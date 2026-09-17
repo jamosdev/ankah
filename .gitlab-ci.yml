@@ -34,6 +34,6 @@ publish_main:
     - if git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main; then exit 0; fi
     - git checkout -B main origin/main
     - git merge --no-ff --no-commit "$CI_COMMIT_SHA"
-    - git rm -r -f --ignore-unmatch .gitlab-ci.yml .githooks tools
+    - git rm -r -f --ignore-unmatch .gitlab-ci.yml .githooks tools AGENTS.md
     - git commit -m "Publish validated source"
     - git push "$CI_REPOSITORY_URL" HEAD:main
