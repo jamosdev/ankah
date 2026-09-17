@@ -1,6 +1,8 @@
 #include "ankah/http.h"
 #include "ankah/pow.h"
 #include "ankah/static.h"
+#include "ankah/session.h"
+#include "ankah/qr.h"
 #include <uv.h>
 
 #include <inttypes.h>
@@ -10,14 +12,14 @@
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
-#include <mbedtls/sha256.h>
+#include "ankah/sha256.h"
 
 #define MAX_CONNECTIONS 256
 #define MAX_BODY (16U * 1024U * 1024U)
 #define MAX_ALLOW 32
 #define MAX_PENDING_WRITES 8
 #define MAX_ASSET_SIZE (4U * 1024U * 1024U)
-#define ASSET_COUNT 6
+#define ASSET_COUNT 7
 #define RATE_BUCKETS 1024
 
 typedef struct {
@@ -45,6 +47,15 @@ struct connection {
     char peer_ip[64];
     size_t initial_size;
     size_t body_received;
+    ankah_session *capture_session;
+    unsigned char *replay_body;
+    size_t replay_size;
+    size_t replay_offset;
+    int replaying;
+    int capture_continue;
+    char continue_body[256];
+    size_t continue_received;
+    size_t continue_expected;
     unsigned int pending;
     unsigned int handles;
     int upstream_initialized;
@@ -95,10 +106,14 @@ static configuration config;
 
 static void close_connection(connection *c);
 static void send_asset_chunk(connection *c);
+static void send_replay_chunk(connection *c);
+static int queue_bytes(connection *c, uv_stream_t *destination,
+                       uv_stream_t *source, const char *data, size_t length, int finish);
 static void respond(connection *c, int status, const char *reason,
                     const char *type, const char *body, const char *extra);
 static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer);
 static void on_upstream_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer);
+static size_t header_end(const char *bytes, size_t length);
 
 static int same_ascii(const char *left, const char *right) {
     unsigned char a, b;
@@ -110,6 +125,67 @@ static int same_ascii(const char *left, const char *right) {
         if (a != b) return 0;
     }
     return *left == *right;
+}
+
+static void respond_binary(connection *c, const char *type,
+                           const unsigned char *body, size_t size) {
+    char head[512];
+    int n = snprintf(head, sizeof(head),
+                     "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
+                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n", type, size);
+    if (n < 0 || (size_t)n >= sizeof(head) || size + (size_t)n > 65536) {
+        close_connection(c);
+        return;
+    }
+    {
+        unsigned char *packet = malloc((size_t)n + size);
+        if (!packet) { close_connection(c); return; }
+        memcpy(packet, head, (size_t)n);
+        memcpy(packet + n, body, size);
+        if (queue_bytes(c, (uv_stream_t *)&c->client, NULL,
+                        (const char *)packet, (size_t)n + size, 1) != 0)
+            close_connection(c);
+        free(packet);
+    }
+}
+
+static ankah_session *request_session(const ankah_request *request) {
+    const char *cookie = ankah_header_value(request, "Cookie");
+    const char *item;
+    char id[33];
+    if (!cookie) return NULL;
+    item = strstr(cookie, "ankah_sid=");
+    if (!item || (item != cookie && item[-1] != ';' && item[-1] != ' ')) return NULL;
+    item += strlen("ankah_sid=");
+    if (strspn(item, "0123456789abcdef") != 32 ||
+        (item[32] != ';' && item[32] != ' ' && item[32] != 0)) return NULL;
+    memcpy(id, item, 32);
+    id[32] = 0;
+    return ankah_session_find(id, (uint64_t)time(NULL));
+}
+
+static int html_escape(const char *source, char *out, size_t capacity) {
+    size_t used = 0;
+    while (*source) {
+        const char *replacement = NULL;
+        if (*source == '&') replacement = "&amp;";
+        else if (*source == '<') replacement = "&lt;";
+        else if (*source == '>') replacement = "&gt;";
+        else if (*source == '\'') replacement = "&#39;";
+        else if (*source == '"') replacement = "&quot;";
+        if (replacement) {
+            size_t n = strlen(replacement);
+            if (used + n >= capacity) return -1;
+            memcpy(out + used, replacement, n);
+            used += n;
+        } else {
+            if (used + 1 >= capacity) return -1;
+            out[used++] = *source;
+        }
+        ++source;
+    }
+    out[used] = 0;
+    return 0;
 }
 
 static int prefix(const char *value, const char *start) {
@@ -191,7 +267,7 @@ static int load_asset(static_asset *asset, const char *directory) {
     fclose(file);
     asset->data[asset->size] = 0;
     if (i != asset->size ||
-        mbedtls_sha256_ret(asset->data, asset->size, digest, 0) != 0) return -1;
+        ankah_sha256(asset->data, asset->size, digest) != 0) return -1;
     asset->etag[0] = '"';
     for (i = 0; i < sizeof(digest); ++i) {
         asset->etag[1 + i * 2] = digits[digest[i] >> 4];
@@ -207,12 +283,12 @@ static int load_asset(static_asset *asset, const char *directory) {
 static int load_assets(void) {
     static const char *names[ASSET_COUNT] = {
         "ankah.png", "particles.min.js", "particlejs.json", "challenge.js",
-        "solver.py", "challenge-polyglot.txt"
+        "solver.py", "challenge-polyglot.txt", "phone-scan.png"
     };
     static const char *types[ASSET_COUNT] = {
         "image/png", "application/javascript; charset=utf-8",
         "application/json; charset=utf-8", "application/javascript; charset=utf-8",
-        "text/x-python; charset=utf-8", "text/plain; charset=utf-8"
+        "text/x-python; charset=utf-8", "text/plain; charset=utf-8", "image/png"
     };
     unsigned int i;
     for (i = 0; i < ASSET_COUNT; ++i) {
@@ -301,6 +377,9 @@ static void on_handle_closed(uv_handle_t *handle) {
 static void close_connection(connection *c) {
     if (c->closed) return;
     c->closed = 1;
+    if (c->capture_session) ankah_session_discard(c->capture_session);
+    free(c->replay_body);
+    c->replay_body = NULL;
     uv_read_stop((uv_stream_t *)&c->client);
     if (c->upstream_initialized) uv_read_stop((uv_stream_t *)&c->upstream);
     if (!uv_is_closing((uv_handle_t *)&c->client))
@@ -342,6 +421,10 @@ static void on_write(uv_write_t *request, int status) {
         send_asset_chunk(c);
         return;
     }
+    if (c->replaying && c->pending == 0) {
+        send_replay_chunk(c);
+        return;
+    }
     if (!c->closed && source && c->pending < MAX_PENDING_WRITES) {
         uv_read_start(source, allocate_read,
                       source == (uv_stream_t *)&c->client ? on_client_read : on_upstream_read);
@@ -371,6 +454,22 @@ static int queue_bytes(connection *c, uv_stream_t *destination,
     }
     if (source && c->pending >= MAX_PENDING_WRITES) uv_read_stop(source);
     return 0;
+}
+
+static void send_replay_chunk(connection *c) {
+    size_t amount;
+    if (c->replay_offset == c->replay_size) {
+        free(c->replay_body);
+        c->replay_body = NULL;
+        c->replaying = 0;
+        return;
+    }
+    amount = c->replay_size - c->replay_offset;
+    if (amount > 32768) amount = 32768;
+    if (queue_bytes(c, (uv_stream_t *)&c->upstream, NULL,
+                    (const char *)c->replay_body + c->replay_offset, amount, 0) != 0)
+        close_connection(c);
+    else c->replay_offset += amount;
 }
 
 static void send_asset_chunk(connection *c) {
@@ -503,7 +602,7 @@ static int serve_static_if_matched(connection *c) {
 
 static void respond(connection *c, int status, const char *reason,
                     const char *type, const char *body, const char *extra) {
-    char response[8192];
+    char response[16384];
     size_t body_size = strlen(body);
     int length = snprintf(response, sizeof(response),
                           "HTTP/1.1 %d %s\r\nContent-Type: %s\r\n"
@@ -534,6 +633,8 @@ static int cookie_valid(const ankah_request *request) {
 
 static int allowed(const ankah_request *request) {
     unsigned int i;
+    ankah_session *session = request_session(request);
+    if (ankah_session_solved(session, (uint64_t)time(NULL))) return 1;
     if (request->websocket) return 1;
     for (i = 0; i < config.allow_count; ++i) {
         if (prefix(request->target, config.allow[i])) return 1;
@@ -597,6 +698,60 @@ static int render_script(const char *challenge, char *out, size_t capacity) {
     return 0;
 }
 
+static void render_gate(connection *c, ankah_session *session) {
+    char body[8192], extra[512], action[ANKAH_MAX_TARGET * 6], hidden[128];
+    char illustration[160], challenge_js[160];
+    int n;
+    if (asset_path(6, illustration, sizeof(illustration)) != 0 ||
+        asset_path(3, challenge_js, sizeof(challenge_js)) != 0) {
+        close_connection(c);
+        return;
+    }
+    if (session->is_post) {
+        if (html_escape(session->target, action, sizeof(action)) != 0) {
+            close_connection(c); return;
+        }
+        n = snprintf(hidden, sizeof(hidden),
+                     "<input type=hidden name=ankah_continue value='%s'>", session->token);
+    } else {
+        n = snprintf(action, sizeof(action), "/ankah/finish/%s", session->id);
+        hidden[0] = 0;
+    }
+    if (n < 0 || (size_t)n >= (session->is_post ? sizeof(hidden) : sizeof(action))) {
+        close_connection(c); return;
+    }
+    n = snprintf(body, sizeof(body),
+        "<!doctype html><html lang=en><meta charset=utf-8>"
+        "<meta name=viewport content='width=device-width,initial-scale=1'>"
+        "<title>Checking your browser</title>"
+        "<style>html,body{margin:0;min-height:100%%;font:16px system-ui;background:#101929;color:#f4f7fb}"
+        "main{max-width:38rem;margin:5vh auto;padding:2rem;text-align:center;background:#18253b;border-radius:1rem}"
+        "img{height:auto}#phone{width:100px}#qr{width:220px;background:white;padding:8px}"
+        "#phone-help{display:flex;align-items:center;justify-content:center;gap:1rem;flex-wrap:wrap}"
+        "button{padding:.7rem 1.5rem;font:inherit;cursor:pointer}"
+        "</style><body data-challenge='%s' data-session='%s'>"
+        "<main><h1>Checking your browser</h1><p>Solving a short proof of work.</p>"
+        "<output id=progress>Starting challenge...</output>"
+        "<section id=phone-panel><h2>Don't have JavaScript? Scan here.</h2>"
+        "<div id=phone-help><img id=phone src='%s' alt='Phone scanning a code'>"
+        "<img id=qr src='/ankah/qr/%s.png' alt='QR code to solve on your phone'></div>"
+        "<p>After solving on your phone, click Finished here.</p></section>"
+        "<form id=finish method=%s action='%s'>%s<button type=submit>Finished</button></form>"
+        "</main><script src='%s'></script></body></html>",
+        session->challenge, session->id, illustration, session->id,
+        session->is_post ? "post" : "get",
+        action, hidden,
+        challenge_js);
+    if (n < 0 || (size_t)n >= sizeof(body)) { close_connection(c); return; }
+    n = snprintf(extra, sizeof(extra),
+        "Set-Cookie: ankah_sid=%s; Max-Age=1800; Path=/; HttpOnly; SameSite=Lax%s\r\n"
+        "Content-Security-Policy: default-src 'none'; img-src 'self'; script-src 'self'; "
+        "style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'\r\n",
+        session->id, prefix(config.public_origin, "https://") ? "; Secure" : "");
+    if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
+    respond(c, 428, "Precondition Required", "text/html; charset=utf-8", body, extra);
+}
+
 static void handle_challenge(connection *c) {
     char challenge[ANKAH_CHALLENGE_TEXT_MAX];
     char body[4096];
@@ -620,42 +775,120 @@ static void handle_challenge(connection *c) {
         if (length < 0 || (size_t)length >= sizeof(extra)) { close_connection(c); return; }
         respond(c, 302, "Found", "text/plain; charset=utf-8", body, extra);
     } else {
-        char mascot[160], particles_js[160], particles_json[160], challenge_js[160];
-        if (asset_path(0, mascot, sizeof(mascot)) != 0 ||
-            asset_path(1, particles_js, sizeof(particles_js)) != 0 ||
-            asset_path(2, particles_json, sizeof(particles_json)) != 0 ||
-            asset_path(3, challenge_js, sizeof(challenge_js)) != 0) {
-            close_connection(c);
+        if (strcmp(c->request.method, "GET") != 0 &&
+            strcmp(c->request.method, "POST") != 0) {
+            respond(c, 405, "Method Not Allowed", "text/plain",
+                    "Unlock with a GET request, then retry this method.\n", NULL);
             return;
         }
-        length = snprintf(body, sizeof(body),
-                          "<!doctype html><html lang=en><meta charset=utf-8>"
-                          "<meta name=viewport content='width=device-width,initial-scale=1'>"
-                          "<title>Ankah challenge</title>"
-                          "<style>html,body{margin:0;min-height:100%%;font:16px system-ui;background:#101929;color:#f4f7fb}"
-                          "#particles-js{position:fixed;inset:0;z-index:0}main{position:relative;z-index:1;"
-                          "max-width:35rem;margin:8vh auto;padding:2rem;text-align:center;"
-                          "background:#18253be8;border-radius:1rem;box-shadow:0 1rem 3rem #0008}"
-                          "img{width:min(14rem,45vw);height:auto}h1{margin:.5rem 0}"
-                          "output{display:block;margin:1.5rem 0}</style>"
-                          "<body data-challenge='%s' data-particles='%s'>"
-                          "<div id=particles-js></div><main><img src='%s' alt='Ankah mascot'>"
-                          "<h1>Checking your browser</h1>"
-                          "<p>Solving a short proof of work to protect this service.</p>"
-                          "<output id=progress>Starting challenge...</output>"
-                          "<noscript>JavaScript is required for this challenge.</noscript></main>"
-                          "<script src='%s'></script><script src='%s'></script></body></html>",
-                          challenge, particles_json, mascot, particles_js, challenge_js);
-        if (length < 0 || (size_t)length >= sizeof(body)) { close_connection(c); return; }
-        respond(c, 428, "Precondition Required", "text/html; charset=utf-8", body,
-                "Content-Security-Policy: default-src 'none'; img-src 'self'; "
-                "script-src 'self'; style-src 'unsafe-inline'; connect-src 'self'\r\n");
+        ankah_session *session = ankah_session_new(config.secret, host,
+            (uint64_t)time(NULL), &c->request, c->peer_ip);
+        size_t end = header_end(c->initial, c->initial_size);
+        if (!session) {
+            respond(c, 503, "Unavailable", "text/plain", "Challenge capacity reached\n", NULL);
+            return;
+        }
+        if (session->is_post) {
+            int complete = ankah_session_append(session, c->initial + end, c->initial_size - end);
+            if (complete < 0) { ankah_session_discard(session); close_connection(c); return; }
+            if (!complete) {
+                c->capture_session = session;
+                if (ankah_header_value(&c->request, "Expect") &&
+                    same_ascii(ankah_header_value(&c->request, "Expect"), "100-continue")) {
+                    static const char interim[] = "HTTP/1.1 100 Continue\r\n\r\n";
+                    queue_bytes(c, (uv_stream_t *)&c->client, NULL, interim, sizeof(interim) - 1, 0);
+                }
+                return;
+            }
+        }
+        render_gate(c, session);
     }
 }
 
 static void handle_internal(connection *c) {
     const char *target = c->request.target;
     const char *host = ankah_header_value(&c->request, "Host");
+    if (prefix(target, "/ankah/qr/") && strcmp(c->request.method, "GET") == 0) {
+        const char *id = target + strlen("/ankah/qr/");
+        char key[33], url[512];
+        ankah_session *session;
+        unsigned char *png;
+        size_t size;
+        if (strlen(id) != 36 || strcmp(id + 32, ".png") != 0) {
+            respond(c, 404, "Not Found", "text/plain", "Unknown code\n", NULL); return;
+        }
+        memcpy(key, id, 32); key[32] = 0;
+        session = ankah_session_find(key, (uint64_t)time(NULL));
+        if (!session || snprintf(url, sizeof(url), "%s/ankah/solve/%s",
+                                 config.public_origin, key) >= (int)sizeof(url) ||
+            ankah_qr_png(url, &png, &size) != 0) {
+            respond(c, 404, "Not Found", "text/plain", "Unknown code\n", NULL); return;
+        }
+        respond_binary(c, "image/png", png, size);
+        free(png);
+        return;
+    }
+    if (prefix(target, "/ankah/solve/") && strcmp(c->request.method, "GET") == 0) {
+        ankah_session *session = ankah_session_find(target + strlen("/ankah/solve/"),
+                                                    (uint64_t)time(NULL));
+        char body[2048], script[160];
+        int n;
+        if (!session || asset_path(3, script, sizeof(script)) != 0) {
+            respond(c, 404, "Not Found", "text/plain", "Challenge expired\n", NULL); return;
+        }
+        if (ankah_session_solved(session, (uint64_t)time(NULL))) {
+            respond(c, 200, "OK", "text/html; charset=utf-8",
+                    "<!doctype html><html lang=en><meta charset=utf-8><title>Finished</title>"
+                    "<p>Challenge passed. Click Finished on the original page.</p>", NULL);
+            return;
+        }
+        n = snprintf(body, sizeof(body),
+            "<!doctype html><html lang=en><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'>"
+            "<title>Solve challenge</title><body data-challenge='%s' data-session='%s' data-mobile=1>"
+            "<main><h1>Solve challenge</h1><output id=progress>Starting...</output>"
+            "<p>When complete, click Finished on the original page.</p></main>"
+            "<script src='%s'></script></body></html>", session->challenge, session->id, script);
+        if (n < 0 || (size_t)n >= sizeof(body)) { close_connection(c); return; }
+        respond(c, 200, "OK", "text/html; charset=utf-8", body,
+                "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'\r\n");
+        return;
+    }
+    if (prefix(target, "/ankah/answer/") && strcmp(c->request.method, "POST") == 0) {
+        const char *answer = strchr(target, '?');
+        char key[33], *end;
+        unsigned long long counter;
+        ankah_session *session;
+        if (!answer || (size_t)(answer - (target + strlen("/ankah/answer/"))) != 32 ||
+            strncmp(answer, "?answer=", 8) != 0) {
+            respond(c, 400, "Bad Request", "text/plain", "Invalid answer\n", NULL); return;
+        }
+        memcpy(key, target + strlen("/ankah/answer/"), 32); key[32] = 0;
+        counter = strtoull(answer + 8, &end, 10);
+        session = ankah_session_find(key, (uint64_t)time(NULL));
+        if (end == answer + 8 || *end || !session ||
+            ankah_check_answer(config.secret, host, (uint64_t)time(NULL),
+                               session->challenge, (uint64_t)counter) != 0 ||
+            ankah_session_solve(session, (uint64_t)time(NULL)) != 0) {
+            respond(c, 403, "Forbidden", "text/plain", "Invalid answer\n", NULL); return;
+        }
+        respond(c, 200, "OK", "text/plain", "Challenge passed. Click Finished on the original page.\n", NULL);
+        return;
+    }
+    if (prefix(target, "/ankah/finish/") && strcmp(c->request.method, "GET") == 0) {
+        ankah_session *session = ankah_session_find(target + strlen("/ankah/finish/"),
+                                                    (uint64_t)time(NULL));
+        char extra[ANKAH_MAX_TARGET + 64];
+        int n;
+        if (!session || session != request_session(&c->request) || session->is_post ||
+            !ankah_session_solved(session, (uint64_t)time(NULL))) {
+            respond(c, 403, "Forbidden", "text/plain", "Challenge not passed\n", NULL); return;
+        }
+        n = snprintf(extra, sizeof(extra), "Location: %s\r\n", session->target);
+        if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
+        respond(c, 303, "See Other", "text/plain", "Continuing\n", extra);
+        return;
+    }
     if (prefix(target, "/ankah/assets/") &&
         (strcmp(c->request.method, "GET") == 0 ||
          strcmp(c->request.method, "HEAD") == 0)) {
@@ -736,6 +969,7 @@ static int build_upstream_request(const connection *c, char *out, size_t capacit
         const ankah_header *header = &c->request.headers[i];
         if (same_ascii(header->name, "Connection") ||
             same_ascii(header->name, "Proxy-Connection") ||
+            (c->replaying && same_ascii(header->name, "Expect")) ||
             same_ascii(header->name, "X-Forwarded-For") ||
             same_ascii(header->name, "X-Real-IP") ||
             same_ascii(header->name, "Forwarded")) continue;
@@ -762,10 +996,10 @@ static void on_connected(uv_connect_t *request, int status) {
         return;
     }
     head_size = build_upstream_request(c, head, sizeof(head));
-    end = header_end(c->initial, c->initial_size);
-    if (head_size < 0 || end == 0 ||
+    end = c->replaying ? 0 : header_end(c->initial, c->initial_size);
+    if (head_size < 0 || (!c->replaying && end == 0) ||
         queue_bytes(c, (uv_stream_t *)&c->upstream, NULL, head, (size_t)head_size, 0) != 0 ||
-        (c->initial_size > end &&
+        (!c->replaying && c->initial_size > end &&
          queue_bytes(c, (uv_stream_t *)&c->upstream, NULL,
                      c->initial + end, c->initial_size - end, 0) != 0)) {
         close_connection(c);
@@ -773,7 +1007,8 @@ static void on_connected(uv_connect_t *request, int status) {
     }
     c->forwarding = 1;
     if (uv_read_start((uv_stream_t *)&c->upstream, allocate_read, on_upstream_read) != 0 ||
-        uv_read_start((uv_stream_t *)&c->client, allocate_read, on_client_read) != 0)
+        (!c->replaying && uv_read_start((uv_stream_t *)&c->client,
+                                      allocate_read, on_client_read) != 0))
         close_connection(c);
 }
 
@@ -789,6 +1024,38 @@ static int start_upstream(connection *c) {
     result = uv_tcp_connect(&c->connect_request, &c->upstream,
                             (const struct sockaddr *)&address, on_connected);
     return result;
+}
+
+static void finish_continue(connection *c) {
+    ankah_session *session = request_session(&c->request);
+    ankah_request *saved;
+    unsigned char *body;
+    size_t size;
+    char token[33];
+    if (c->continue_received != c->continue_expected ||
+        c->continue_expected != 47 ||
+        memcmp(c->continue_body, "ankah_continue=", 15) != 0) {
+        respond(c, 403, "Forbidden", "text/plain", "Invalid continuation\n", NULL);
+        return;
+    }
+    memcpy(token, c->continue_body + 15, 32);
+    token[32] = 0;
+    if (!session || strcmp(c->request.target, session->target) != 0 ||
+        ankah_session_take_post(session, token, (uint64_t)time(NULL),
+                                &saved, &body, &size) != 0) {
+        respond(c, 403, "Forbidden", "text/plain", "Continuation expired\n", NULL);
+        return;
+    }
+    c->request = *saved;
+    free(saved);
+    strcpy(c->peer_ip, session->peer_ip);
+    c->replay_body = body;
+    c->replay_size = size;
+    c->replaying = 1;
+    c->continue_expected = 0;
+    uv_read_stop((uv_stream_t *)&c->client);
+    if (start_upstream(c) != 0)
+        respond(c, 502, "Bad Gateway", "text/plain", "Upstream unavailable\n", NULL);
 }
 
 static void handle_initial(connection *c) {
@@ -816,15 +1083,37 @@ static void handle_initial(connection *c) {
     if (c->request.chunked || c->request.content_length > MAX_BODY ||
         (!c->websocket && c->initial_size - end > c->request.content_length)) {
         respond(c, 413, "Content Too Large", "text/plain",
-                "Unsupported request body\n", NULL);
+                "Unsupported request body. Unlock with a GET request, then retry.\n", NULL);
         return;
     }
     c->body_received = c->initial_size - end;
+    if (strcmp(c->request.method, "POST") == 0) {
+        ankah_session *session = request_session(&c->request);
+        const char *type = ankah_header_value(&c->request, "Content-Type");
+        if (session && session->is_post &&
+            strcmp(c->request.target, session->target) == 0 &&
+            ankah_session_solved(session, (uint64_t)time(NULL)) &&
+            type && prefix(type, "application/x-www-form-urlencoded") &&
+            c->request.content_length == 47) {
+            c->capture_continue = 1;
+            c->continue_expected = c->request.content_length;
+            c->continue_received = c->body_received;
+            memcpy(c->continue_body, c->initial + end, c->body_received);
+            if (c->continue_received == c->continue_expected) finish_continue(c);
+            return;
+        }
+    }
     if (prefix(c->request.target, "/ankah/")) {
         handle_internal(c);
     } else if (serve_static_if_matched(c)) {
         return;
     } else if (!allowed(&c->request)) {
+        if (strcmp(c->request.method, "POST") == 0 &&
+            c->request.content_length > ANKAH_POST_REPLAY_MAX) {
+            respond(c, 413, "Content Too Large", "text/plain",
+                    "Unlock with a small GET request, then retry this upload.\n", NULL);
+            return;
+        }
         handle_challenge(c);
     } else {
         uv_read_stop((uv_stream_t *)&c->client);
@@ -837,7 +1126,27 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
     connection *c = (connection *)stream->data;
     if (count > 0 && !c->closed) {
         refresh_timeout(c);
-        if (!c->forwarding) {
+        if (c->capture_session) {
+            int complete = ankah_session_append(c->capture_session, buffer->base, (size_t)count);
+            if (complete < 0) {
+                ankah_session_discard(c->capture_session);
+                c->capture_session = NULL;
+                respond(c, 400, "Bad Request", "text/plain", "Invalid body size\n", NULL);
+            } else if (complete) {
+                ankah_session *session = c->capture_session;
+                c->capture_session = NULL;
+                uv_read_stop(stream);
+                render_gate(c, session);
+            }
+        } else if (c->capture_continue) {
+            if ((size_t)count > c->continue_expected - c->continue_received) {
+                respond(c, 400, "Bad Request", "text/plain", "Invalid continuation\n", NULL);
+            } else {
+                memcpy(c->continue_body + c->continue_received, buffer->base, (size_t)count);
+                c->continue_received += (size_t)count;
+                if (c->continue_received == c->continue_expected) finish_continue(c);
+            }
+        } else if (!c->forwarding) {
             if ((size_t)count > ANKAH_HEADER_LIMIT - c->initial_size) {
                 respond(c, 431, "Request Header Fields Too Large", "text/plain",
                         "Request headers too large\n", NULL);
