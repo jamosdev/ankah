@@ -1,0 +1,37 @@
+stages:
+  - scan
+  - publish
+
+default:
+  image: python:3.12-alpine
+  before_script:
+    - apk add --no-cache git
+    - git fetch origin +refs/heads/main:refs/remotes/origin/main
+
+variables:
+  GIT_DEPTH: "0"
+
+workflow:
+  rules:
+    - if: '$CI_PIPELINE_SOURCE == "push" && $CI_COMMIT_BRANCH == "mastah"'
+    - when: never
+
+scan_release:
+  stage: scan
+  script:
+    - CI_COMMIT_BEFORE_SHA="$(git merge-base HEAD origin/main)" python3 tools/check_commit_message.py --ci-range
+    - python3 tools/check_source.py
+
+publish_main:
+  stage: publish
+  resource_group: main
+  script:
+    - git config user.name "GitLab release"
+    - git config user.email "release@users.noreply.gitlab.com"
+    - git fetch origin +refs/heads/main:refs/remotes/origin/main
+    - if git merge-base --is-ancestor "$CI_COMMIT_SHA" origin/main; then exit 0; fi
+    - git checkout -B main origin/main
+    - git merge --no-ff --no-commit "$CI_COMMIT_SHA"
+    - git rm -r -f --ignore-unmatch .gitlab-ci.yml .githooks tools
+    - git commit -m "Publish validated source"
+    - git push "$CI_REPOSITORY_URL" HEAD:main
