@@ -13,13 +13,16 @@
 #include <sys/stat.h>
 #include <time.h>
 #include "ankah/sha256.h"
+#if ANKAH_HAS_WASM
+#include "browser_pow_data.h"
+#endif
 
 #define MAX_CONNECTIONS 256
 #define MAX_BODY (16U * 1024U * 1024U)
 #define MAX_ALLOW 32
 #define MAX_PENDING_WRITES 8
 #define MAX_ASSET_SIZE (4U * 1024U * 1024U)
-#define ASSET_COUNT 7
+#define ASSET_COUNT (8 + ANKAH_HAS_WASM)
 #define RATE_BUCKETS 1024
 
 typedef struct {
@@ -71,7 +74,7 @@ struct connection {
 typedef struct {
     const char *name;
     const char *type;
-    unsigned char *data;
+    const unsigned char *data;
     size_t size;
     char etag[67];
     char last_modified[64];
@@ -246,28 +249,11 @@ static int load_secret(const char *path) {
     return 0;
 }
 
-static int load_asset(static_asset *asset, const char *directory) {
+static int finish_asset(static_asset *asset) {
     static const char digits[] = "0123456789abcdef";
-    struct stat metadata;
     unsigned char digest[32];
-    char path[1024];
-    FILE *file;
     size_t i;
-    int length = snprintf(path, sizeof(path), "%s/%s", directory, asset->name);
-    if (length < 0 || (size_t)length >= sizeof(path) ||
-        stat(path, &metadata) != 0 || metadata.st_size < 0 ||
-        (uint64_t)metadata.st_size > MAX_ASSET_SIZE) return -1;
-    asset->size = (size_t)metadata.st_size;
-    asset->modified = metadata.st_mtime;
-    asset->data = (unsigned char *)malloc(asset->size + 1);
-    if (!asset->data) return -1;
-    file = fopen(path, "rb");
-    if (!file) return -1;
-    i = fread(asset->data, 1, asset->size, file);
-    fclose(file);
-    asset->data[asset->size] = 0;
-    if (i != asset->size ||
-        ankah_sha256(asset->data, asset->size, digest) != 0) return -1;
+    if (ankah_sha256(asset->data, asset->size, digest) != 0) return -1;
     asset->etag[0] = '"';
     for (i = 0; i < sizeof(digest); ++i) {
         asset->etag[1 + i * 2] = digits[digest[i] >> 4];
@@ -275,26 +261,64 @@ static int load_asset(static_asset *asset, const char *directory) {
     }
     asset->etag[65] = '"';
     asset->etag[66] = 0;
-    if (!strftime(asset->last_modified, sizeof(asset->last_modified),
-                  "%a, %d %b %Y %H:%M:%S GMT", gmtime(&asset->modified))) return -1;
-    return 0;
+    return strftime(asset->last_modified, sizeof(asset->last_modified),
+                    "%a, %d %b %Y %H:%M:%S GMT", gmtime(&asset->modified)) ? 0 : -1;
+}
+
+static int load_asset(static_asset *asset, const char *directory) {
+    struct stat metadata;
+    char path[1024];
+    FILE *file;
+    unsigned char *data;
+    size_t i;
+    int length = snprintf(path, sizeof(path), "%s/%s", directory, asset->name);
+    if (length < 0 || (size_t)length >= sizeof(path) ||
+        stat(path, &metadata) != 0 || metadata.st_size < 0 ||
+        (uint64_t)metadata.st_size > MAX_ASSET_SIZE) return -1;
+    asset->size = (size_t)metadata.st_size;
+    asset->modified = metadata.st_mtime;
+    data = (unsigned char *)malloc(asset->size + 1);
+    if (!data) return -1;
+    file = fopen(path, "rb");
+    if (!file) { free(data); return -1; }
+    i = fread(data, 1, asset->size, file);
+    fclose(file);
+    data[asset->size] = 0;
+    if (i != asset->size) { free(data); return -1; }
+    asset->data = data;
+    return finish_asset(asset);
 }
 
 static int load_assets(void) {
     static const char *names[ASSET_COUNT] = {
         "ankah.png", "particles.min.js", "particlejs.json", "challenge.js",
-        "solver.py", "challenge-polyglot.txt", "phone-scan.png"
+        "solver.py", "challenge-polyglot.txt", "phone-scan.png",
+        "pow-worker.js"
+#if ANKAH_HAS_WASM
+        , "browser_pow.wasm"
+#endif
     };
     static const char *types[ASSET_COUNT] = {
         "image/png", "application/javascript; charset=utf-8",
         "application/json; charset=utf-8", "application/javascript; charset=utf-8",
-        "text/x-python; charset=utf-8", "text/plain; charset=utf-8", "image/png"
+        "text/x-python; charset=utf-8", "text/plain; charset=utf-8", "image/png",
+        "application/javascript; charset=utf-8"
+#if ANKAH_HAS_WASM
+        , "application/wasm"
+#endif
     };
     unsigned int i;
     for (i = 0; i < ASSET_COUNT; ++i) {
         config.assets[i].name = names[i];
         config.assets[i].type = types[i];
-        if (load_asset(&config.assets[i], config.assets_dir) != 0) return -1;
+        if (i == 8) {
+#if ANKAH_HAS_WASM
+            config.assets[i].data = ankah_browser_pow_data;
+            config.assets[i].size = sizeof(ankah_browser_pow_data);
+            config.assets[i].modified = 0;
+            if (finish_asset(&config.assets[i]) != 0) return -1;
+#endif
+        } else if (load_asset(&config.assets[i], config.assets_dir) != 0) return -1;
     }
     return 0;
 }
@@ -701,12 +725,19 @@ static int render_script(const char *challenge, char *out, size_t capacity) {
 static void render_gate(connection *c, ankah_session *session) {
     char body[8192], extra[512], action[ANKAH_MAX_TARGET * 6], hidden[128];
     char illustration[160], challenge_js[160];
+    char worker_js[160] = "", wasm_path[160] = "";
     int n;
     if (asset_path(6, illustration, sizeof(illustration)) != 0 ||
         asset_path(3, challenge_js, sizeof(challenge_js)) != 0) {
         close_connection(c);
         return;
     }
+#if ANKAH_HAS_WASM
+    if (asset_path(7, worker_js, sizeof(worker_js)) != 0 ||
+        asset_path(8, wasm_path, sizeof(wasm_path)) != 0) {
+        close_connection(c); return;
+    }
+#endif
     if (session->is_post) {
         if (html_escape(session->target, action, sizeof(action)) != 0) {
             close_connection(c); return;
@@ -729,7 +760,7 @@ static void render_gate(connection *c, ankah_session *session) {
         "img{height:auto}#phone{width:100px}#qr{width:220px;background:white;padding:8px}"
         "#phone-help{display:flex;align-items:center;justify-content:center;gap:1rem;flex-wrap:wrap}"
         "button{padding:.7rem 1.5rem;font:inherit;cursor:pointer}"
-        "</style><body data-challenge='%s' data-session='%s'>"
+        "</style><body data-challenge='%s' data-session='%s' data-worker='%s' data-wasm='%s'>"
         "<main><h1>Checking your browser</h1><p>Solving a short proof of work.</p>"
         "<output id=progress>Starting challenge...</output>"
         "<section id=phone-panel><h2>Don't have JavaScript? Scan here.</h2>"
@@ -738,15 +769,17 @@ static void render_gate(connection *c, ankah_session *session) {
         "<p>After solving on your phone, click Finished here.</p></section>"
         "<form id=finish method=%s action='%s'>%s<button type=submit>Finished</button></form>"
         "</main><script src='%s'></script></body></html>",
-        session->challenge, session->id, illustration, session->id,
+        session->challenge, session->id, worker_js, wasm_path,
+        illustration, session->id,
         session->is_post ? "post" : "get",
         action, hidden,
         challenge_js);
     if (n < 0 || (size_t)n >= sizeof(body)) { close_connection(c); return; }
     n = snprintf(extra, sizeof(extra),
         "Set-Cookie: ankah_sid=%s; Max-Age=1800; Path=/; HttpOnly; SameSite=Lax%s\r\n"
-        "Content-Security-Policy: default-src 'none'; img-src 'self'; script-src 'self'; "
-        "style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'\r\n",
+        "Content-Security-Policy: default-src 'none'; img-src 'self'; "
+        "script-src 'self' 'wasm-unsafe-eval'; "
+        "worker-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'\r\n",
         session->id, prefix(config.public_origin, "https://") ? "; Secure" : "");
     if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
     respond(c, 428, "Precondition Required", "text/html; charset=utf-8", body, extra);
@@ -831,11 +864,17 @@ static void handle_internal(connection *c) {
     if (prefix(target, "/ankah/solve/") && strcmp(c->request.method, "GET") == 0) {
         ankah_session *session = ankah_session_find(target + strlen("/ankah/solve/"),
                                                     (uint64_t)time(NULL));
-        char body[2048], script[160];
+        char body[2048], script[160], worker_js[160] = "", wasm_path[160] = "";
         int n;
         if (!session || asset_path(3, script, sizeof(script)) != 0) {
             respond(c, 404, "Not Found", "text/plain", "Challenge expired\n", NULL); return;
         }
+#if ANKAH_HAS_WASM
+        if (asset_path(7, worker_js, sizeof(worker_js)) != 0 ||
+            asset_path(8, wasm_path, sizeof(wasm_path)) != 0) {
+            close_connection(c); return;
+        }
+#endif
         if (ankah_session_solved(session, (uint64_t)time(NULL))) {
             respond(c, 200, "OK", "text/html; charset=utf-8",
                     "<!doctype html><html lang=en><meta charset=utf-8><title>Finished</title>"
@@ -845,13 +884,17 @@ static void handle_internal(connection *c) {
         n = snprintf(body, sizeof(body),
             "<!doctype html><html lang=en><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>Solve challenge</title><body data-challenge='%s' data-session='%s' data-mobile=1>"
+            "<title>Solve challenge</title><body data-challenge='%s' data-session='%s' "
+            "data-worker='%s' data-wasm='%s' data-mobile=1>"
             "<main><h1>Solve challenge</h1><output id=progress>Starting...</output>"
             "<p>When complete, click Finished on the original page.</p></main>"
-            "<script src='%s'></script></body></html>", session->challenge, session->id, script);
+            "<script src='%s'></script></body></html>", session->challenge,
+            session->id, worker_js, wasm_path, script);
         if (n < 0 || (size_t)n >= sizeof(body)) { close_connection(c); return; }
         respond(c, 200, "OK", "text/html; charset=utf-8", body,
-                "Content-Security-Policy: default-src 'none'; script-src 'self'; connect-src 'self'\r\n");
+                "Content-Security-Policy: default-src 'none'; "
+                "script-src 'self' 'wasm-unsafe-eval'; "
+                "worker-src 'self'; connect-src 'self'\r\n");
         return;
     }
     if (prefix(target, "/ankah/answer/") && strcmp(c->request.method, "POST") == 0) {

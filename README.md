@@ -15,6 +15,11 @@ at paths containing their SHA-256 digest with
 `Cache-Control: public, max-age=31536000, immutable`. Challenge pages and
 scripts use `Cache-Control: no-store`.
 
+The browser normally searches for an answer in a single WebAssembly worker.
+If the worker or module cannot start, it falls back to the Web Crypto solver.
+Both use the same challenge and answer endpoint. The QR option remains
+available on the original page.
+
 For a blocked GET, Finished redirects to the exact original path and query.
 For a blocked POST, Ankah holds the original headers and raw body in process
 memory and the page carries a one-use continuation token. The token form
@@ -35,8 +40,10 @@ content addressed bundle for Ankah to load at startup. See
 
 ## Build and test
 
-Requires a C99 compiler, CMake, libuv, Mbed TLS's crypto library, and Python 3
-for integration tests. CMake downloads llhttp 9.3.1, qrcodegen, and
+Requires a C99 compiler, CMake, libuv, Mbed TLS's crypto library, Python 3,
+and Clang with a WebAssembly target and LLD. Node is used for the browser solver
+tests. Set `-DANKAH_WASM_SOLVER=OFF` to build with only the Web Crypto fallback.
+CMake downloads llhttp 9.3.1, qrcodegen, and
 stb_image_write during the build. qrcodegen is MIT licensed; stb_image_write
 is available under the public domain or MIT license.
 
@@ -64,6 +71,6 @@ trusted local processes.
 
 ## Release readiness
 
-TLS/HTTP/2, a WASM browser solver, trusted proxy IP handling, and cross-platform
+TLS/HTTP/2, trusted proxy IP handling, and cross-platform
 builds are still pending. Do not place this
 prototype in front of a public service yet.

@@ -90,10 +90,23 @@ def main():
 
             status, headers, page = request("/report?x=1&y=2")
             assert status == 428 and b"phone-panel" in page and b"Finished" in page
+            assert "worker-src 'self'" in headers["Content-Security-Policy"]
+            gate_headers = headers
             assert b"setTimeout(() => { panel.hidden = false; }, 10000)" in pathlib.Path(root, "challenge.js").read_bytes()
+            worker_path = re.search(rb"data-worker='([^']*)'", page).group(1).decode()
+            wasm_path = re.search(rb"data-wasm='([^']*)'", page).group(1).decode()
+            if worker_path and wasm_path:
+                status, headers, worker = request(worker_path)
+                assert status == 200 and b"search_batch" in worker
+                assert headers["Content-Type"].startswith("application/javascript")
+                status, headers, module = request(wasm_path)
+                assert status == 200 and headers["Content-Type"] == "application/wasm"
+                assert headers["Cache-Control"] == "public, max-age=31536000, immutable"
+                assert module.startswith(b"\x00asm")
+                assert hashlib.sha256(module).hexdigest() in wasm_path
             sid = re.search(rb"data-session='([a-f0-9]{32})'", page).group(1).decode()
             challenge = re.search(rb"data-challenge='([^']+)'", page).group(1).decode()
-            cookie = headers["Set-Cookie"].split(";", 1)[0]
+            cookie = gate_headers["Set-Cookie"].split(";", 1)[0]
             status, headers, png = request(f"/ankah/qr/{sid}.png")
             assert status == 200 and headers["Content-Type"] == "image/png"
             assert png.startswith(b"\x89PNG\r\n\x1a\n")
