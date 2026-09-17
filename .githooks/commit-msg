@@ -1,3 +1,0 @@
-#!/bin/sh
-repo_root=$(git rev-parse --show-toplevel) || exit 2
-exec python3 "$repo_root/tools/check_commit_message.py" --message-file "$1"

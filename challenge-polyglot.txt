@@ -1,0 +1,90 @@
+:; if false; then
+@echo off
+goto :batch
+:; fi
+set -eu
+ankah_tmp=$(mktemp)
+trap 'rm -f "$ankah_tmp"' EXIT
+if command -v curl >/dev/null 2>&1; then
+    curl -fsSL '@ANKAH_SOLVER_URL@' -o "$ankah_tmp"
+elif command -v wget >/dev/null 2>&1; then
+    wget -q -O "$ankah_tmp" '@ANKAH_SOLVER_URL@'
+else
+    echo 'Ankah needs curl or wget to fetch the solver.' >&2
+    exit 1
+fi
+ankah_python=
+for candidate in python3 python; do
+    if command -v "$candidate" >/dev/null 2>&1 &&
+       "$candidate" -c 'import sys,hashlib;sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then
+        ankah_python=$candidate
+        break
+    fi
+done
+if [ -z "$ankah_python" ]; then
+    ankah_install=
+    if command -v apt-get >/dev/null 2>&1; then
+        ankah_install='sudo apt-get update && sudo apt-get install python3'
+    elif command -v dnf >/dev/null 2>&1; then
+        ankah_install='sudo dnf install python3'
+    elif command -v pacman >/dev/null 2>&1; then
+        ankah_install='sudo pacman -S python'
+    elif command -v brew >/dev/null 2>&1; then
+        ankah_install='brew install python'
+    fi
+    if [ -z "$ankah_install" ]; then
+        echo 'Install Python 3, then run this challenge again.' >&2
+        exit 1
+    fi
+    printf 'Python 3 is missing. Run this command? %s [y/N] ' "$ankah_install" >&2
+    read -r ankah_reply </dev/tty || exit 1
+    case "$ankah_reply" in y|Y|yes|YES) sh -c "$ankah_install";; *) exit 1;; esac
+    for candidate in python3 python; do
+        if command -v "$candidate" >/dev/null 2>&1 &&
+           "$candidate" -c 'import sys;sys.exit(sys.version_info[0] != 3)' >/dev/null 2>&1; then
+            ankah_python=$candidate
+            break
+        fi
+    done
+    if [ -z "$ankah_python" ]; then
+        echo 'Python 3 is still unavailable. Open a new terminal and retry.' >&2
+        exit 1
+    fi
+fi
+"$ankah_python" "$ankah_tmp" '@ANKAH_ORIGIN@' '@ANKAH_CHALLENGE@'
+exit $?
+:batch
+set "ANKAH_TMP=%TEMP%\ankah-%RANDOM%.py"
+curl.exe -fsSL -o "%ANKAH_TMP%" "@ANKAH_SOLVER_URL@"
+if errorlevel 1 goto :fetch_failed
+py -3 -c "import sys,hashlib;sys.exit(sys.version_info[0] != 3)" >NUL 2>&1
+if not errorlevel 1 goto :run_py
+python3 -c "import sys,hashlib;sys.exit(sys.version_info[0] != 3)" >NUL 2>&1
+if not errorlevel 1 goto :run_python3
+python -c "import sys,hashlib;sys.exit(sys.version_info[0] != 3)" >NUL 2>&1
+if not errorlevel 1 goto :run_python
+echo Python 3 is missing. Install with: winget install --id Python.Python.3.13 -e
+choice /M "Run that winget command now"
+if errorlevel 2 goto :missing
+winget install --id Python.Python.3.13 -e
+if errorlevel 1 goto :missing
+py -3 -c "import sys;sys.exit(sys.version_info[0] != 3)" >NUL 2>&1
+if errorlevel 1 goto :missing
+:run_py
+py -3 "%ANKAH_TMP%" "@ANKAH_ORIGIN@" "@ANKAH_CHALLENGE@"
+goto :cleanup
+:run_python3
+python3 "%ANKAH_TMP%" "@ANKAH_ORIGIN@" "@ANKAH_CHALLENGE@"
+goto :cleanup
+:run_python
+python "%ANKAH_TMP%" "@ANKAH_ORIGIN@" "@ANKAH_CHALLENGE@"
+goto :cleanup
+:fetch_failed
+echo Ankah could not download the solver.
+goto :cleanup
+:missing
+echo Open a new terminal after installing Python, then retry this challenge.
+:cleanup
+set "ANKAH_RESULT=%ERRORLEVEL%"
+del "%ANKAH_TMP%" >NUL 2>&1
+exit /b %ANKAH_RESULT%
