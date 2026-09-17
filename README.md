@@ -12,6 +12,11 @@ at paths containing their SHA-256 digest with
 `Cache-Control: public, max-age=31536000, immutable`. Challenge pages and
 scripts use `Cache-Control: no-store`.
 
+Ankah can also serve packaged application static files directly. The build
+helper detects common Python web app and frontend directories, then writes a
+content addressed bundle for Ankah to load at startup. See
+[build time static serving](docs/static-serving.md).
+
 ## Build and test
 
 Requires a C99 compiler, CMake, libuv, Mbed TLS's crypto library, and Python 3
@@ -41,6 +46,6 @@ trusted local processes.
 
 ## Release readiness
 
-TLS/HTTP/2, a WASM browser solver, trusted proxy IP handling, cross-platform
-builds, and the GitLab release pipeline are still pending. Do not place this
+TLS/HTTP/2, a WASM browser solver, trusted proxy IP handling, and cross-platform
+builds are still pending. Do not place this
 prototype in front of a public service yet.
