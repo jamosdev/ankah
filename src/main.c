@@ -1,5 +1,6 @@
 #include "ankah/http.h"
 #include "ankah/pow.h"
+#include "ankah/static.h"
 #include <uv.h>
 
 #include <inttypes.h>
@@ -52,6 +53,7 @@ struct connection {
     int closed;
     int websocket;
     int asset_index;
+    const ankah_static_entry *static_entry;
     size_t asset_offset;
 };
 
@@ -73,6 +75,7 @@ typedef struct {
     char public_origin[256];
     char secret_path[512];
     char assets_dir[512];
+    char static_dir[512];
     const char *allow[MAX_ALLOW];
     unsigned int allow_count;
     unsigned char secret[ANKAH_SECRET_SIZE];
@@ -82,6 +85,7 @@ typedef struct {
     int child_started;
     unsigned int connections;
     static_asset assets[ASSET_COUNT];
+    ankah_static_bundle static_bundle;
     rate_bucket rates[RATE_BUCKETS];
     double global_tokens;
     uint64_t global_last_ns;
@@ -264,6 +268,9 @@ static int parse_options(int argc, char **argv, int *child_index) {
         } else if (strcmp(argv[i], "--assets-dir") == 0) {
             if (strlen(argv[++i]) >= sizeof(config.assets_dir)) return -1;
             strcpy(config.assets_dir, argv[i]);
+        } else if (strcmp(argv[i], "--static-bundle") == 0) {
+            if (strlen(argv[++i]) >= sizeof(config.static_dir)) return -1;
+            strcpy(config.static_dir, argv[i]);
         } else if (strcmp(argv[i], "--allow-prefix") == 0) {
             if (config.allow_count == MAX_ALLOW) return -1;
             config.allow[config.allow_count++] = argv[++i];
@@ -277,7 +284,9 @@ static int parse_options(int argc, char **argv, int *child_index) {
                                   "0123456789.-:") != strlen(host)) return -1;
     }
     if (config.secret_path[0] == 0 || load_secret(config.secret_path) != 0 ||
-        load_assets() != 0) return -1;
+        load_assets() != 0 ||
+        (config.static_dir[0] &&
+         ankah_static_load(&config.static_bundle, config.static_dir) != 0)) return -1;
     return 0;
 }
 
@@ -329,7 +338,7 @@ static void on_write(uv_write_t *request, int status) {
         close_connection(c);
         return;
     }
-    if (c->asset_index >= 0 && c->pending == 0) {
+    if ((c->asset_index >= 0 || c->static_entry) && c->pending == 0) {
         send_asset_chunk(c);
         return;
     }
@@ -365,17 +374,24 @@ static int queue_bytes(connection *c, uv_stream_t *destination,
 }
 
 static void send_asset_chunk(connection *c) {
-    const static_asset *asset;
+    const unsigned char *data;
+    size_t size;
     size_t remaining, amount;
-    if (c->closed || c->asset_index < 0) return;
-    asset = &config.assets[c->asset_index];
-    remaining = asset->size - c->asset_offset;
+    if (c->closed) return;
+    if (c->static_entry) {
+        data = c->static_entry->data;
+        size = c->static_entry->size;
+    } else if (c->asset_index >= 0) {
+        data = config.assets[c->asset_index].data;
+        size = config.assets[c->asset_index].size;
+    } else return;
+    remaining = size - c->asset_offset;
     if (!remaining) { close_connection(c); return; }
     amount = remaining < 32768 ? remaining : 32768;
     c->asset_offset += amount;
     if (queue_bytes(c, (uv_stream_t *)&c->client, NULL,
-                    (const char *)asset->data + c->asset_offset - amount,
-                    amount, c->asset_offset == asset->size) != 0)
+                    (const char *)data + c->asset_offset - amount,
+                    amount, c->asset_offset == size) != 0)
         close_connection(c);
 }
 
@@ -439,6 +455,50 @@ static void serve_asset(connection *c) {
     if (!cached && strcmp(c->request.method, "HEAD") != 0) c->asset_index = (int)index;
     if (queue_bytes(c, (uv_stream_t *)&c->client, NULL, response, (size_t)length,
                     c->asset_index < 0) != 0) close_connection(c);
+}
+
+static int serve_static_if_matched(connection *c) {
+    char path[ANKAH_MAX_TARGET], response[1024];
+    const ankah_static_entry *entry;
+    const char *query = strchr(c->request.target, '?');
+    const char *conditional;
+    size_t length = query ? (size_t)(query - c->request.target) :
+                            strlen(c->request.target);
+    int cached, head, written;
+    if (!config.static_bundle.prefix || length >= sizeof(path)) return 0;
+    memcpy(path, c->request.target, length);
+    path[length] = 0;
+    entry = ankah_static_find(&config.static_bundle, path);
+    if (!entry) {
+        if (!ankah_static_in_namespace(&config.static_bundle, path)) return 0;
+        respond(c, 404, "Not Found", "text/plain", "Unknown static file\n", NULL);
+        return 1;
+    }
+    head = strcmp(c->request.method, "HEAD") == 0;
+    if (!head && strcmp(c->request.method, "GET") != 0) {
+        respond(c, 405, "Method Not Allowed", "text/plain",
+                "Method not allowed\n", "Allow: GET, HEAD\r\n");
+        return 1;
+    }
+    conditional = ankah_header_value(&c->request, "If-None-Match");
+    cached = conditional && strcmp(conditional, entry->etag) == 0;
+    written = snprintf(response, sizeof(response),
+                       "HTTP/1.1 %d %s\r\nContent-Type: %s\r\n"
+                       "Content-Length: %zu\r\nCache-Control: %s\r\n"
+                       "ETag: %s\r\nConnection: close\r\n\r\n",
+                       cached ? 304 : 200, cached ? "Not Modified" : "OK",
+                       entry->mime, cached ? (size_t)0 : entry->size,
+                       entry->immutable ? "public, max-age=31536000, immutable" :
+                                          "public, max-age=60",
+                       entry->etag);
+    if (written < 0 || (size_t)written >= sizeof(response)) {
+        close_connection(c);
+        return 1;
+    }
+    if (!cached && !head && entry->size) c->static_entry = entry;
+    if (queue_bytes(c, (uv_stream_t *)&c->client, NULL, response, (size_t)written,
+                    !c->static_entry) != 0) close_connection(c);
+    return 1;
 }
 
 static void respond(connection *c, int status, const char *reason,
@@ -762,6 +822,8 @@ static void handle_initial(connection *c) {
     c->body_received = c->initial_size - end;
     if (prefix(c->request.target, "/ankah/")) {
         handle_internal(c);
+    } else if (serve_static_if_matched(c)) {
+        return;
     } else if (!allowed(&c->request)) {
         handle_challenge(c);
     } else {
@@ -880,7 +942,8 @@ int main(int argc, char **argv) {
     if (parse_options(argc, argv, &child_index) != 0) {
         fprintf(stderr, "usage: ankah --public-origin https://host --secret-file path "
                         "[--listen ip:port] [--upstream ip:port] "
-                        "[--allow-prefix /path] [-- child command]\n");
+                        "[--allow-prefix /path] [--static-bundle dir] "
+                        "[-- child command]\n");
         return 2;
     }
     config.loop = uv_default_loop();

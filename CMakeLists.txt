@@ -21,7 +21,7 @@ target_include_directories(ankah_http PUBLIC include)
 target_link_libraries(ankah_http PUBLIC llhttp_static)
 find_path(LIBUV_INCLUDE_DIR uv.h REQUIRED)
 find_library(LIBUV_LIBRARY uv REQUIRED)
-add_executable(ankah src/main.c)
+add_executable(ankah src/main.c src/static.c)
 target_include_directories(ankah PRIVATE ${LIBUV_INCLUDE_DIR})
 if(UNIX)
   target_compile_definitions(ankah PRIVATE _POSIX_C_SOURCE=200809L)
@@ -39,4 +39,8 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME cache COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/cache_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME static COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/static_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR}/build_static_bundle.py
+    ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
