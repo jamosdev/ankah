@@ -2,7 +2,7 @@
 
 #include <mbedtls/entropy.h>
 #include <mbedtls/md.h>
-#include <mbedtls/sha256.h>
+#include "ankah/sha256.h"
 
 #include <inttypes.h>
 #include <stdio.h>
@@ -124,7 +124,7 @@ int ankah_check_answer(const unsigned char secret[ANKAH_SECRET_SIZE],
         !equal_secret(signature, expected, ANKAH_MAC_SIZE * 2)) return -1;
     length = snprintf(candidate, sizeof(candidate), "%s:%" PRIu64, nonce, counter);
     if (length < 0 || (size_t)length >= sizeof(candidate) ||
-        mbedtls_sha256_ret((const unsigned char *)candidate, (size_t)length, digest, 0) != 0) return -1;
+        ankah_sha256((const unsigned char *)candidate, (size_t)length, digest) != 0) return -1;
     full_bytes = (unsigned int)(bit_count / 8);
     remaining = (unsigned int)(bit_count % 8);
     for (i = 0; i < full_bytes; ++i) if (digest[i] != 0) return -1;

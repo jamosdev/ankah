@@ -3,16 +3,19 @@
   "use strict";
   const challenge = document.body.dataset.challenge;
   const progress = document.getElementById("progress");
+  const session = document.body.dataset.session;
+  const mobile = document.body.dataset.mobile === "1";
+  const panel = document.getElementById("phone-panel");
+  if (panel) {
+    panel.hidden = true;
+    setTimeout(() => { panel.hidden = false; }, 10000);
+  }
   const parts = challenge.split(".");
   const nonce = parts[0];
   const bits = Number(parts[2]);
   const encoder = new TextEncoder();
   let guesses = 0;
   let started = performance.now();
-
-  if (window.particlesJS) {
-    window.particlesJS.load("particles-js", document.body.dataset.particles);
-  }
 
   function passes(hash) {
     const full = Math.floor(bits / 8);
@@ -44,12 +47,19 @@
       if (passes(hash)) {
         update();
         progress.textContent = "Challenge passed. Continuing...";
+        const endpoint = session
+          ? `/ankah/answer/${session}?answer=${counter}`
+          : `/ankah/open?challenge=${encodeURIComponent(challenge)}&answer=${counter}`;
         const response = await fetch(
-          `/ankah/open?challenge=${encodeURIComponent(challenge)}&answer=${counter}`,
+          endpoint,
           { method: "POST", credentials: "same-origin", cache: "no-store" }
         );
         if (!response.ok) throw new Error("The answer was rejected");
-        location.reload();
+        if (mobile) {
+          progress.textContent = "Challenge passed. Click Finished on the original page.";
+        } else {
+          document.getElementById("finish").submit();
+        }
         return;
       }
     }
@@ -58,5 +68,6 @@
 
   solve().catch((error) => {
     progress.textContent = error.message;
+    if (panel) panel.hidden = false;
   });
 })();

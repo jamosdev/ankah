@@ -1,7 +1,7 @@
 #include "ankah/static.h"
 #include "ankah/http.h"
 
-#include <mbedtls/sha256.h>
+#include "ankah/sha256.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -87,8 +87,8 @@ static int parse_entry(ankah_static_entry *entry, char *line,
         if (mapping == MAP_FAILED) { close(descriptor); return -1; }
     }
     close(descriptor);
-    if (mbedtls_sha256_ret(declared_size ? mapping : "", (size_t)declared_size,
-                           digest, 0) != 0) {
+    if (ankah_sha256(declared_size ? mapping : "", (size_t)declared_size,
+                     digest) != 0) {
         if (mapping) munmap(mapping, (size_t)declared_size);
         return -1;
     }

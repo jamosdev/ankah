@@ -1,5 +1,6 @@
 stages:
   - scan
+  - build
   - publish
 
 default:
@@ -23,6 +24,16 @@ scan_release:
   script:
     - CI_COMMIT_BEFORE_SHA="$(git merge-base HEAD origin/main)" python3 tools/check_commit_message.py --ci-range
     - python3 tools/check_source.py
+
+build_test:
+  stage: build
+  image: python:3.12-alpine3.20
+  before_script:
+    - apk add --no-cache cmake make gcc g++ musl-dev libuv-dev mbedtls-dev git
+  script:
+    - cmake -S . -B ci-build
+    - cmake --build ci-build -j 2
+    - ctest --test-dir ci-build --output-on-failure
 
 publish_main:
   stage: publish
