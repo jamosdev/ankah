@@ -45,35 +45,51 @@ static int valid_prefix(const char *prefix) {
 }
 
 static int parse_entry(ankah_static_entry *entry, char *line,
-                       const char *directory, const char *prefix) {
-    char *fields[5], *cursor = line, *separator, *end;
+                       const char *directory, const char *prefix, int version) {
+    char *fields[6], *cursor = line, *separator, *end;
+    const char *digest_field, *size_field, *mime_field, *immutable_field;
+    ankah_static_variant *variant;
     char path[4096];
     struct stat metadata;
     unsigned char digest[32];
     size_t i;
     unsigned long long declared_size;
-    int descriptor, length;
+    int descriptor, length, encoding = 0;
     void *mapping = NULL;
-    for (i = 0; i < 4; ++i) {
+    for (i = 0; i < (version == 2 ? 5U : 4U); ++i) {
         fields[i] = cursor;
         separator = strchr(cursor, '\t');
         if (!separator) return -1;
         *separator = 0;
         cursor = separator + 1;
     }
-    fields[4] = cursor;
-    if (strchr(cursor, '\t') || !digest_name(fields[1]) ||
+    fields[version == 2 ? 5 : 4] = cursor;
+    if (version == 2) {
+        if (strcmp(fields[1], "gzip") == 0) encoding = 1;
+        else if (strcmp(fields[1], "br") == 0) encoding = 2;
+        else if (strcmp(fields[1], "identity") != 0) return -1;
+    }
+    digest_field = fields[version == 2 ? 2 : 1];
+    size_field = fields[version == 2 ? 3 : 2];
+    mime_field = fields[version == 2 ? 4 : 3];
+    immutable_field = fields[version == 2 ? 5 : 4];
+    variant = &entry->variants[encoding];
+    if (strchr(cursor, '\t') || !digest_name(digest_field) ||
         !fields[0][0] || strlen(fields[0]) >= ANKAH_MAX_TARGET ||
         strncmp(fields[0], prefix, strlen(prefix)) != 0 ||
         strchr(fields[0], '?') || strchr(fields[0], '#') ||
         strchr(fields[0], '\r') || strchr(fields[0], '\n') ||
-        !fields[2][0] || !fields[3][0] || strlen(fields[3]) > 128 ||
-        strchr(fields[3], '\r') || strchr(fields[3], '\n') ||
-        (strcmp(fields[4], "0") != 0 && strcmp(fields[4], "1") != 0)) return -1;
+        !size_field[0] || !mime_field[0] || strlen(mime_field) > 128 ||
+        strchr(mime_field, '\r') || strchr(mime_field, '\n') ||
+        (strcmp(immutable_field, "0") != 0 && strcmp(immutable_field, "1") != 0) ||
+        variant->present) return -1;
+    if (entry->url && (strcmp(entry->url, fields[0]) != 0 ||
+        strcmp(entry->mime, mime_field) != 0 ||
+        entry->immutable != (immutable_field[0] == '1'))) return -1;
     errno = 0;
-    declared_size = strtoull(fields[2], &end, 10);
+    declared_size = strtoull(size_field, &end, 10);
     if (errno || *end || declared_size > SIZE_MAX) return -1;
-    length = snprintf(path, sizeof(path), "%s/files/%s", directory, fields[1]);
+    length = snprintf(path, sizeof(path), "%s/files/%s", directory, digest_field);
     if (length < 0 || (size_t)length >= sizeof(path)) return -1;
     descriptor = open(path, O_RDONLY | O_NOFOLLOW);
     if (descriptor < 0) return -1;
@@ -94,27 +110,32 @@ static int parse_entry(ankah_static_entry *entry, char *line,
     }
     for (i = 0; i < 32; ++i) {
         static const char hex[] = "0123456789abcdef";
-        if (fields[1][i * 2] != hex[digest[i] >> 4] ||
-            fields[1][i * 2 + 1] != hex[digest[i] & 15]) {
+        if (digest_field[i * 2] != hex[digest[i] >> 4] ||
+            digest_field[i * 2 + 1] != hex[digest[i] & 15]) {
             if (mapping) munmap(mapping, (size_t)declared_size);
             return -1;
         }
     }
-    entry->url = strdup(fields[0]);
-    entry->mime = strdup(fields[3]);
-    if (!entry->url || !entry->mime) {
-        free(entry->url);
-        free(entry->mime);
-        if (mapping) munmap(mapping, (size_t)declared_size);
-        return -1;
+    if (!entry->url) {
+        entry->url = strdup(fields[0]);
+        entry->mime = strdup(mime_field);
+        if (!entry->url || !entry->mime) {
+            free(entry->url);
+            free(entry->mime);
+            entry->url = NULL;
+            entry->mime = NULL;
+            if (mapping) munmap(mapping, (size_t)declared_size);
+            return -1;
+        }
+        entry->immutable = immutable_field[0] == '1';
     }
-    entry->data = mapping;
-    entry->size = (size_t)declared_size;
-    entry->immutable = fields[4][0] == '1';
-    entry->etag[0] = '"';
-    memcpy(entry->etag + 1, fields[1], 64);
-    entry->etag[65] = '"';
-    entry->etag[66] = 0;
+    variant->data = mapping;
+    variant->size = (size_t)declared_size;
+    variant->present = 1;
+    variant->etag[0] = '"';
+    memcpy(variant->etag + 1, digest_field, 64);
+    variant->etag[65] = '"';
+    variant->etag[66] = 0;
     return 0;
 }
 
@@ -124,8 +145,10 @@ void ankah_static_free(ankah_static_bundle *bundle) {
     for (i = 0; i < bundle->count; ++i) {
         free(bundle->entries[i].url);
         free(bundle->entries[i].mime);
-        if (bundle->entries[i].data)
-            munmap(bundle->entries[i].data, bundle->entries[i].size);
+        for (int j = 0; j < 3; ++j)
+            if (bundle->entries[i].variants[j].data)
+                munmap(bundle->entries[i].variants[j].data,
+                       bundle->entries[i].variants[j].size);
     }
     free(bundle->entries);
     free(bundle->slots);
@@ -138,7 +161,7 @@ int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
     size_t line_capacity = 0, capacity = 0, i;
     ssize_t read_size;
     FILE *file = NULL;
-    int length, result = -1;
+    int length, result = -1, version;
     memset(bundle, 0, sizeof(*bundle));
     length = snprintf(path, sizeof(path), "%s/manifest.tsv", directory);
     if (length < 0 || (size_t)length >= sizeof(path)) return -1;
@@ -148,29 +171,40 @@ int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
     if (read_size < 0 || read_size > ANKAH_MAX_TARGET + 32 ||
         memchr(line, 0, (size_t)read_size) ||
         line[read_size - 1] != '\n' ||
-        strncmp(line, "ANKAH_STATIC_V1\t", 16) != 0) goto done;
+        (strncmp(line, "ANKAH_STATIC_V1\t", 16) != 0 &&
+         strncmp(line, "ANKAH_STATIC_V2\t", 16) != 0)) goto done;
+    version = line[14] == '2' ? 2 : 1;
     line[read_size - 1] = 0;
     bundle->prefix = strdup(line + 16);
     if (!bundle->prefix || !valid_prefix(bundle->prefix)) goto done;
     while ((read_size = getline(&line, &line_capacity, file)) >= 0) {
         ankah_static_entry *next;
         if (read_size > 4096 || memchr(line, 0, (size_t)read_size) ||
-            line[read_size - 1] != '\n' ||
-            bundle->count >= MAX_STATIC_FILES) goto done;
+            line[read_size - 1] != '\n') goto done;
         line[read_size - 1] = 0;
-        if (bundle->count == capacity) {
+        if (bundle->count == 0 || !bundle->entries[bundle->count - 1].url ||
+            strncmp(line, bundle->entries[bundle->count - 1].url,
+                    strlen(bundle->entries[bundle->count - 1].url)) != 0 ||
+            line[strlen(bundle->entries[bundle->count - 1].url)] != '\t') {
+          if (bundle->count >= MAX_STATIC_FILES ||
+              (bundle->count && !bundle->entries[bundle->count - 1].variants[0].present))
+              goto done;
+          if (bundle->count == capacity) {
             size_t new_capacity = capacity ? capacity * 2 : 32;
             next = realloc(bundle->entries, new_capacity * sizeof(*next));
             if (!next) goto done;
             bundle->entries = next;
             capacity = new_capacity;
+          }
+          memset(&bundle->entries[bundle->count], 0, sizeof(*bundle->entries));
+          ++bundle->count;
         }
-        memset(&bundle->entries[bundle->count], 0, sizeof(*bundle->entries));
-        if (parse_entry(&bundle->entries[bundle->count], line, directory,
-                        bundle->prefix) != 0) goto done;
-        ++bundle->count;
+        if (parse_entry(&bundle->entries[bundle->count - 1], line, directory,
+                        bundle->prefix, version) != 0) goto done;
     }
     if (ferror(file)) goto done;
+    if (bundle->count && !bundle->entries[bundle->count - 1].variants[0].present)
+        goto done;
     bundle->slot_count = 32;
     while (bundle->slot_count < bundle->count * 2) bundle->slot_count *= 2;
     bundle->slots = calloc(bundle->slot_count, sizeof(*bundle->slots));

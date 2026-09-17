@@ -2,6 +2,7 @@
 """Package a web application's static files for Ankah at image build time."""
 
 import argparse
+import gzip
 import hashlib
 import mimetypes
 from pathlib import Path
@@ -9,9 +10,11 @@ import re
 from urllib.parse import quote
 
 
-VERSION = "ANKAH_STATIC_V1"
+VERSION = "ANKAH_STATIC_V2"
 HASHED_NAME = re.compile(r"(?:^|[.-])[0-9a-fA-F]{8,}(?:[.-]|$)")
 SKIP_PARTS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
+COMPRESSIBLE = {"application/javascript", "application/json", "application/xml",
+                "application/wasm", "image/svg+xml"}
 
 
 def detect(root):
@@ -52,6 +55,10 @@ def validate_prefix(prefix):
 
 
 def package(source, output, prefix):
+    try:
+        import brotli
+    except ImportError as error:
+        raise ValueError("Brotli is required to build static bundles; install it with pip") from error
     source = source.resolve(strict=True)
     output = output.resolve()
     if output == source or source in output.parents:
@@ -88,10 +95,27 @@ def package(source, output, prefix):
         else:
             temp.rename(blob)
         immutable = int(bool(HASHED_NAME.search(path.name)))
-        record = f"\t{digest.hexdigest()}\t{size}\t{mime_type(path)}\t{immutable}\n"
-        lines.append(url + record)
+        mime = mime_type(path)
+        record = f"\tidentity\t{digest.hexdigest()}\t{size}\t{mime}\t{immutable}\n"
+        urls = [url]
         if prefix == "/" and relative.parts == ("index.html",):
-            lines.append("/" + record)
+            urls.append("/")
+        records = [record]
+        if size >= 1024 and (mime.startswith("text/") or mime.split(";", 1)[0] in COMPRESSIBLE):
+            original = blob.read_bytes()
+            for encoding, compressed in (("gzip", gzip.compress(original, compresslevel=9, mtime=0)),
+                                         ("br", brotli.compress(original, quality=11))):
+                if len(compressed) >= size:
+                    continue
+                compressed_digest = hashlib.sha256(compressed).hexdigest()
+                compressed_blob = files_dir / compressed_digest
+                if not compressed_blob.exists():
+                    compressed_blob.write_bytes(compressed)
+                variant = f"\t{encoding}\t{compressed_digest}\t{len(compressed)}\t{mime}\t{immutable}\n"
+                records.append(variant)
+        for item_url in urls:
+            for item_record in records:
+                lines.append(item_url + item_record)
         count += 1
     (output / "manifest.tsv").write_text("".join(lines), encoding="ascii")
     return count

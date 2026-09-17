@@ -4,11 +4,16 @@
 #include <stddef.h>
 
 typedef struct {
-    char *url;
-    char *mime;
     unsigned char *data;
     size_t size;
     char etag[67];
+    int present;
+} ankah_static_variant;
+
+typedef struct {
+    char *url;
+    char *mime;
+    ankah_static_variant variants[3];
     int immutable;
 } ankah_static_entry;
 

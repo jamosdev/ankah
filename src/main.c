@@ -6,10 +6,12 @@
 #include <uv.h>
 
 #include <inttypes.h>
+#include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
 #include "ankah/sha256.h"
@@ -24,6 +26,22 @@
 #define MAX_ASSET_SIZE (4U * 1024U * 1024U)
 #define ASSET_COUNT (8 + ANKAH_HAS_WASM)
 #define RATE_BUCKETS 1024
+#define MAX_STATIC_RANGES 16
+#define MAX_STATIC_SEGMENTS (MAX_STATIC_RANGES * 3 + 1)
+
+typedef struct cache_blob cache_blob;
+struct cache_blob {
+    cache_blob *previous, *next;
+    unsigned char *data;
+    char etag[67];
+    size_t size;
+    unsigned int pins;
+};
+
+typedef struct {
+    const unsigned char *data;
+    size_t size;
+} static_segment;
 
 typedef struct {
     char ip[64];
@@ -68,6 +86,12 @@ struct connection {
     int websocket;
     int asset_index;
     const ankah_static_entry *static_entry;
+    cache_blob *cache_pin;
+    static_segment segments[MAX_STATIC_SEGMENTS];
+    unsigned int segment_count, segment_index;
+    size_t segment_offset;
+    char segment_headers[8192];
+    size_t segment_headers_used;
     size_t asset_offset;
 };
 
@@ -100,6 +124,8 @@ typedef struct {
     unsigned int connections;
     static_asset assets[ASSET_COUNT];
     ankah_static_bundle static_bundle;
+    size_t static_cache_limit, static_cache_used;
+    cache_blob *cache_first, *cache_last;
     rate_bucket rates[RATE_BUCKETS];
     double global_tokens;
     uint64_t global_last_ns;
@@ -346,6 +372,7 @@ static int parse_options(int argc, char **argv, int *child_index) {
     strcpy(config.upstream_ip, "127.0.0.1");
     config.upstream_port = 8001;
     strcpy(config.assets_dir, ".");
+    config.static_cache_limit = 64U * 1024U * 1024U;
     *child_index = argc;
     for (i = 1; i < argc; ++i) {
         if (strcmp(argv[i], "--") == 0) {
@@ -371,6 +398,11 @@ static int parse_options(int argc, char **argv, int *child_index) {
         } else if (strcmp(argv[i], "--static-bundle") == 0) {
             if (strlen(argv[++i]) >= sizeof(config.static_dir)) return -1;
             strcpy(config.static_dir, argv[i]);
+        } else if (strcmp(argv[i], "--static-cache-mb") == 0) {
+            char *end;
+            unsigned long long megabytes = strtoull(argv[++i], &end, 10);
+            if (!argv[i][0] || *end || megabytes > SIZE_MAX / (1024U * 1024U)) return -1;
+            config.static_cache_limit = (size_t)megabytes * 1024U * 1024U;
         } else if (strcmp(argv[i], "--allow-prefix") == 0) {
             if (config.allow_count == MAX_ALLOW) return -1;
             config.allow[config.allow_count++] = argv[++i];
@@ -401,6 +433,7 @@ static void on_handle_closed(uv_handle_t *handle) {
 static void close_connection(connection *c) {
     if (c->closed) return;
     c->closed = 1;
+    if (c->cache_pin) --c->cache_pin->pins;
     if (c->capture_session) ankah_session_discard(c->capture_session);
     free(c->replay_body);
     c->replay_body = NULL;
@@ -502,8 +535,25 @@ static void send_asset_chunk(connection *c) {
     size_t remaining, amount;
     if (c->closed) return;
     if (c->static_entry) {
-        data = c->static_entry->data;
-        size = c->static_entry->size;
+        while (c->segment_index < c->segment_count &&
+               c->segment_offset == c->segments[c->segment_index].size) {
+            ++c->segment_index;
+            c->segment_offset = 0;
+        }
+        if (c->segment_index == c->segment_count) {
+            close_connection(c);
+            return;
+        }
+        data = c->segments[c->segment_index].data;
+        size = c->segments[c->segment_index].size;
+        remaining = size - c->segment_offset;
+        amount = remaining < 32768 ? remaining : 32768;
+        c->segment_offset += amount;
+        if (queue_bytes(c, (uv_stream_t *)&c->client, NULL,
+                        (const char *)data + c->segment_offset - amount, amount,
+                        c->segment_index + 1 == c->segment_count &&
+                        c->segment_offset == size) != 0) close_connection(c);
+        return;
     } else if (c->asset_index >= 0) {
         data = config.assets[c->asset_index].data;
         size = config.assets[c->asset_index].size;
@@ -580,14 +630,220 @@ static void serve_asset(connection *c) {
                     c->asset_index < 0) != 0) close_connection(c);
 }
 
+static void cache_unlink(cache_blob *blob) {
+    if (blob->previous) blob->previous->next = blob->next;
+    else config.cache_first = blob->next;
+    if (blob->next) blob->next->previous = blob->previous;
+    else config.cache_last = blob->previous;
+    blob->previous = blob->next = NULL;
+}
+
+static void cache_front(cache_blob *blob) {
+    blob->next = config.cache_first;
+    blob->previous = NULL;
+    if (blob->next) blob->next->previous = blob;
+    else config.cache_last = blob;
+    config.cache_first = blob;
+}
+
+static cache_blob *cache_get(const ankah_static_variant *variant, int fill) {
+    cache_blob *item, *previous;
+    if (!config.static_cache_limit || !variant->size ||
+        variant->size > config.static_cache_limit) return NULL;
+    for (item = config.cache_first; item; item = item->next) {
+        if (strcmp(item->etag, variant->etag) == 0) {
+            cache_unlink(item);
+            cache_front(item);
+            ++item->pins;
+            return item;
+        }
+    }
+    if (!fill) return NULL;
+    for (item = config.cache_last; item &&
+         config.static_cache_used > config.static_cache_limit - variant->size;
+         item = previous) {
+        previous = item->previous;
+        if (item->pins) continue;
+        cache_unlink(item);
+        config.static_cache_used -= item->size;
+        free(item->data);
+        free(item);
+    }
+    if (config.static_cache_used > config.static_cache_limit - variant->size)
+        return NULL;
+    item = calloc(1, sizeof(*item));
+    if (!item) return NULL;
+    item->data = malloc(variant->size);
+    if (!item->data) { free(item); return NULL; }
+    memcpy(item->data, variant->data, variant->size);
+    item->size = variant->size;
+    strcpy(item->etag, variant->etag);
+    item->pins = 1;
+    cache_front(item);
+    config.static_cache_used += item->size;
+    return item;
+}
+
+static int parse_quality(const char *start, const char **end) {
+    const char *p = start;
+    int value = 0, digits = 0, whole;
+    if (*p != '0' && *p != '1') return -1;
+    whole = *p++ - '0';
+    if (*p == '.') {
+        ++p;
+        while (*p >= '0' && *p <= '9') {
+            if (++digits > 3) return -1;
+            value = value * 10 + (*p++ - '0');
+        }
+    }
+    if (*p && *p != ',' && *p != ' ' && *p != '\t') return -1;
+    if (whole && value) return -1;
+    while (digits++ < 3) value *= 10;
+    *end = p;
+    return whole ? 1000 : value;
+}
+
+static int encoding_quality(const ankah_request *request, const char *name,
+                            int identity) {
+    int explicit_q = -1, wildcard_q = -1, found = 0;
+    unsigned int i;
+    for (i = 0; i < request->count; ++i) {
+        const char *p, *end;
+        if (!same_ascii(request->headers[i].name, "Accept-Encoding")) continue;
+        found = 1;
+        p = request->headers[i].value;
+        while (*p) {
+            const char *token, *token_end;
+            int q = 1000;
+            while (*p == ',' || *p == ' ' || *p == '\t') ++p;
+            token = p;
+            while (*p && *p != ',' && *p != ';' && *p != ' ' && *p != '\t') ++p;
+            token_end = p;
+            while (*p == ' ' || *p == '\t') ++p;
+            if (*p == ';') {
+                ++p;
+                while (*p == ' ' || *p == '\t') ++p;
+                if (strncasecmp(p, "q=", 2) != 0) q = 0;
+                else {
+                    p += 2;
+                    q = parse_quality(p, &p);
+                    if (q < 0) q = 0;
+                }
+            }
+            while (*p && *p != ',') ++p;
+            end = token_end;
+            if ((size_t)(end - token) == strlen(name) &&
+                strncasecmp(token, name, (size_t)(end - token)) == 0) explicit_q = q;
+            if (end - token == 1 && *token == '*') wildcard_q = q;
+        }
+    }
+    if (!found) return identity ? 1000 : 0;
+    if (explicit_q >= 0) return explicit_q;
+    if (identity) return wildcard_q == 0 ? 0 : 1000;
+    return wildcard_q >= 0 ? wildcard_q : 0;
+}
+
+static int etag_matches(const ankah_request *request, const char *etag) {
+    unsigned int i;
+    for (i = 0; i < request->count; ++i) {
+        const char *p;
+        if (!same_ascii(request->headers[i].name, "If-None-Match")) continue;
+        p = request->headers[i].value;
+        while (*p) {
+            const char *start, *end;
+            while (*p == ' ' || *p == '\t' || *p == ',') ++p;
+            start = p;
+            while (*p && *p != ',') ++p;
+            end = p;
+            while (end > start && (end[-1] == ' ' || end[-1] == '\t')) --end;
+            if (end - start == 1 && *start == '*') return 1;
+            if (end - start >= 2 && start[0] == 'W' && start[1] == '/') start += 2;
+            if ((size_t)(end - start) == strlen(etag) &&
+                strncmp(start, etag, (size_t)(end - start)) == 0) return 1;
+        }
+    }
+    return 0;
+}
+
+typedef struct { size_t first, last; } byte_range;
+
+static int parse_ranges(const char *value, size_t size, byte_range out[MAX_STATIC_RANGES]) {
+    const char *p;
+    int count = 0;
+    if (!value || strncmp(value, "bytes=", 6) != 0) return 0;
+    p = value + 6;
+    while (*p) {
+        unsigned long long first = 0, last = 0;
+        int suffix = 0, has_last = 0;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (*p == '-') suffix = 1;
+        else {
+            if (*p < '0' || *p > '9') return 0;
+            while (*p >= '0' && *p <= '9') {
+                unsigned int digit = (unsigned int)(*p++ - '0');
+                if (first > (ULLONG_MAX - digit) / 10) return 0;
+                first = first * 10 + digit;
+            }
+        }
+        if (*p++ != '-') return 0;
+        while (*p >= '0' && *p <= '9') {
+            unsigned int digit = (unsigned int)(*p++ - '0');
+            if (last > (ULLONG_MAX - digit) / 10) return 0;
+            last = last * 10 + digit;
+            has_last = 1;
+        }
+        if (suffix && !has_last) return 0;
+        if (!suffix && has_last && last < first) return 0;
+        if (++count > MAX_STATIC_RANGES) return 0;
+        if (size && ((suffix && last) || (!suffix && first < size))) {
+            byte_range *range = &out[count - 1];
+            range->first = suffix ? (last >= size ? 0 : size - (size_t)last) : (size_t)first;
+            range->last = suffix || !has_last || last >= size ? size - 1 : (size_t)last;
+        } else out[count - 1].first = SIZE_MAX;
+        while (*p == ' ' || *p == '\t') ++p;
+        if (!*p) break;
+        if (*p++ != ',' || !*p) return 0;
+    }
+    if (!count) return 0;
+    {
+        int i, kept = 0;
+        for (i = 0; i < count; ++i)
+            if (out[i].first != SIZE_MAX) out[kept++] = out[i];
+        return kept ? kept : -1;
+    }
+}
+
+static int static_add_segment(connection *c, const unsigned char *data, size_t size) {
+    if (c->segment_count == MAX_STATIC_SEGMENTS) return -1;
+    c->segments[c->segment_count].data = data;
+    c->segments[c->segment_count].size = size;
+    ++c->segment_count;
+    return 0;
+}
+
+static int static_add_text(connection *c, const char *text, size_t size) {
+    unsigned char *destination;
+    if (size > sizeof(c->segment_headers) - c->segment_headers_used) return -1;
+    destination = (unsigned char *)c->segment_headers + c->segment_headers_used;
+    memcpy(destination, text, size);
+    c->segment_headers_used += size;
+    return static_add_segment(c, destination, size);
+}
+
 static int serve_static_if_matched(connection *c) {
-    char path[ANKAH_MAX_TARGET], response[1024];
+    char path[ANKAH_MAX_TARGET], response[1024], part[512], boundary[48];
+    char content_type[256], range_field[128];
     const ankah_static_entry *entry;
+    const ankah_static_variant *variant;
+    const unsigned char *data;
     const char *query = strchr(c->request.target, '?');
-    const char *conditional;
+    const char *range_header, *if_range, *encoding = NULL;
+    byte_range ranges[MAX_STATIC_RANGES];
     size_t length = query ? (size_t)(query - c->request.target) :
                             strlen(c->request.target);
-    int cached, head, written;
+    size_t body_size;
+    int cached, head, written, code = 200, range_count = 0, selected = -1;
+    int best_quality = 0, i;
     if (!config.static_bundle.prefix || length >= sizeof(path)) return 0;
     memcpy(path, c->request.target, length);
     path[length] = 0;
@@ -603,24 +859,115 @@ static int serve_static_if_matched(connection *c) {
                 "Method not allowed\n", "Allow: GET, HEAD\r\n");
         return 1;
     }
-    conditional = ankah_header_value(&c->request, "If-None-Match");
-    cached = conditional && strcmp(conditional, entry->etag) == 0;
+    for (i = 2; i >= 0; --i) {
+        const char *name = i == 2 ? "br" : i == 1 ? "gzip" : "identity";
+        int quality = encoding_quality(&c->request, name, i == 0);
+        if (entry->variants[i].present && quality > best_quality) {
+            selected = i;
+            best_quality = quality;
+        }
+    }
+    if (selected < 0) {
+        if (head) {
+            static const char unavailable[] =
+                "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/plain\r\n"
+                "Content-Length: 36\r\nVary: Accept-Encoding\r\n"
+                "Cache-Control: no-store\r\n"
+                "Connection: close\r\n\r\n";
+            if (queue_bytes(c, (uv_stream_t *)&c->client, NULL, unavailable,
+                            sizeof(unavailable) - 1, 1) != 0) close_connection(c);
+        } else respond(c, 406, "Not Acceptable", "text/plain",
+                       "No acceptable static representation\n",
+                       "Vary: Accept-Encoding\r\n");
+        return 1;
+    }
+    variant = &entry->variants[selected];
+    if (selected == 1) encoding = "gzip";
+    if (selected == 2) encoding = "br";
+    cached = etag_matches(&c->request, variant->etag);
+    range_header = ankah_header_value(&c->request, "Range");
+    if_range = ankah_header_value(&c->request, "If-Range");
+    if (!cached && range_header && (!if_range || strcmp(if_range, variant->etag) == 0)) {
+        range_count = parse_ranges(range_header, variant->size, ranges);
+        if (range_count != 0) code = range_count < 0 ? 416 : 206;
+    }
+    body_size = code == 416 || cached ? 0 : variant->size;
+    data = variant->data;
+    if (code == 200 && !cached && !head && selected && variant->size) {
+        c->cache_pin = cache_get(variant, 1);
+        if (c->cache_pin) data = c->cache_pin->data;
+    } else if (code == 206 && !head && selected) {
+        c->cache_pin = cache_get(variant, 0);
+        if (c->cache_pin) data = c->cache_pin->data;
+    }
+    if (code == 206 && range_count == 1) {
+        body_size = ranges[0].last - ranges[0].first + 1;
+        if (static_add_segment(c, data + ranges[0].first, body_size) != 0) goto failed;
+    } else if (code == 206 && range_count > 1) {
+        int n;
+        body_size = 0;
+        snprintf(boundary, sizeof(boundary), "ankah-%.*s", 32, variant->etag + 1);
+        for (i = 0; i < range_count; ++i) {
+            size_t piece = ranges[i].last - ranges[i].first + 1;
+            n = snprintf(part, sizeof(part),
+                         "--%s\r\nContent-Type: %s\r\nContent-Range: bytes %zu-%zu/%zu\r\n\r\n",
+                         boundary, entry->mime, ranges[i].first, ranges[i].last,
+                         variant->size);
+            if (n < 0 || (size_t)n >= sizeof(part) ||
+                body_size > SIZE_MAX - (size_t)n - piece - 2 ||
+                static_add_text(c, part, (size_t)n) != 0 ||
+                static_add_segment(c, data + ranges[i].first, piece) != 0 ||
+                static_add_text(c, "\r\n", 2) != 0) goto failed;
+            body_size += (size_t)n + piece + 2;
+        }
+        n = snprintf(part, sizeof(part), "--%s--\r\n", boundary);
+        if (n < 0 || (size_t)n >= sizeof(part) ||
+            body_size > SIZE_MAX - (size_t)n ||
+            static_add_text(c, part, (size_t)n) != 0) goto failed;
+        body_size += (size_t)n;
+    } else if (code == 200 && !cached && variant->size) {
+        if (static_add_segment(c, data, variant->size) != 0) goto failed;
+    }
+    if (code == 206 && range_count > 1) {
+        written = snprintf(content_type, sizeof(content_type),
+                           "multipart/byteranges; boundary=%s", boundary);
+    } else written = snprintf(content_type, sizeof(content_type), "%s", entry->mime);
+    if (written < 0 || (size_t)written >= sizeof(content_type)) goto failed;
+    range_field[0] = 0;
+    if (code == 206 && range_count == 1) {
+        written = snprintf(range_field, sizeof(range_field),
+                           "Content-Range: bytes %zu-%zu/%zu\r\n",
+                           ranges[0].first, ranges[0].last, variant->size);
+    } else if (code == 416) {
+        written = snprintf(range_field, sizeof(range_field),
+                           "Content-Range: bytes */%zu\r\n", variant->size);
+    } else written = 0;
+    if (written < 0 || (size_t)written >= sizeof(range_field)) goto failed;
     written = snprintf(response, sizeof(response),
                        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\n"
                        "Content-Length: %zu\r\nCache-Control: %s\r\n"
-                       "ETag: %s\r\nConnection: close\r\n\r\n",
-                       cached ? 304 : 200, cached ? "Not Modified" : "OK",
-                       entry->mime, cached ? (size_t)0 : entry->size,
+                       "ETag: %s\r\nVary: Accept-Encoding\r\nAccept-Ranges: bytes\r\n"
+                       "%s%sConnection: close\r\n\r\n",
+                       cached ? 304 : code,
+                       cached ? "Not Modified" : code == 206 ? "Partial Content" :
+                       code == 416 ? "Range Not Satisfiable" : "OK",
+                       content_type,
+                       body_size,
                        entry->immutable ? "public, max-age=31536000, immutable" :
                                           "public, max-age=60",
-                       entry->etag);
+                       variant->etag,
+                       encoding ? (selected == 1 ? "Content-Encoding: gzip\r\n" :
+                                                   "Content-Encoding: br\r\n") : "",
+                       range_field);
     if (written < 0 || (size_t)written >= sizeof(response)) {
-        close_connection(c);
-        return 1;
+        goto failed;
     }
-    if (!cached && !head && entry->size) c->static_entry = entry;
+    if (!cached && code != 416 && !head && body_size) c->static_entry = entry;
     if (queue_bytes(c, (uv_stream_t *)&c->client, NULL, response, (size_t)written,
                     !c->static_entry) != 0) close_connection(c);
+    return 1;
+failed:
+    close_connection(c);
     return 1;
 }
 
@@ -1294,7 +1641,7 @@ int main(int argc, char **argv) {
     if (parse_options(argc, argv, &child_index) != 0) {
         fprintf(stderr, "usage: ankah --public-origin https://host --secret-file path "
                         "[--listen ip:port] [--upstream ip:port] "
-                        "[--allow-prefix /path] [--static-bundle dir] "
+                        "[--allow-prefix /path] [--static-bundle dir] [--static-cache-mb n] "
                         "[-- child command]\n");
         return 2;
     }

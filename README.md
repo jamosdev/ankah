@@ -37,6 +37,9 @@ Ankah can also serve packaged application static files directly. The build
 helper detects common Python web app and frontend directories, then writes a
 content addressed bundle for Ankah to load at startup. See
 [build time static serving](docs/static-serving.md).
+The builder also stores gzip and Brotli variants. Static responses support
+single and multipart byte ranges, and a bounded memory cache retains hot
+compressed files.
 
 ## Build and test
 

@@ -35,8 +35,11 @@ python3 build_static_bundle.py --project-root /app --source dist \
 With a root mount, `index.html` is also available at `/`. Other URLs must
 match a packaged file exactly; this does not add a catch-all SPA fallback.
 
-The output contains `manifest.tsv` and content addressed files under
-`files/`. Put the complete directory in the runtime image at the same path
+Install the Python `Brotli` package in the build stage. The helper stores
+smaller gzip and Brotli versions of text, JavaScript, JSON, XML, SVG, and
+WebAssembly files of at least 1 KiB. The output contains a version 2
+`manifest.tsv` and content addressed files under `files/`. Ankah also accepts
+older version 1 bundles. Put the complete directory in the runtime image at the same path
 passed to `--static-bundle`. Ankah checks file hashes while loading it. Keep
 the package read only at runtime. The helper skips hidden files and rejects
 symbolic links. It requires a new or empty output directory.
@@ -58,6 +61,7 @@ WORKDIR /app
 COPY . .
 # For Django, run this after dependencies are installed:
 # RUN python manage.py collectstatic --noinput
+RUN python -m pip install Brotli==1.1.0
 COPY --from=ankah /build_static_bundle.py /usr/local/bin/build_static_bundle.py
 RUN python /usr/local/bin/build_static_bundle.py \
     --project-root /app --output /opt/ankah-static
@@ -71,5 +75,10 @@ Static files under the configured prefix are public and bypass the challenge.
 Ankah serves `GET` and `HEAD`, returns 404 for unknown paths in a non-root
 static namespace, and sends other URLs through the existing routing. It sends
 an ETag and a short cache lifetime by default. Filenames containing a long hex
-fingerprint receive an immutable cache lifetime. Compression negotiation and
-range requests are not implemented yet.
+fingerprint receive an immutable cache lifetime. `Accept-Encoding` selects the
+most preferred available representation, with Brotli winning ties; each has its own ETag. Byte
+ranges address the selected representation, including its compressed bytes.
+Single and multipart ranges are supported, up to 16 ranges per request.
+Ankah keeps a 64 MiB LRU cache of compressed files used by full GET responses.
+Set `--static-cache-mb N` to change its size, or `0` to disable it. Range
+responses use a cached copy if one exists but do not fill the cache.
