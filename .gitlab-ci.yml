@@ -4,6 +4,8 @@ stages:
 
 default:
   image: python:3.12-alpine
+  tags:
+    - docker
   before_script:
     - apk add --no-cache git
     - git fetch origin +refs/heads/main:refs/remotes/origin/main
