@@ -1,6 +1,8 @@
 #include "ankah/http.h"
 #include "ankah/files.h"
+#include "ankah/frontend.h"
 #include "ankah/pow.h"
+#include "ankah/proxy.h"
 #include "ankah/static.h"
 #include "ankah/session.h"
 #include "ankah/qr.h"
@@ -84,6 +86,8 @@ struct connection {
     int forwarding;
     int closed;
     int websocket;
+    int internal;
+    int rate_checked;
     int asset_index;
     const ankah_static_entry *static_entry;
     cache_blob *cache_pin;
@@ -116,11 +120,18 @@ typedef struct {
     char secret_path[512];
     char assets_dir[512];
     char static_dir[512];
+    char tls_certificate[512];
+    char tls_key[512];
+    char internal_key[65];
     const char *allow[MAX_ALLOW];
     unsigned int allow_count;
+    ankah_network trusted_proxies[ANKAH_MAX_TRUSTED_PROXIES];
+    unsigned int trusted_proxy_count;
     unsigned char secret[ANKAH_SECRET_SIZE];
     uv_loop_t *loop;
     uv_tcp_t listener;
+    uv_tcp_t internal_listener;
+    int internal_listener_initialized;
     uv_process_t child;
     int child_started;
     unsigned int connections;
@@ -387,19 +398,45 @@ static int load_assets(void) {
 }
 
 static int parse_address(const char *input, char *ip, size_t capacity, int *port) {
-    const char *colon = strrchr(input, ':');
+    const char *colon, *address_start = input, *address_end;
     char *end;
     long value;
     size_t length;
-    if (!colon) return -1;
-    length = (size_t)(colon - input);
+    if (input[0] == '[') {
+        address_start = input + 1;
+        address_end = strchr(address_start, ']');
+        if (!address_end || address_end[1] != ':') return -1;
+        colon = address_end + 1;
+    } else {
+        colon = strrchr(input, ':');
+        if (!colon || memchr(input, ':', (size_t)(colon - input))) return -1;
+        address_end = colon;
+    }
+    length = (size_t)(address_end - address_start);
     if (length == 0 || length >= capacity) return -1;
-    memcpy(ip, input, length);
+    memcpy(ip, address_start, length);
     ip[length] = 0;
     value = strtol(colon + 1, &end, 10);
     if (*end || value < 1 || value > 65535) return -1;
     *port = (int)value;
     return 0;
+}
+
+static int socket_address(const char *ip, int port, struct sockaddr_storage *out) {
+    memset(out, 0, sizeof(*out));
+    if (strchr(ip, ':'))
+        return uv_ip6_addr(ip, port, (struct sockaddr_in6 *)out);
+    return uv_ip4_addr(ip, port, (struct sockaddr_in *)out);
+}
+
+static void hex_encode(const unsigned char *input, size_t size, char *out) {
+    static const char digits[] = "0123456789abcdef";
+    size_t i;
+    for (i = 0; i < size; ++i) {
+        out[i * 2] = digits[input[i] >> 4];
+        out[i * 2 + 1] = digits[input[i] & 15];
+    }
+    out[size * 2] = 0;
 }
 
 static int valid_allow_prefix(const char *value) {
@@ -451,6 +488,18 @@ static int parse_options(int argc, char **argv, int *child_index) {
             if (decimal_u64(argv[++i], &megabytes) != 0 ||
                 megabytes > SIZE_MAX / (1024U * 1024U)) return -1;
             config.static_cache_limit = (size_t)megabytes * 1024U * 1024U;
+        } else if (strcmp(argv[i], "--tls-cert") == 0) {
+            if (strlen(argv[++i]) >= sizeof(config.tls_certificate)) return -1;
+            strcpy(config.tls_certificate, argv[i]);
+        } else if (strcmp(argv[i], "--tls-key") == 0) {
+            if (strlen(argv[++i]) >= sizeof(config.tls_key)) return -1;
+            strcpy(config.tls_key, argv[i]);
+        } else if (strcmp(argv[i], "--trusted-proxy") == 0) {
+            if (config.trusted_proxy_count == ANKAH_MAX_TRUSTED_PROXIES ||
+                ankah_parse_network(argv[++i],
+                                    &config.trusted_proxies[config.trusted_proxy_count]) != 0)
+                return -1;
+            ++config.trusted_proxy_count;
         } else if (strcmp(argv[i], "--allow-prefix") == 0) {
             if (config.allow_count == MAX_ALLOW || !valid_allow_prefix(argv[i + 1])) return -1;
             config.allow[config.allow_count++] = argv[++i];
@@ -459,10 +508,12 @@ static int parse_options(int argc, char **argv, int *child_index) {
     if (!prefix(config.public_origin, "https://") &&
         !prefix(config.public_origin, "http://")) return -1;
     config.public_https = prefix(config.public_origin, "https://");
+    if (!!config.tls_certificate[0] != !!config.tls_key[0] ||
+        (config.tls_certificate[0] && !config.public_https)) return -1;
     {
         const char *host = strstr(config.public_origin, "://") + 3;
         if (!*host || strspn(host, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
-                                  "0123456789.-:") != strlen(host)) return -1;
+                                  "0123456789.-:[]") != strlen(host)) return -1;
         strcpy(config.public_host, host);
     }
     if (config.secret_path[0] == 0 || load_secret(config.secret_path) != 0 ||
@@ -551,6 +602,7 @@ static void on_write(uv_write_t *request, int status) {
 static int queue_bytes(connection *c, uv_stream_t *destination,
                        uv_stream_t *source, const char *data, size_t length, int finish) {
     queued_write *write = (queued_write *)calloc(1, sizeof(*write));
+    uv_buf_t buffers[1];
     int result;
     if (!write || length > 65536) { free(write); return -1; }
     write->buffer.base = (char *)malloc(length ? length : 1);
@@ -562,7 +614,8 @@ static int queue_bytes(connection *c, uv_stream_t *destination,
     write->finish = finish;
     write->request.data = write;
     ++c->pending;
-    result = uv_write(&write->request, destination, &write->buffer, 1, on_write);
+    buffers[0] = write->buffer;
+    result = uv_write(&write->request, destination, buffers, 1, on_write);
     if (result < 0) {
         --c->pending;
         free(write->buffer.base);
@@ -1458,9 +1511,37 @@ static int skip_upstream_header(const connection *c, const ankah_header *header)
         same_ascii(header->name, "Upgrade") ||
         same_ascii(header->name, "Forwarded") ||
         same_ascii(header->name, "X-Real-IP") ||
+        starts_ascii(header->name, "X-Ankah-Internal-") ||
         starts_ascii(header->name, "X-Forwarded-") ||
         (c->replaying && same_ascii(header->name, "Expect"))) return 1;
     return connection_names_header(&c->request, header->name);
+}
+
+static int prepare_client_ip(connection *c) {
+    char direct[64], resolved[64];
+    const char *key = NULL, *peer = NULL;
+    unsigned int key_count = 0, peer_count = 0, i;
+    strcpy(direct, c->peer_ip);
+    for (i = 0; i < c->request.count; ++i) {
+        const ankah_header *header = &c->request.headers[i];
+        if (same_ascii(header->name, "X-Ankah-Internal-Key")) {
+            key = header->value;
+            ++key_count;
+        } else if (same_ascii(header->name, "X-Ankah-Internal-Peer")) {
+            peer = header->value;
+            ++peer_count;
+        }
+    }
+    if (c->internal) {
+        if (key_count != 1 || peer_count != 1 ||
+            strcmp(key, config.internal_key) != 0 ||
+            ankah_normalize_ip(peer, direct, sizeof(direct)) != 0) return -1;
+    }
+    if (ankah_resolve_client_ip(&c->request, direct,
+                                config.trusted_proxies, config.trusted_proxy_count,
+                                resolved, sizeof(resolved)) != 0) return -1;
+    strcpy(c->peer_ip, resolved);
+    return 0;
 }
 
 static int build_upstream_request(const connection *c, char *out, size_t capacity) {
@@ -1516,9 +1597,9 @@ static void on_connected(uv_connect_t *request, int status) {
 }
 
 static int start_upstream(connection *c) {
-    struct sockaddr_in address;
+    struct sockaddr_storage address;
     int result;
-    if (uv_ip4_addr(config.upstream_ip, config.upstream_port, &address) != 0) return -1;
+    if (socket_address(config.upstream_ip, config.upstream_port, &address) != 0) return -1;
     if (uv_tcp_init(config.loop, &c->upstream) != 0) return -1;
     c->upstream_initialized = 1;
     c->upstream.data = c;
@@ -1573,6 +1654,18 @@ static void handle_initial(connection *c) {
     if (ankah_parse_request(c->initial, end, &c->request) != 0) {
         respond(c, 400, "Bad Request", "text/plain", "Invalid HTTP request\n", NULL);
         return;
+    }
+    if (prepare_client_ip(c) != 0) {
+        respond(c, 400, "Bad Request", "text/plain", "Invalid forwarding information\n", NULL);
+        return;
+    }
+    if (!c->rate_checked) {
+        c->rate_checked = 1;
+        if (!allow_rate(c->peer_ip)) {
+            respond(c, 429, "Too Many Requests", "text/plain",
+                    "Rate limit exceeded\n", "Retry-After: 1\r\n");
+            return;
+        }
     }
     {
         const char *request_host = ankah_header_value(&c->request, "Host");
@@ -1731,6 +1824,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
     c = (connection *)calloc(1, sizeof(*c));
     if (!c) return;
     c->asset_index = -1;
+    c->internal = server == (uv_stream_t *)&config.internal_listener;
     if (uv_tcp_init(config.loop, &c->client) != 0) { free(c); return; }
     c->client.data = c;
     c->handles = 1;
@@ -1750,12 +1844,9 @@ static void on_new_connection(uv_stream_t *server, int status) {
     if (uv_tcp_getpeername(&c->client, (struct sockaddr *)&address, &address_size) == 0 &&
         address.ss_family == AF_INET) {
         uv_ip4_name((const struct sockaddr_in *)&address, c->peer_ip, sizeof(c->peer_ip));
+    } else if (address.ss_family == AF_INET6) {
+        uv_ip6_name((const struct sockaddr_in6 *)&address, c->peer_ip, sizeof(c->peer_ip));
     } else strcpy(c->peer_ip, "0.0.0.0");
-    if (!allow_rate(c->peer_ip)) {
-        respond(c, 429, "Too Many Requests", "text/plain",
-                "Rate limit exceeded\n", "Retry-After: 1\r\n");
-        return;
-    }
     refresh_timeout(c);
     if (uv_read_start((uv_stream_t *)&c->client, allocate_read, on_client_read) != 0)
         close_connection(c);
@@ -1766,25 +1857,62 @@ static void on_child_exit(uv_process_t *process, int64_t status, int signal_numb
             status, signal_number);
     uv_close((uv_handle_t *)process, NULL);
     uv_close((uv_handle_t *)&config.listener, NULL);
+    if (config.internal_listener_initialized)
+        uv_close((uv_handle_t *)&config.internal_listener, NULL);
     uv_stop(config.loop);
 }
 
 int main(int argc, char **argv) {
-    struct sockaddr_in address;
+    struct sockaddr_storage address;
     uv_process_options_t child_options;
+    ankah_frontend_options frontend_options;
     int child_index, result;
     if (parse_options(argc, argv, &child_index) != 0) {
         fprintf(stderr, "usage: ankah --public-origin https://host --secret-file path "
                         "[--listen ip:port] [--upstream ip:port] "
                         "[--allow-prefix /path] [--static-bundle dir] [--static-cache-mb n] "
+                        "[--tls-cert path --tls-key path] [--trusted-proxy cidr] "
                         "[-- child command]\n");
         return 2;
     }
     config.loop = uv_default_loop();
-    if (uv_ip4_addr(config.listen_ip, config.listen_port, &address) != 0 ||
+    if (config.tls_certificate[0]) {
+        struct sockaddr_in internal_address;
+        int address_size = sizeof(internal_address);
+        unsigned char random_key[32];
+        if (ankah_random(random_key, sizeof(random_key)) != 0) {
+            fprintf(stderr, "Ankah failed to initialize internal routing\n");
+            return 1;
+        }
+        hex_encode(random_key, sizeof(random_key), config.internal_key);
+        if (uv_ip4_addr("127.0.0.1", 0, &internal_address) != 0 ||
+            uv_tcp_init(config.loop, &config.internal_listener) != 0 ||
+            uv_tcp_bind(&config.internal_listener,
+                        (const struct sockaddr *)&internal_address, 0) != 0 ||
+            uv_listen((uv_stream_t *)&config.internal_listener, 128,
+                      on_new_connection) != 0 ||
+            uv_tcp_getsockname(&config.internal_listener,
+                               (struct sockaddr *)&internal_address, &address_size) != 0) {
+            fprintf(stderr, "Ankah failed to initialize internal routing\n");
+            return 1;
+        }
+        config.internal_listener_initialized = 1;
+        memset(&frontend_options, 0, sizeof(frontend_options));
+        frontend_options.loop = config.loop;
+        frontend_options.certificate_path = config.tls_certificate;
+        frontend_options.key_path = config.tls_key;
+        frontend_options.internal_key = config.internal_key;
+        frontend_options.internal_port = ntohs(internal_address.sin_port);
+        if (ankah_frontend_init(&frontend_options) != 0) {
+            fprintf(stderr, "Ankah failed to initialize TLS\n");
+            return 1;
+        }
+    }
+    if (socket_address(config.listen_ip, config.listen_port, &address) != 0 ||
         uv_tcp_init(config.loop, &config.listener) != 0 ||
         uv_tcp_bind(&config.listener, (const struct sockaddr *)&address, 0) != 0 ||
-        uv_listen((uv_stream_t *)&config.listener, 128, on_new_connection) != 0) {
+        uv_listen((uv_stream_t *)&config.listener, 128,
+                  config.tls_certificate[0] ? ankah_frontend_accept : on_new_connection) != 0) {
         fprintf(stderr, "Ankah failed to listen\n");
         return 1;
     }
@@ -1801,5 +1929,7 @@ int main(int argc, char **argv) {
         config.child_started = 1;
     }
     fprintf(stderr, "Ankah listening on %s:%d\n", config.listen_ip, config.listen_port);
-    return uv_run(config.loop, UV_RUN_DEFAULT) == 0 ? 0 : 1;
+    result = uv_run(config.loop, UV_RUN_DEFAULT) == 0 ? 0 : 1;
+    if (config.tls_certificate[0]) ankah_frontend_shutdown();
+    return result;
 }

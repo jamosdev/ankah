@@ -42,6 +42,22 @@ FetchContent_Declare(llhttp
   URL_HASH SHA256=1eb813c7437b31a87496a1cd3ed79f00746720f5e7e29c79b42c02cb69f36c39
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(llhttp)
+if(ANKAH_BUNDLED_RUNTIME_DEPS)
+  set(ENABLE_LIB_ONLY ON CACHE BOOL "" FORCE)
+  set(ENABLE_FAILMALLOC OFF CACHE BOOL "" FORCE)
+  set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+  set(BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(nghttp2
+    URL https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz
+    URL_HASH SHA256=e05cb1388eaca3830aded4ccf20044b6e1ac1a61411dcca11b0437c4285c8bc2
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(nghttp2)
+  set(ANKAH_NGHTTP2 nghttp2_static)
+else()
+  find_path(NGHTTP2_INCLUDE_DIR nghttp2/nghttp2.h REQUIRED)
+  find_library(NGHTTP2_LIBRARY nghttp2 REQUIRED)
+  set(ANKAH_NGHTTP2 ${NGHTTP2_LIBRARY})
+endif()
 FetchContent_Declare(qrcodegen
   URL https://github.com/nayuki/QR-Code-generator/archive/3c6d0b3cefb4e049dc337e82237c9644399716a8.tar.gz
   URL_HASH SHA256=ea6326674b89e3af6d055dac722d5d03ffd3a1d3edb5acd8d691a8b89236907b
@@ -68,11 +84,15 @@ if(ANKAH_BUNDLED_RUNTIME_DEPS)
     DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
   FetchContent_MakeAvailable(mbedtls)
   set(ANKAH_MBEDCRYPTO mbedcrypto)
+  set(ANKAH_MBEDTLS_TLS mbedtls mbedx509)
 else()
-  find_path(MBEDTLS_INCLUDE_DIR mbedtls/sha256.h REQUIRED)
+  find_path(MBEDTLS_INCLUDE_DIR mbedtls/ssl.h REQUIRED)
   find_library(MBEDCRYPTO_LIBRARY mbedcrypto REQUIRED)
+  find_library(MBEDTLS_LIBRARY mbedtls REQUIRED)
+  find_library(MBEDX509_LIBRARY mbedx509 REQUIRED)
   target_include_directories(ankah_pow PRIVATE ${MBEDTLS_INCLUDE_DIR})
   set(ANKAH_MBEDCRYPTO ${MBEDCRYPTO_LIBRARY})
+  set(ANKAH_MBEDTLS_TLS ${MBEDTLS_LIBRARY} ${MBEDX509_LIBRARY})
 endif()
 target_link_libraries(ankah_pow PUBLIC ${ANKAH_MBEDCRYPTO})
 add_library(ankah_http STATIC src/http.c)
@@ -96,7 +116,8 @@ else()
   find_library(LIBUV_LIBRARY uv REQUIRED)
   set(ANKAH_LIBUV ${LIBUV_LIBRARY})
 endif()
-add_executable(ankah src/main.c src/static.c src/session.c src/files.c)
+add_executable(ankah src/main.c src/static.c src/session.c src/files.c
+  src/proxy.c src/frontend.c)
 if(ANKAH_WASM_SOLVER)
   add_dependencies(ankah ankah-browser-pow)
   target_include_directories(ankah PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -105,19 +126,30 @@ else()
   target_compile_definitions(ankah PRIVATE ANKAH_HAS_WASM=0)
 endif()
 if(NOT ANKAH_BUNDLED_RUNTIME_DEPS)
-  target_include_directories(ankah PRIVATE ${LIBUV_INCLUDE_DIR})
+  target_include_directories(ankah PRIVATE ${LIBUV_INCLUDE_DIR} ${MBEDTLS_INCLUDE_DIR}
+    ${NGHTTP2_INCLUDE_DIR})
 endif()
 if(UNIX)
   target_compile_definitions(ankah PRIVATE _POSIX_C_SOURCE=200809L)
 endif()
-target_link_libraries(ankah PRIVATE ankah_http ankah_pow ankah_qr ${ANKAH_LIBUV})
+target_link_libraries(ankah PRIVATE ankah_http ankah_pow ankah_qr ${ANKAH_LIBUV}
+  ${ANKAH_MBEDTLS_TLS} ${ANKAH_NGHTTP2})
 add_executable(ankah-pow tests/pow_test.c)
 target_link_libraries(ankah-pow PRIVATE ankah_pow)
 add_executable(ankah-http tests/http_test.c)
 target_link_libraries(ankah-http PRIVATE ankah_http)
 add_executable(ankah-session tests/session_test.c src/session.c)
 target_link_libraries(ankah-session PRIVATE ankah_pow)
-set(ANKAH_PROJECT_TARGETS ankah ankah-pow ankah-http ankah-session
+add_executable(ankah-proxy tests/proxy_test.c src/proxy.c)
+target_include_directories(ankah-proxy PRIVATE include)
+if(UNIX)
+  target_compile_definitions(ankah-proxy PRIVATE _POSIX_C_SOURCE=200809L)
+endif()
+if(NOT ANKAH_BUNDLED_RUNTIME_DEPS)
+  target_include_directories(ankah-proxy PRIVATE ${LIBUV_INCLUDE_DIR})
+endif()
+target_link_libraries(ankah-proxy PRIVATE ${ANKAH_LIBUV})
+set(ANKAH_PROJECT_TARGETS ankah ankah-pow ankah-http ankah-session ankah-proxy
   ankah_qr ankah_pow ankah_http)
 if(ANKAH_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   foreach(target IN LISTS ANKAH_PROJECT_TARGETS)
@@ -126,7 +158,7 @@ if(ANKAH_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 if(MINGW)
   target_compile_definitions(ankah PRIVATE _WIN32_WINNT=0x0A00)
-  foreach(target ankah ankah-pow ankah-http ankah-session)
+  foreach(target ankah ankah-pow ankah-http ankah-session ankah-proxy)
     target_link_options(${target} PRIVATE -static -static-libgcc)
   endforeach()
 endif()
@@ -134,6 +166,7 @@ enable_testing()
 add_test(NAME pow COMMAND ankah-pow)
 add_test(NAME http COMMAND ankah-http)
 add_test(NAME session COMMAND ankah-session)
+add_test(NAME proxy COMMAND ankah-proxy)
 if(NOT Python3_Interpreter_FOUND)
   find_package(Python3 COMPONENTS Interpreter)
 endif()
@@ -151,8 +184,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME platform COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/platform_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME tls_http2 COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_http2_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
   if(CMAKE_CROSSCOMPILING)
-    set_tests_properties(cache static continuation platform PROPERTIES
+    set_tests_properties(cache static continuation platform tls_http2 PROPERTIES
       ENVIRONMENT "ANKAH_TEST_RUNNER=${ANKAH_TEST_RUNNER};ANKAH_TEST_WINDOWS_PATHS=1")
   endif()
 endif()
@@ -178,6 +214,8 @@ install(FILES
   DESTINATION assets COMPONENT ankah_runtime)
 install(FILES docs/windows.md DESTINATION . RENAME README-WINDOWS.md
   COMPONENT ankah_runtime)
+install(FILES docs/tls-and-proxies.md DESTINATION . RENAME TLS-AND-PROXIES.md
+  COMPONENT ankah_runtime)
 install(FILES PARTICLES_LICENSE.md DESTINATION notices COMPONENT ankah_runtime)
 install(FILES
   ${llhttp_SOURCE_DIR}/LICENSE-MIT
@@ -192,6 +230,9 @@ if(ANKAH_BUNDLED_RUNTIME_DEPS)
   install(FILES
     ${mbedtls_SOURCE_DIR}/LICENSE
     DESTINATION notices RENAME mbedtls-LICENSE.txt COMPONENT ankah_runtime)
+  install(FILES
+    ${nghttp2_SOURCE_DIR}/COPYING
+    DESTINATION notices RENAME nghttp2-LICENSE.txt COMPONENT ankah_runtime)
   install(FILES
     ${libuv_SOURCE_DIR}/LICENSE
     DESTINATION notices RENAME libuv-LICENSE.txt COMPONENT ankah_runtime)

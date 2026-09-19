@@ -3,10 +3,11 @@
 Ankah is a native HTTP gateway for Python web applications. The current source
 is a prototype; it is not ready to protect a public service.
 
-The HTTP/1.1 gateway issues a proof of work challenge before forwarding a
-request to a local application server. It can start that server as a child
-process. The browser challenge can be solved on the original device or by
-scanning a QR code with a phone. A browser without JavaScript shows the QR code
+The gateway accepts HTTP/1.1 and can negotiate HTTP/2 over its optional TLS
+listener before forwarding HTTP/1.1 requests to a local application server.
+It can start that server as a child process. The browser challenge can be
+solved on the original device or by scanning a QR code with a phone. A browser
+without JavaScript shows the QR code
 immediately; a browser still solving after ten seconds shows it too. The phone
 marks the original browser session as solved, then the original browser uses
 its Finished button to continue. A Python based terminal solver is available
@@ -23,7 +24,8 @@ available on the original page.
 Protocol upgrade requests require an existing solved browser session or pass.
 Clients should complete an ordinary GET challenge before opening a WebSocket.
 Requests sent upstream receive canonical forwarding headers derived from the
-configured public origin and the direct peer address.
+configured public origin and the resolved client address. Forwarded client
+addresses can be accepted from explicitly configured proxy networks.
 
 For a blocked GET, Finished redirects to the exact original path and query.
 For a blocked POST, Ankah holds the original headers and raw body in process
@@ -48,7 +50,7 @@ compressed files.
 
 ## Build and test
 
-Requires a C99 compiler, CMake, libuv, Mbed TLS's crypto library, Python 3,
+Requires a C99 compiler, CMake, libuv, Mbed TLS, nghttp2, Python 3,
 and Clang with a WebAssembly target and LLD. Node is used for the browser solver
 tests. Set `-DANKAH_WASM_SOLVER=OFF` to build with only the Web Crypto fallback.
 CMake downloads llhttp 9.4.3, qrcodegen, and
@@ -62,8 +64,8 @@ ctest --test-dir build --output-on-failure
 ```
 
 Windows x64 builds use MinGW and can be tested from Linux with Wine. The
-Windows build uses pinned static copies of libuv and Mbed TLS and produces a
-runtime package containing the executable and browser assets. See
+Windows build uses pinned static copies of libuv, Mbed TLS, and nghttp2 and
+produces a runtime package containing the executable and browser assets. See
 [Windows builds](docs/windows.md).
 
 ## Local example
@@ -82,7 +84,5 @@ chmod 600 ankah.secret
 secret for each deployment. The upstream address must be reachable only by
 trusted local processes.
 
-## Release readiness
-
-TLS/HTTP/2 and trusted proxy IP handling are still pending. Do not place this
-prototype in front of a public service yet.
+For direct TLS, HTTP/2, certificate reload, IPv6 address syntax, and proxy
+configuration, see [TLS and proxy configuration](docs/tls-and-proxies.md).

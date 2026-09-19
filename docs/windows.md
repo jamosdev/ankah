@@ -1,10 +1,11 @@
 # Windows x64 builds
 
 Ankah can be cross compiled for 64 bit Windows with MinGW. The Windows build
-uses pinned static copies of libuv and Mbed TLS, so the executable does not
-need compiler runtime DLLs. Windows system DLLs are still used.
+uses pinned static copies of libuv, Mbed TLS, and nghttp2, so the executable
+does not need compiler runtime DLLs. Windows system DLLs are still used.
 
-From a Linux checkout with MinGW, CMake, Clang, LLD, Python, and Node installed:
+From a Linux checkout with MinGW, CMake, Clang, LLD, Python, Node, curl, and
+OpenSSL installed:
 
 ```sh
 cmake -S . -B build-windows -G Ninja \
@@ -33,8 +34,9 @@ cmake --build build-windows
 ctest --test-dir build-windows --output-on-failure --timeout 180
 ```
 
-The test launcher translates asset, secret, and static bundle paths into the
-default Wine `Z:` drive. Native Windows use accepts normal Windows paths.
+The test launcher translates asset, secret, static bundle, certificate, and
+key paths into the default Wine `Z:` drive. Native Windows use accepts normal
+Windows paths.
 
 ## Runtime package
 

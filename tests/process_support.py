@@ -5,7 +5,8 @@ import shlex
 from pathlib import Path
 
 
-PATH_OPTIONS = {"--assets-dir", "--secret-file", "--static-bundle"}
+PATH_OPTIONS = {"--assets-dir", "--secret-file", "--static-bundle",
+                "--tls-cert", "--tls-key"}
 
 
 def windows_path(value):
