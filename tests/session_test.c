@@ -7,11 +7,12 @@ int main(void) {
     unsigned char secret[ANKAH_SECRET_SIZE] = {0};
     ankah_request request = {0};
     ankah_session *session;
-    ankah_request *saved;
-    unsigned char *body;
-    size_t size;
+    ankah_request *saved = NULL;
+    unsigned char *body = NULL;
+    size_t size = 0;
     char id[33], token[33];
     const uint64_t now = 1700000000;
+    (void)size;
 
     strcpy(request.method, "POST");
     strcpy(request.target, "/upload?x=1");

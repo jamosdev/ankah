@@ -13,6 +13,14 @@ int main(void) {
     const char *duplicate = "GET / HTTP/1.1\r\nHost: example.test\r\nHost: other.test\r\n\r\n";
     const char *upgrade = "GET /ws HTTP/1.1\r\nHost: example.test\r\n"
                           "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    const char *post_upgrade = "POST /ws HTTP/1.1\r\nHost: example.test\r\n"
+                               "Connection: Upgrade\r\nUpgrade: websocket\r\n"
+                               "Content-Length: 0\r\n\r\n";
+    const char *missing_connection = "GET /ws HTTP/1.1\r\nHost: example.test\r\n"
+                                     "Upgrade: websocket\r\n\r\n";
+    const char *duplicate_expect = "POST / HTTP/1.1\r\nHost: example.test\r\n"
+                                   "Content-Length: 0\r\nExpect: 100-continue\r\n"
+                                   "Expect: other\r\n\r\n";
     ankah_request request;
     int failures = 0;
     failures += expect(ankah_parse_request(good, strlen(good), &request) == 0, "valid request");
@@ -23,5 +31,13 @@ int main(void) {
                        "duplicate host");
     failures += expect(ankah_parse_request(upgrade, strlen(upgrade), &request) == 0 &&
                        request.websocket, "websocket upgrade");
+    failures += expect(ankah_parse_request(post_upgrade, strlen(post_upgrade), &request) == 0 &&
+                       !request.websocket, "POST is not a websocket upgrade");
+    failures += expect(ankah_parse_request(missing_connection, strlen(missing_connection),
+                                           &request) == 0 && !request.websocket,
+                       "upgrade requires connection token");
+    failures += expect(ankah_parse_request(duplicate_expect, strlen(duplicate_expect),
+                                           &request) != 0,
+                       "duplicate expectation");
     return failures ? 1 : 0;
 }

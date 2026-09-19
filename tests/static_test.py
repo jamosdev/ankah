@@ -76,6 +76,8 @@ def main():
             require(headers.get("Cache-Control") == "public, max-age=60", "wrong cache policy")
             require(headers.get("Vary") == "Accept-Encoding", "missing Vary")
             require(headers.get("Accept-Ranges") == "bytes", "missing range advertisement")
+            require(headers.get("X-Content-Type-Options") == "nosniff",
+                    "static type policy missing")
             status, gzip_headers, zipped = request(port, "/static/large.txt",
                                                    headers={"Accept-Encoding": "gzip"})
             require(status == 200 and gzip_headers.get("Content-Encoding") == "gzip" and
@@ -103,8 +105,11 @@ def main():
             status, headers, payload = request(port, "/static/large.txt", "HEAD")
             require(status == 200 and not payload and int(headers["Content-Length"]) == len(body),
                     "HEAD failed")
-            status, _, payload = request(port, "/static/large.txt", headers={"If-None-Match": f'"{digest}"'})
+            status, cached_headers, payload = request(
+                port, "/static/large.txt", headers={"If-None-Match": f'"{digest}"'})
             require(status == 304 and not payload, "conditional request failed")
+            require(int(cached_headers["Content-Length"]) == len(body),
+                    "conditional size differs")
             require(request(port, "/static/large.txt", headers={
                 "If-None-Match": f'W/"{digest}"'})[0] == 304,
                 "weak conditional tag failed")
@@ -143,6 +148,11 @@ def main():
                 "multipart ranges failed")
             require(int(multi_headers["Content-Length"]) == len(payload),
                     "multipart length wrong")
+            status, merged_headers, payload = request(port, "/static/large.txt", headers={
+                "Range": "bytes=10-19,0-9,5-14"})
+            require(status == 206 and payload == body[:20] and
+                    merged_headers.get("Content-Range") == f"bytes 0-19/{len(body)}",
+                    "overlapping ranges were not merged")
             status, multi_headers, payload = request(port, "/static/large.txt", headers={
                 "Accept-Encoding": "gzip", "Range": "bytes=0-4,10-14"})
             require(status == 206 and multi_headers.get("Content-Encoding") == "gzip" and

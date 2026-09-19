@@ -6,6 +6,8 @@
 #include <uv.h>
 
 #include <inttypes.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -14,6 +16,7 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 #include "ankah/sha256.h"
 #if ANKAH_HAS_WASM
 #include "browser_pow_data.h"
@@ -79,6 +82,7 @@ struct connection {
     size_t continue_expected;
     unsigned int pending;
     unsigned int handles;
+    uint64_t request_deadline_ns;
     int upstream_initialized;
     int timer_initialized;
     int forwarding;
@@ -111,6 +115,8 @@ typedef struct {
     char upstream_ip[64];
     int upstream_port;
     char public_origin[256];
+    char public_host[256];
+    int public_https;
     char secret_path[512];
     char assets_dir[512];
     char static_dir[512];
@@ -140,6 +146,7 @@ static int queue_bytes(connection *c, uv_stream_t *destination,
                        uv_stream_t *source, const char *data, size_t length, int finish);
 static void respond(connection *c, int status, const char *reason,
                     const char *type, const char *body, const char *extra);
+static int etag_matches(const ankah_request *request, const char *etag);
 static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer);
 static void on_upstream_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer);
 static size_t header_end(const char *bytes, size_t length);
@@ -156,12 +163,31 @@ static int same_ascii(const char *left, const char *right) {
     return *left == *right;
 }
 
+static int same_ascii_part(const char *left, size_t length, const char *right) {
+    size_t i;
+    if (strlen(right) != length) return 0;
+    for (i = 0; i < length; ++i) {
+        unsigned char a = (unsigned char)left[i];
+        unsigned char b = (unsigned char)right[i];
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + 32);
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static int starts_ascii(const char *value, const char *start) {
+    size_t length = strlen(start);
+    return strlen(value) >= length && same_ascii_part(value, length, start);
+}
+
 static void respond_binary(connection *c, const char *type,
                            const unsigned char *body, size_t size) {
     char head[512];
     int n = snprintf(head, sizeof(head),
                      "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %zu\r\n"
-                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n", type, size);
+                     "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+                     "Referrer-Policy: no-referrer\r\nConnection: close\r\n\r\n", type, size);
     if (n < 0 || (size_t)n >= sizeof(head) || size + (size_t)n > 65536) {
         close_connection(c);
         return;
@@ -257,21 +283,58 @@ static int hex_value(char c) {
     return -1;
 }
 
+static int decimal_u64(const char *text, uint64_t *out) {
+    uint64_t value = 0;
+    size_t i;
+    if (!text || !text[0]) return -1;
+    for (i = 0; text[i]; ++i) {
+        unsigned int digit;
+        if (text[i] < '0' || text[i] > '9') return -1;
+        digit = (unsigned int)(text[i] - '0');
+        if (value > (UINT64_MAX - digit) / 10) return -1;
+        value = value * 10 + digit;
+    }
+    *out = value;
+    return 0;
+}
+
+static void erase_bytes(void *data, size_t size) {
+    volatile unsigned char *bytes = data;
+    while (size--) *bytes++ = 0;
+}
+
 static int load_secret(const char *path) {
-    char input[67];
-    FILE *file = fopen(path, "rb");
-    size_t size, i;
-    if (!file) return -1;
-    size = fread(input, 1, sizeof(input), file);
-    fclose(file);
+    char input[65];
+    struct stat metadata;
+    size_t size = 0, i;
+    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (descriptor < 0 || fstat(descriptor, &metadata) != 0 ||
+        !S_ISREG(metadata.st_mode) ||
+        (metadata.st_size != 64 && metadata.st_size != 65)) {
+        if (descriptor >= 0) close(descriptor);
+        return -1;
+    }
+    while (size < (size_t)metadata.st_size) {
+        ssize_t amount = read(descriptor, input + size,
+                              (size_t)metadata.st_size - size);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) { close(descriptor); erase_bytes(input, sizeof(input)); return -1; }
+        size += (size_t)amount;
+    }
+    close(descriptor);
     if (size == 65 && input[64] == '\n') size = 64;
-    if (size != 64) return -1;
+    if (size != 64) { erase_bytes(input, sizeof(input)); return -1; }
     for (i = 0; i < ANKAH_SECRET_SIZE; ++i) {
         int high = hex_value(input[i * 2]);
         int low = hex_value(input[i * 2 + 1]);
-        if (high < 0 || low < 0) return -1;
+        if (high < 0 || low < 0) {
+            erase_bytes(input, sizeof(input));
+            erase_bytes(config.secret, sizeof(config.secret));
+            return -1;
+        }
         config.secret[i] = (unsigned char)((high << 4) | low);
     }
+    erase_bytes(input, sizeof(input));
     return 0;
 }
 
@@ -365,6 +428,17 @@ static int parse_address(const char *input, char *ip, size_t capacity, int *port
     return 0;
 }
 
+static int valid_allow_prefix(const char *value) {
+    size_t i, length;
+    if (!value || value[0] != '/') return 0;
+    length = strlen(value);
+    if (length >= ANKAH_MAX_TARGET) return 0;
+    for (i = 0; i < length; ++i)
+        if ((unsigned char)value[i] < 33 || (unsigned char)value[i] > 126 ||
+            value[i] == '#') return 0;
+    return 1;
+}
+
 static int parse_options(int argc, char **argv, int *child_index) {
     int i;
     strcpy(config.listen_ip, "0.0.0.0");
@@ -399,21 +473,23 @@ static int parse_options(int argc, char **argv, int *child_index) {
             if (strlen(argv[++i]) >= sizeof(config.static_dir)) return -1;
             strcpy(config.static_dir, argv[i]);
         } else if (strcmp(argv[i], "--static-cache-mb") == 0) {
-            char *end;
-            unsigned long long megabytes = strtoull(argv[++i], &end, 10);
-            if (!argv[i][0] || *end || megabytes > SIZE_MAX / (1024U * 1024U)) return -1;
+            uint64_t megabytes;
+            if (decimal_u64(argv[++i], &megabytes) != 0 ||
+                megabytes > SIZE_MAX / (1024U * 1024U)) return -1;
             config.static_cache_limit = (size_t)megabytes * 1024U * 1024U;
         } else if (strcmp(argv[i], "--allow-prefix") == 0) {
-            if (config.allow_count == MAX_ALLOW) return -1;
+            if (config.allow_count == MAX_ALLOW || !valid_allow_prefix(argv[i + 1])) return -1;
             config.allow[config.allow_count++] = argv[++i];
         } else return -1;
     }
     if (!prefix(config.public_origin, "https://") &&
         !prefix(config.public_origin, "http://")) return -1;
+    config.public_https = prefix(config.public_origin, "https://");
     {
         const char *host = strstr(config.public_origin, "://") + 3;
         if (!*host || strspn(host, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
                                   "0123456789.-:") != strlen(host)) return -1;
+        strcpy(config.public_host, host);
     }
     if (config.secret_path[0] == 0 || load_secret(config.secret_path) != 0 ||
         load_assets() != 0 ||
@@ -452,7 +528,17 @@ static void on_timeout(uv_timer_t *timer) {
 }
 
 static void refresh_timeout(connection *c) {
-    uv_timer_start(&c->timer, on_timeout, c->websocket ? 300000 : 30000, 0);
+    uint64_t timeout = c->websocket ? 300000 : 30000;
+    if (c->request_deadline_ns) {
+        uint64_t now = uv_hrtime(), remaining;
+        if (now >= c->request_deadline_ns) {
+            close_connection(c);
+            return;
+        }
+        remaining = (c->request_deadline_ns - now + 999999) / 1000000;
+        if (remaining < timeout) timeout = remaining;
+    }
+    uv_timer_start(&c->timer, on_timeout, timeout ? timeout : 1, 0);
 }
 
 static void allocate_read(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer) {
@@ -615,14 +701,15 @@ static void serve_asset(connection *c) {
     asset = &config.assets[index];
     etag = ankah_header_value(&c->request, "If-None-Match");
     modified = ankah_header_value(&c->request, "If-Modified-Since");
-    cached = (etag && strcmp(etag, asset->etag) == 0) ||
+    cached = (etag && etag_matches(&c->request, asset->etag)) ||
              (!etag && not_modified_since(modified, asset));
     length = snprintf(response, sizeof(response),
                       "HTTP/1.1 %d %s\r\nContent-Type: %s\r\n"
                       "Content-Length: %zu\r\nCache-Control: public, max-age=31536000, immutable\r\n"
-                      "ETag: %s\r\nLast-Modified: %s\r\nConnection: close\r\n\r\n",
+                      "ETag: %s\r\nLast-Modified: %s\r\n"
+                      "X-Content-Type-Options: nosniff\r\nConnection: close\r\n\r\n",
                       cached ? 304 : 200, cached ? "Not Modified" : "OK",
-                      asset->type, cached ? (size_t)0 : asset->size,
+                      asset->type, asset->size,
                       asset->etag, asset->last_modified);
     if (length < 0 || (size_t)length >= sizeof(response)) { close_connection(c); return; }
     if (!cached && strcmp(c->request.method, "HEAD") != 0) c->asset_index = (int)index;
@@ -770,7 +857,7 @@ typedef struct { size_t first, last; } byte_range;
 static int parse_ranges(const char *value, size_t size, byte_range out[MAX_STATIC_RANGES]) {
     const char *p;
     int count = 0;
-    if (!value || strncmp(value, "bytes=", 6) != 0) return 0;
+    if (!value || !starts_ascii(value, "bytes=")) return 0;
     p = value + 6;
     while (*p) {
         unsigned long long first = 0, last = 0;
@@ -806,10 +893,27 @@ static int parse_ranges(const char *value, size_t size, byte_range out[MAX_STATI
     }
     if (!count) return 0;
     {
-        int i, kept = 0;
+        int i, j, kept = 0, merged = 0;
         for (i = 0; i < count; ++i)
             if (out[i].first != SIZE_MAX) out[kept++] = out[i];
-        return kept ? kept : -1;
+        if (!kept) return -1;
+        for (i = 1; i < kept; ++i) {
+            byte_range item = out[i];
+            j = i;
+            while (j > 0 && (out[j - 1].first > item.first ||
+                   (out[j - 1].first == item.first && out[j - 1].last > item.last))) {
+                out[j] = out[j - 1];
+                --j;
+            }
+            out[j] = item;
+        }
+        for (i = 0; i < kept; ++i) {
+            if (merged && out[i].first <= out[merged - 1].last + 1) {
+                if (out[i].last > out[merged - 1].last)
+                    out[merged - 1].last = out[i].last;
+            } else out[merged++] = out[i];
+        }
+        return merged;
     }
 }
 
@@ -872,7 +976,7 @@ static int serve_static_if_matched(connection *c) {
             static const char unavailable[] =
                 "HTTP/1.1 406 Not Acceptable\r\nContent-Type: text/plain\r\n"
                 "Content-Length: 36\r\nVary: Accept-Encoding\r\n"
-                "Cache-Control: no-store\r\n"
+                "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
                 "Connection: close\r\n\r\n";
             if (queue_bytes(c, (uv_stream_t *)&c->client, NULL, unavailable,
                             sizeof(unavailable) - 1, 1) != 0) close_connection(c);
@@ -947,12 +1051,12 @@ static int serve_static_if_matched(connection *c) {
                        "HTTP/1.1 %d %s\r\nContent-Type: %s\r\n"
                        "Content-Length: %zu\r\nCache-Control: %s\r\n"
                        "ETag: %s\r\nVary: Accept-Encoding\r\nAccept-Ranges: bytes\r\n"
-                       "%s%sConnection: close\r\n\r\n",
+                       "X-Content-Type-Options: nosniff\r\n%s%sConnection: close\r\n\r\n",
                        cached ? 304 : code,
                        cached ? "Not Modified" : code == 206 ? "Partial Content" :
                        code == 416 ? "Range Not Satisfiable" : "OK",
                        content_type,
-                       body_size,
+                       cached ? variant->size : body_size,
                        entry->immutable ? "public, max-age=31536000, immutable" :
                                           "public, max-age=60",
                        variant->etag,
@@ -978,6 +1082,8 @@ static void respond(connection *c, int status, const char *reason,
     int length = snprintf(response, sizeof(response),
                           "HTTP/1.1 %d %s\r\nContent-Type: %s\r\n"
                           "Content-Length: %zu\r\nCache-Control: no-store\r\n"
+                          "X-Content-Type-Options: nosniff\r\n"
+                          "Referrer-Policy: no-referrer\r\n"
                           "Connection: close\r\n%s\r\n%s",
                           status, reason, type, body_size, extra ? extra : "", body);
     if (length < 0 || (size_t)length >= sizeof(response) ||
@@ -987,11 +1093,10 @@ static void respond(connection *c, int status, const char *reason,
 
 static int cookie_valid(const ankah_request *request) {
     const char *cookie = ankah_header_value(request, "Cookie");
-    const char *host = ankah_header_value(request, "Host");
     const char *item;
     char pass[ANKAH_PASS_TEXT_MAX];
     size_t length;
-    if (!cookie || !host) return 0;
+    if (!cookie) return 0;
     item = strstr(cookie, "ankah_pass=");
     if (!item || (item != cookie && item[-1] != ' ' && item[-1] != ';')) return 0;
     item += strlen("ankah_pass=");
@@ -999,14 +1104,14 @@ static int cookie_valid(const ankah_request *request) {
     if (length == 0 || length >= sizeof(pass)) return 0;
     memcpy(pass, item, length);
     pass[length] = 0;
-    return ankah_check_pass(config.secret, host, (uint64_t)time(NULL), pass) == 0;
+    return ankah_check_pass(config.secret, config.public_host,
+                            (uint64_t)time(NULL), pass) == 0;
 }
 
 static int allowed(const ankah_request *request) {
     unsigned int i;
     ankah_session *session = request_session(request);
     if (ankah_session_solved(session, (uint64_t)time(NULL))) return 1;
-    if (request->websocket) return 1;
     for (i = 0; i < config.allow_count; ++i) {
         if (prefix(request->target, config.allow[i])) return 1;
     }
@@ -1017,8 +1122,6 @@ static int parse_answer(const char *target, char *challenge, size_t capacity,
                         uint64_t *counter) {
     const char *start = strstr(target, "?challenge=");
     const char *answer;
-    char *end;
-    unsigned long long value;
     size_t length;
     if (!start) return -1;
     start += strlen("?challenge=");
@@ -1030,10 +1133,7 @@ static int parse_answer(const char *target, char *challenge, size_t capacity,
     challenge[length] = 0;
     answer += strlen("&answer=");
     if (!*answer) return -1;
-    value = strtoull(answer, &end, 10);
-    if (*end || end == answer) return -1;
-    *counter = (uint64_t)value;
-    return 0;
+    return decimal_u64(answer, counter);
 }
 
 static int render_script(const char *challenge, char *out, size_t capacity) {
@@ -1126,7 +1226,8 @@ static void render_gate(connection *c, ankah_session *session) {
         "Set-Cookie: ankah_sid=%s; Max-Age=1800; Path=/; HttpOnly; SameSite=Lax%s\r\n"
         "Content-Security-Policy: default-src 'none'; img-src 'self'; "
         "script-src 'self' 'wasm-unsafe-eval'; "
-        "worker-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; form-action 'self'\r\n",
+        "worker-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; "
+        "form-action 'self'; frame-ancestors 'none'\r\n",
         session->id, prefix(config.public_origin, "https://") ? "; Secure" : "");
     if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
     respond(c, 428, "Precondition Required", "text/html; charset=utf-8", body, extra);
@@ -1136,10 +1237,10 @@ static void handle_challenge(connection *c) {
     char challenge[ANKAH_CHALLENGE_TEXT_MAX];
     char body[4096];
     char extra[512];
-    const char *host = ankah_header_value(&c->request, "Host");
     const char *agent = ankah_header_value(&c->request, "User-Agent");
     int length;
-    if (ankah_issue_challenge(config.secret, host, (uint64_t)time(NULL), 18, challenge) != 0) {
+    if (ankah_issue_challenge(config.secret, config.public_host,
+                              (uint64_t)time(NULL), 18, challenge) != 0) {
         respond(c, 503, "Unavailable", "text/plain", "Challenge unavailable\n", NULL);
         return;
     }
@@ -1161,7 +1262,7 @@ static void handle_challenge(connection *c) {
                     "Unlock with a GET request, then retry this method.\n", NULL);
             return;
         }
-        ankah_session *session = ankah_session_new(config.secret, host,
+        ankah_session *session = ankah_session_new(config.secret, config.public_host,
             (uint64_t)time(NULL), &c->request, c->peer_ip);
         size_t end = header_end(c->initial, c->initial_size);
         if (!session) {
@@ -1187,7 +1288,7 @@ static void handle_challenge(connection *c) {
 
 static void handle_internal(connection *c) {
     const char *target = c->request.target;
-    const char *host = ankah_header_value(&c->request, "Host");
+    const char *host = config.public_host;
     if (prefix(target, "/ankah/qr/") && strcmp(c->request.method, "GET") == 0) {
         const char *id = target + strlen("/ankah/qr/");
         char key[33], url[512];
@@ -1241,24 +1342,23 @@ static void handle_internal(connection *c) {
         respond(c, 200, "OK", "text/html; charset=utf-8", body,
                 "Content-Security-Policy: default-src 'none'; "
                 "script-src 'self' 'wasm-unsafe-eval'; "
-                "worker-src 'self'; connect-src 'self'\r\n");
+                "worker-src 'self'; connect-src 'self'; frame-ancestors 'none'\r\n");
         return;
     }
     if (prefix(target, "/ankah/answer/") && strcmp(c->request.method, "POST") == 0) {
         const char *answer = strchr(target, '?');
-        char key[33], *end;
-        unsigned long long counter;
+        char key[33];
+        uint64_t counter;
         ankah_session *session;
         if (!answer || (size_t)(answer - (target + strlen("/ankah/answer/"))) != 32 ||
             strncmp(answer, "?answer=", 8) != 0) {
             respond(c, 400, "Bad Request", "text/plain", "Invalid answer\n", NULL); return;
         }
         memcpy(key, target + strlen("/ankah/answer/"), 32); key[32] = 0;
-        counter = strtoull(answer + 8, &end, 10);
         session = ankah_session_find(key, (uint64_t)time(NULL));
-        if (end == answer + 8 || *end || !session ||
+        if (decimal_u64(answer + 8, &counter) != 0 || !session ||
             ankah_check_answer(config.secret, host, (uint64_t)time(NULL),
-                               session->challenge, (uint64_t)counter) != 0 ||
+                               session->challenge, counter) != 0 ||
             ankah_session_solve(session, (uint64_t)time(NULL)) != 0) {
             respond(c, 403, "Forbidden", "text/plain", "Invalid answer\n", NULL); return;
         }
@@ -1268,13 +1368,17 @@ static void handle_internal(connection *c) {
     if (prefix(target, "/ankah/finish/") && strcmp(c->request.method, "GET") == 0) {
         ankah_session *session = ankah_session_find(target + strlen("/ankah/finish/"),
                                                     (uint64_t)time(NULL));
-        char extra[ANKAH_MAX_TARGET + 64];
+        char extra[sizeof(config.public_origin) + ANKAH_MAX_TARGET + 64];
         int n;
         if (!session || session != request_session(&c->request) || session->is_post ||
             !ankah_session_solved(session, (uint64_t)time(NULL))) {
             respond(c, 403, "Forbidden", "text/plain", "Challenge not passed\n", NULL); return;
         }
-        n = snprintf(extra, sizeof(extra), "Location: %s\r\n", session->target);
+        if (session->target[1] == '/' || session->target[1] == '\\')
+            n = snprintf(extra, sizeof(extra), "Location: %s%s\r\n",
+                         config.public_origin, session->target);
+        else
+            n = snprintf(extra, sizeof(extra), "Location: %s\r\n", session->target);
         if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
         respond(c, 303, "See Other", "text/plain", "Continuing\n", extra);
         return;
@@ -1318,7 +1422,7 @@ static void handle_internal(connection *c) {
         respond(c, 428, "Precondition Required", "text/plain; charset=utf-8", body, NULL);
         return;
     }
-    if (prefix(target, "/ankah/open") && strcmp(c->request.method, "POST") == 0) {
+    if (prefix(target, "/ankah/open?") && strcmp(c->request.method, "POST") == 0) {
         char challenge[ANKAH_CHALLENGE_TEXT_MAX], pass[ANKAH_PASS_TEXT_MAX], header[256];
         uint64_t counter;
         int length;
@@ -1347,6 +1451,44 @@ static size_t header_end(const char *bytes, size_t length) {
     return 0;
 }
 
+static int connection_names_header(const ankah_request *request, const char *name) {
+    unsigned int i;
+    for (i = 0; i < request->count; ++i) {
+        const char *p;
+        if (!same_ascii(request->headers[i].name, "Connection")) continue;
+        p = request->headers[i].value;
+        while (*p) {
+            const char *start, *end;
+            while (*p == ',' || *p == ' ' || *p == '\t') ++p;
+            start = p;
+            while (*p && *p != ',') ++p;
+            end = p;
+            while (end > start && (end[-1] == ' ' || end[-1] == '\t')) --end;
+            if (same_ascii_part(start, (size_t)(end - start), name)) return 1;
+        }
+    }
+    return 0;
+}
+
+static int skip_upstream_header(const connection *c, const ankah_header *header) {
+    if (same_ascii(header->name, "Host") ||
+        same_ascii(header->name, "Content-Length")) return 0;
+    if (c->websocket && same_ascii(header->name, "Upgrade")) return 0;
+    if (same_ascii(header->name, "Connection") ||
+        same_ascii(header->name, "Proxy-Connection") ||
+        same_ascii(header->name, "Proxy-Authorization") ||
+        same_ascii(header->name, "Keep-Alive") ||
+        same_ascii(header->name, "TE") ||
+        same_ascii(header->name, "Trailer") ||
+        same_ascii(header->name, "Transfer-Encoding") ||
+        same_ascii(header->name, "Upgrade") ||
+        same_ascii(header->name, "Forwarded") ||
+        same_ascii(header->name, "X-Real-IP") ||
+        starts_ascii(header->name, "X-Forwarded-") ||
+        (c->replaying && same_ascii(header->name, "Expect"))) return 1;
+    return connection_names_header(&c->request, header->name);
+}
+
 static int build_upstream_request(const connection *c, char *out, size_t capacity) {
     size_t used = 0;
     unsigned int i;
@@ -1357,20 +1499,17 @@ static int build_upstream_request(const connection *c, char *out, size_t capacit
     used = (size_t)length;
     for (i = 0; i < c->request.count; ++i) {
         const ankah_header *header = &c->request.headers[i];
-        if (same_ascii(header->name, "Connection") ||
-            same_ascii(header->name, "Proxy-Connection") ||
-            (c->replaying && same_ascii(header->name, "Expect")) ||
-            same_ascii(header->name, "X-Forwarded-For") ||
-            same_ascii(header->name, "X-Real-IP") ||
-            same_ascii(header->name, "Forwarded")) continue;
+        if (skip_upstream_header(c, header)) continue;
         length = snprintf(out + used, capacity - used, "%s: %s\r\n",
                           header->name, header->value);
         if (length < 0 || (size_t)length >= capacity - used) return -1;
         used += (size_t)length;
     }
     length = snprintf(out + used, capacity - used,
-                      "Connection: %s\r\nX-Forwarded-For: %s\r\n\r\n",
-                      c->websocket ? "Upgrade" : "close", c->peer_ip);
+                      "Connection: %s\r\nX-Forwarded-For: %s\r\n"
+                      "X-Forwarded-Proto: %s\r\nX-Forwarded-Host: %s\r\n\r\n",
+                      c->websocket ? "Upgrade" : "close", c->peer_ip,
+                      config.public_https ? "https" : "http", config.public_host);
     if (length < 0 || (size_t)length >= capacity - used) return -1;
     return (int)(used + (size_t)length);
 }
@@ -1450,6 +1589,7 @@ static void finish_continue(connection *c) {
 
 static void handle_initial(connection *c) {
     size_t end = header_end(c->initial, c->initial_size);
+    const char *expect;
     if (!end) {
         if (c->initial_size >= ANKAH_HEADER_LIMIT)
             respond(c, 431, "Request Header Fields Too Large", "text/plain",
@@ -1461,13 +1601,18 @@ static void handle_initial(connection *c) {
         return;
     }
     {
-        const char *public_host = strstr(config.public_origin, "://") + 3;
         const char *request_host = ankah_header_value(&c->request, "Host");
-        if (!same_ascii(request_host, public_host)) {
+        if (!same_ascii(request_host, config.public_host)) {
             respond(c, 421, "Misdirected Request", "text/plain",
                     "Unexpected Host\n", NULL);
             return;
         }
+    }
+    expect = ankah_header_value(&c->request, "Expect");
+    if (expect && (!same_ascii(expect, "100-continue") || !c->request.has_body)) {
+        respond(c, 417, "Expectation Failed", "text/plain",
+                "Unsupported expectation\n", NULL);
+        return;
     }
     c->websocket = c->request.websocket;
     if (c->request.chunked || c->request.content_length > MAX_BODY ||
@@ -1477,6 +1622,10 @@ static void handle_initial(connection *c) {
         return;
     }
     c->body_received = c->initial_size - end;
+    c->request_deadline_ns = c->body_received < c->request.content_length ?
+        uv_hrtime() + UINT64_C(120000000000) : 0;
+    refresh_timeout(c);
+    if (c->closed) return;
     if (strcmp(c->request.method, "POST") == 0) {
         ankah_session *session = request_session(&c->request);
         const char *type = ankah_header_value(&c->request, "Content-Type");
@@ -1516,6 +1665,7 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
     connection *c = (connection *)stream->data;
     if (count > 0 && !c->closed) {
         refresh_timeout(c);
+        if (c->closed) { free(buffer->base); return; }
         if (c->capture_session) {
             int complete = ankah_session_append(c->capture_session, buffer->base, (size_t)count);
             if (complete < 0) {
@@ -1525,6 +1675,8 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
             } else if (complete) {
                 ankah_session *session = c->capture_session;
                 c->capture_session = NULL;
+                c->request_deadline_ns = 0;
+                refresh_timeout(c);
                 uv_read_stop(stream);
                 render_gate(c, session);
             }
@@ -1534,7 +1686,11 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
             } else {
                 memcpy(c->continue_body + c->continue_received, buffer->base, (size_t)count);
                 c->continue_received += (size_t)count;
-                if (c->continue_received == c->continue_expected) finish_continue(c);
+                if (c->continue_received == c->continue_expected) {
+                    c->request_deadline_ns = 0;
+                    refresh_timeout(c);
+                    finish_continue(c);
+                }
             }
         } else if (!c->forwarding) {
             if ((size_t)count > ANKAH_HEADER_LIMIT - c->initial_size) {
@@ -1556,8 +1712,11 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
             }
             if (queue_bytes(c, (uv_stream_t *)&c->upstream, stream,
                             buffer->base, (size_t)count, 0) != 0) close_connection(c);
-            if (!c->websocket && c->body_received == c->request.content_length)
+            if (!c->websocket && c->body_received == c->request.content_length) {
+                c->request_deadline_ns = 0;
+                refresh_timeout(c);
                 uv_read_stop(stream);
+            }
         }
     } else if (count < 0) {
         close_connection(c);
@@ -1569,6 +1728,7 @@ static void on_upstream_read(uv_stream_t *stream, ssize_t count, const uv_buf_t 
     connection *c = (connection *)stream->data;
     if (count > 0 && !c->closed) {
         refresh_timeout(c);
+        if (c->closed) { free(buffer->base); return; }
         if (queue_bytes(c, (uv_stream_t *)&c->client, stream,
                         buffer->base, (size_t)count, 0) != 0) close_connection(c);
     } else if (count < 0) {
@@ -1612,6 +1772,7 @@ static void on_new_connection(uv_stream_t *server, int status) {
     c->timer_initialized = 1;
     c->timer.data = c;
     ++c->handles;
+    c->request_deadline_ns = uv_hrtime() + UINT64_C(30000000000);
     if (uv_tcp_getpeername(&c->client, (struct sockaddr *)&address, &address_size) == 0 &&
         address.ss_family == AF_INET) {
         uv_ip4_name((const struct sockaddr_in *)&address, c->peer_ip, sizeof(c->peer_ip));

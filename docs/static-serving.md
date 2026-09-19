@@ -61,7 +61,7 @@ WORKDIR /app
 COPY . .
 # For Django, run this after dependencies are installed:
 # RUN python manage.py collectstatic --noinput
-RUN python -m pip install Brotli==1.1.0
+RUN python -m pip install Brotli==1.2.0
 COPY --from=ankah /build_static_bundle.py /usr/local/bin/build_static_bundle.py
 RUN python /usr/local/bin/build_static_bundle.py \
     --project-root /app --output /opt/ankah-static

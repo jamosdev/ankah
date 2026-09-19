@@ -29,15 +29,18 @@ include(FetchContent)
 set(LLHTTP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLHTTP_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
 FetchContent_Declare(llhttp
-  URL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.3.1.tar.gz
+  URL https://github.com/nodejs/llhttp/archive/refs/tags/release/v9.4.3.tar.gz
+  URL_HASH SHA256=1eb813c7437b31a87496a1cd3ed79f00746720f5e7e29c79b42c02cb69f36c39
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(llhttp)
 FetchContent_Declare(qrcodegen
   URL https://github.com/nayuki/QR-Code-generator/archive/3c6d0b3cefb4e049dc337e82237c9644399716a8.tar.gz
+  URL_HASH SHA256=ea6326674b89e3af6d055dac722d5d03ffd3a1d3edb5acd8d691a8b89236907b
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(qrcodegen)
 FetchContent_Declare(stb
   URL https://github.com/nothings/stb/archive/2c980bb59875b0d32144a71867fbdebb2f77cd20.tar.gz
+  URL_HASH SHA256=9a955b1b49a4410088a2e0ee2a9c057c3c907d0c1d75454144cb980aca0ba515
   DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
 FetchContent_MakeAvailable(stb)
 add_library(ankah_qr STATIC ${qrcodegen_SOURCE_DIR}/c/qrcodegen.c src/qr.c)

@@ -20,6 +20,11 @@ If the worker or module cannot start, it falls back to the Web Crypto solver.
 Both use the same challenge and answer endpoint. The QR option remains
 available on the original page.
 
+Protocol upgrade requests require an existing solved browser session or pass.
+Clients should complete an ordinary GET challenge before opening a WebSocket.
+Requests sent upstream receive canonical forwarding headers derived from the
+configured public origin and the direct peer address.
+
 For a blocked GET, Finished redirects to the exact original path and query.
 For a blocked POST, Ankah holds the original headers and raw body in process
 memory and the page carries a one-use continuation token. The token form
@@ -46,7 +51,7 @@ compressed files.
 Requires a C99 compiler, CMake, libuv, Mbed TLS's crypto library, Python 3,
 and Clang with a WebAssembly target and LLD. Node is used for the browser solver
 tests. Set `-DANKAH_WASM_SOLVER=OFF` to build with only the Web Crypto fallback.
-CMake downloads llhttp 9.3.1, qrcodegen, and
+CMake downloads llhttp 9.4.3, qrcodegen, and
 stb_image_write during the build. qrcodegen is MIT licensed; stb_image_write
 is available under the public domain or MIT license.
 

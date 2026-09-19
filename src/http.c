@@ -22,6 +22,39 @@ static int same_ascii(const char *left, const char *right) {
     return *left == *right;
 }
 
+static int same_ascii_part(const char *left, size_t length, const char *right) {
+    size_t i;
+    if (strlen(right) != length) return 0;
+    for (i = 0; i < length; ++i) {
+        unsigned char a = (unsigned char)left[i];
+        unsigned char b = (unsigned char)right[i];
+        if (a >= 'A' && a <= 'Z') a = (unsigned char)(a + 32);
+        if (b >= 'A' && b <= 'Z') b = (unsigned char)(b + 32);
+        if (a != b) return 0;
+    }
+    return 1;
+}
+
+static int header_has_token(const ankah_request *request, const char *name,
+                            const char *token) {
+    unsigned int i;
+    for (i = 0; i < request->count; ++i) {
+        const char *p;
+        if (!same_ascii(request->headers[i].name, name)) continue;
+        p = request->headers[i].value;
+        while (*p) {
+            const char *start, *end;
+            while (*p == ',' || *p == ' ' || *p == '\t') ++p;
+            start = p;
+            while (*p && *p != ',') ++p;
+            end = p;
+            while (end > start && (end[-1] == ' ' || end[-1] == '\t')) --end;
+            if (same_ascii_part(start, (size_t)(end - start), token)) return 1;
+        }
+    }
+    return 0;
+}
+
 static int append(char *destination, size_t capacity, const char *part, size_t length) {
     size_t old = strlen(destination);
     if (length >= capacity || old >= capacity - length) return -1;
@@ -76,6 +109,7 @@ int ankah_parse_request(const char *bytes, size_t length, ankah_request *out) {
     parse_context context;
     llhttp_errno_t error;
     unsigned int i, host_count = 0, length_count = 0, encoding_count = 0;
+    unsigned int expect_count = 0, upgrade_count = 0, type_count = 0;
     size_t body_length = 0;
     if (!bytes || !out || length < 4 || length > ANKAH_HEADER_LIMIT ||
         memcmp(bytes + length - 4, "\r\n\r\n", 4) != 0) return -1;
@@ -111,15 +145,20 @@ int ankah_parse_request(const char *bytes, size_t length, ankah_request *out) {
         } else if (same_ascii(header->name, "Transfer-Encoding")) {
             ++encoding_count;
             if (!same_ascii(header->value, "chunked")) return -1;
-        }
+        } else if (same_ascii(header->name, "Expect")) ++expect_count;
+        else if (same_ascii(header->name, "Upgrade")) ++upgrade_count;
+        else if (same_ascii(header->name, "Content-Type")) ++type_count;
     }
     if (host_count != 1 || length_count > 1 || encoding_count > 1 ||
+        expect_count > 1 || upgrade_count > 1 || type_count > 1 ||
         (length_count && encoding_count)) return -1;
     out->content_length = body_length;
     out->has_body = length_count != 0 || encoding_count != 0;
     out->chunked = encoding_count != 0;
-    out->websocket = llhttp_get_upgrade(&parser) &&
+    out->websocket = strcmp(out->method, "GET") == 0 && !out->has_body &&
+                     llhttp_get_upgrade(&parser) &&
                      ankah_header_value(out, "Upgrade") &&
-                     same_ascii(ankah_header_value(out, "Upgrade"), "websocket");
+                     same_ascii(ankah_header_value(out, "Upgrade"), "websocket") &&
+                     header_has_token(out, "Connection", "upgrade");
     return 0;
 }

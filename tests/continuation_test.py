@@ -88,9 +88,25 @@ def main():
             else:
                 raise RuntimeError("gateway did not start")
 
+            with socket.create_connection(("127.0.0.1", gate_port), timeout=5) as sock:
+                sock.sendall((f"GET /socket HTTP/1.1\r\nHost: localhost:{gate_port}\r\n"
+                              "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n").encode())
+                assert sock.recv(1024).startswith(b"HTTP/1.1 428")
+
+            status, _, _ = request("/ankah/open-extra?challenge=x&answer=0", "POST", b"")
+            assert status == 404
+
+            with socket.create_connection(("127.0.0.1", gate_port), timeout=5) as sock:
+                sock.sendall((f"POST /expectation HTTP/1.1\r\nHost: localhost:{gate_port}\r\n"
+                              "Content-Length: 3\r\nExpect: something-else\r\n\r\n").encode())
+                assert sock.recv(1024).startswith(b"HTTP/1.1 417")
+
             status, headers, page = request("/report?x=1&y=2")
             assert status == 428 and b"phone-panel" in page and b"Finished" in page
             assert "worker-src 'self'" in headers["Content-Security-Policy"]
+            assert "frame-ancestors 'none'" in headers["Content-Security-Policy"]
+            assert headers["X-Content-Type-Options"] == "nosniff"
+            assert headers["Referrer-Policy"] == "no-referrer"
             gate_headers = headers
             assert b"setTimeout(() => { panel.hidden = false; }, 10000)" in pathlib.Path(root, "challenge.js").read_bytes()
             worker_path = re.search(rb"data-worker='([^']*)'", page).group(1).decode()
@@ -116,8 +132,49 @@ def main():
             assert status == 200 and "Set-Cookie" not in headers
             status, headers, _ = request(f"/ankah/finish/{sid}", headers={"Cookie": cookie})
             assert status == 303 and headers["Location"] == "/report?x=1&y=2"
-            status, _, payload = request(headers["Location"], headers={"Cookie": cookie})
+
+            status, redirect_headers, redirect_page = request("//elsewhere.example/path")
+            assert status == 428
+            redirect_sid = re.search(
+                rb"data-session='([a-f0-9]{32})'", redirect_page).group(1).decode()
+            redirect_challenge = re.search(
+                rb"data-challenge='([^']+)'", redirect_page).group(1).decode()
+            redirect_cookie = redirect_headers["Set-Cookie"].split(";", 1)[0]
+            status, _, _ = request(
+                f"/ankah/answer/{redirect_sid}?answer={solve(redirect_challenge)}", "POST")
+            assert status == 200
+            status, redirect_headers, _ = request(
+                f"/ankah/finish/{redirect_sid}", headers={"Cookie": redirect_cookie})
+            assert status == 303
+            assert redirect_headers["Location"] == (
+                f"http://localhost:{gate_port}//elsewhere.example/path")
+
+            status, _, payload = request(headers["Location"], headers={
+                "Cookie": cookie,
+                "Connection": "X-Remove",
+                "X-Remove": "discarded",
+                "Keep-Alive": "timeout=30",
+                "X-Forwarded-For": "198.51.100.4",
+                "X-Forwarded-Proto": "ftp",
+                "Forwarded": "for=198.51.100.5"})
             assert status == 200 and payload == b"/report?x=1&y=2"
+            forwarded = seen[-1][3]
+            assert "X-Remove" not in forwarded and "Keep-Alive" not in forwarded
+            assert forwarded["Connection"].lower() == "close"
+            assert forwarded["X-Forwarded-For"] == "127.0.0.1"
+            assert forwarded["X-Forwarded-Proto"] == "http"
+            assert forwarded["X-Forwarded-Host"] == f"localhost:{gate_port}"
+            assert "Forwarded" not in forwarded
+
+            with socket.create_connection(("127.0.0.1", gate_port), timeout=5) as sock:
+                sock.sendall((f"GET /socket HTTP/1.1\r\nHost: localhost:{gate_port}\r\n"
+                              f"Cookie: {cookie}\r\nConnection: Upgrade, X-Remove\r\n"
+                              "Upgrade: websocket\r\nX-Remove: discarded\r\n\r\n").encode())
+                assert sock.recv(1024).startswith(b"HTTP/1.0 200")
+            forwarded = seen[-1][3]
+            assert forwarded["Connection"].lower() == "upgrade"
+            assert forwarded["Upgrade"].lower() == "websocket"
+            assert "X-Remove" not in forwarded
 
             multipart = (b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; "
                          b"filename=\"a.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"
