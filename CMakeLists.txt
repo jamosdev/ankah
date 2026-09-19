@@ -4,6 +4,15 @@ set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
 option(ANKAH_WASM_SOLVER "Build the browser WebAssembly solver" ON)
+option(ANKAH_STRICT_WARNINGS "Treat project compiler warnings as errors" OFF)
+if(WIN32)
+  set(ANKAH_BUNDLED_DEFAULT ON)
+else()
+  set(ANKAH_BUNDLED_DEFAULT OFF)
+endif()
+option(ANKAH_BUNDLED_RUNTIME_DEPS "Build libuv and Mbed TLS from pinned sources"
+  ${ANKAH_BUNDLED_DEFAULT})
+set(ANKAH_TEST_RUNNER "" CACHE STRING "Runner used for cross compiled integration tests")
 if(ANKAH_WASM_SOLVER)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
   find_program(ANKAH_WASM_CLANG NAMES clang REQUIRED)
@@ -48,16 +57,46 @@ target_include_directories(ankah_qr PRIVATE ${qrcodegen_SOURCE_DIR}/c ${stb_SOUR
 target_include_directories(ankah_qr PUBLIC include)
 add_library(ankah_pow STATIC src/pow.c)
 target_include_directories(ankah_pow PUBLIC include)
-find_path(MBEDTLS_INCLUDE_DIR mbedtls/sha256.h REQUIRED)
-find_library(MBEDCRYPTO_LIBRARY mbedcrypto REQUIRED)
-target_include_directories(ankah_pow PRIVATE ${MBEDTLS_INCLUDE_DIR})
-target_link_libraries(ankah_pow PUBLIC ${MBEDCRYPTO_LIBRARY})
+if(ANKAH_BUNDLED_RUNTIME_DEPS)
+  set(ENABLE_PROGRAMS OFF CACHE BOOL "" FORCE)
+  set(ENABLE_TESTING OFF CACHE BOOL "" FORCE)
+  set(USE_SHARED_MBEDTLS_LIBRARY OFF CACHE BOOL "" FORCE)
+  set(USE_STATIC_MBEDTLS_LIBRARY ON CACHE BOOL "" FORCE)
+  FetchContent_Declare(mbedtls
+    URL https://github.com/Mbed-TLS/mbedtls/releases/download/mbedtls-3.6.7/mbedtls-3.6.7.tar.bz2
+    URL_HASH SHA256=a7e8bcbec0e6f761b4af24f25677626b35f762f68eef79c08677a363212d11f6
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(mbedtls)
+  set(ANKAH_MBEDCRYPTO mbedcrypto)
+else()
+  find_path(MBEDTLS_INCLUDE_DIR mbedtls/sha256.h REQUIRED)
+  find_library(MBEDCRYPTO_LIBRARY mbedcrypto REQUIRED)
+  target_include_directories(ankah_pow PRIVATE ${MBEDTLS_INCLUDE_DIR})
+  set(ANKAH_MBEDCRYPTO ${MBEDCRYPTO_LIBRARY})
+endif()
+target_link_libraries(ankah_pow PUBLIC ${ANKAH_MBEDCRYPTO})
 add_library(ankah_http STATIC src/http.c)
 target_include_directories(ankah_http PUBLIC include)
 target_link_libraries(ankah_http PUBLIC llhttp_static)
-find_path(LIBUV_INCLUDE_DIR uv.h REQUIRED)
-find_library(LIBUV_LIBRARY uv REQUIRED)
-add_executable(ankah src/main.c src/static.c src/session.c)
+if(ANKAH_BUNDLED_RUNTIME_DEPS)
+  set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
+  set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+  set(LIBUV_BUILD_BENCH OFF CACHE BOOL "" FORCE)
+  FetchContent_Declare(libuv
+    URL https://dist.libuv.org/dist/v1.52.1/libuv-v1.52.1.tar.gz
+    URL_HASH SHA256=66d511b9e6e334c0e62279eb234fbfb2b3110b1479c09b95b44c7afca8cff9e7
+    DOWNLOAD_EXTRACT_TIMESTAMP TRUE)
+  FetchContent_MakeAvailable(libuv)
+  set(ANKAH_LIBUV uv_a)
+  if(MINGW AND CMAKE_C_COMPILER_ID STREQUAL "GNU")
+    target_compile_options(uv_a PRIVATE -Wno-error=incompatible-pointer-types)
+  endif()
+else()
+  find_path(LIBUV_INCLUDE_DIR uv.h REQUIRED)
+  find_library(LIBUV_LIBRARY uv REQUIRED)
+  set(ANKAH_LIBUV ${LIBUV_LIBRARY})
+endif()
+add_executable(ankah src/main.c src/static.c src/session.c src/files.c)
 if(ANKAH_WASM_SOLVER)
   add_dependencies(ankah ankah-browser-pow)
   target_include_directories(ankah PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -65,17 +104,32 @@ if(ANKAH_WASM_SOLVER)
 else()
   target_compile_definitions(ankah PRIVATE ANKAH_HAS_WASM=0)
 endif()
-target_include_directories(ankah PRIVATE ${LIBUV_INCLUDE_DIR})
+if(NOT ANKAH_BUNDLED_RUNTIME_DEPS)
+  target_include_directories(ankah PRIVATE ${LIBUV_INCLUDE_DIR})
+endif()
 if(UNIX)
   target_compile_definitions(ankah PRIVATE _POSIX_C_SOURCE=200809L)
 endif()
-target_link_libraries(ankah PRIVATE ankah_http ankah_pow ankah_qr ${LIBUV_LIBRARY})
+target_link_libraries(ankah PRIVATE ankah_http ankah_pow ankah_qr ${ANKAH_LIBUV})
 add_executable(ankah-pow tests/pow_test.c)
 target_link_libraries(ankah-pow PRIVATE ankah_pow)
 add_executable(ankah-http tests/http_test.c)
 target_link_libraries(ankah-http PRIVATE ankah_http)
 add_executable(ankah-session tests/session_test.c src/session.c)
 target_link_libraries(ankah-session PRIVATE ankah_pow)
+set(ANKAH_PROJECT_TARGETS ankah ankah-pow ankah-http ankah-session
+  ankah_qr ankah_pow ankah_http)
+if(ANKAH_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  foreach(target IN LISTS ANKAH_PROJECT_TARGETS)
+    target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
+  endforeach()
+endif()
+if(MINGW)
+  target_compile_definitions(ankah PRIVATE _WIN32_WINNT=0x0A00)
+  foreach(target ankah ankah-pow ankah-http ankah-session)
+    target_link_options(${target} PRIVATE -static -static-libgcc)
+  endforeach()
+endif()
 enable_testing()
 add_test(NAME pow COMMAND ankah-pow)
 add_test(NAME http COMMAND ankah-http)
@@ -94,6 +148,13 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME continuation COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/continuation_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME platform COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/platform_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  if(CMAKE_CROSSCOMPILING)
+    set_tests_properties(cache static continuation platform PROPERTIES
+      ENVIRONMENT "ANKAH_TEST_RUNNER=${ANKAH_TEST_RUNNER};ANKAH_TEST_WINDOWS_PATHS=1")
+  endif()
 endif()
 if(ANKAH_WASM_SOLVER)
   find_program(ANKAH_NODE NAMES node nodejs)
@@ -102,4 +163,39 @@ if(ANKAH_WASM_SOLVER)
       "${CMAKE_CURRENT_SOURCE_DIR}/tests/browser_pow_test.js" "${ANKAH_WASM_FILE}"
       "${CMAKE_CURRENT_SOURCE_DIR}/pow-worker.js")
   endif()
+endif()
+
+install(TARGETS ankah RUNTIME DESTINATION . COMPONENT ankah_runtime)
+install(FILES
+  ankah.png
+  particles.min.js
+  particlejs.json
+  challenge.js
+  solver.py
+  challenge-polyglot.txt
+  phone-scan.png
+  pow-worker.js
+  DESTINATION assets COMPONENT ankah_runtime)
+install(FILES docs/windows.md DESTINATION . RENAME README-WINDOWS.md
+  COMPONENT ankah_runtime)
+install(FILES PARTICLES_LICENSE.md DESTINATION notices COMPONENT ankah_runtime)
+install(FILES
+  ${llhttp_SOURCE_DIR}/LICENSE-MIT
+  DESTINATION notices RENAME llhttp-LICENSE.txt COMPONENT ankah_runtime)
+install(FILES
+  ${qrcodegen_SOURCE_DIR}/Readme.markdown
+  DESTINATION notices RENAME qrcodegen-NOTICE.md COMPONENT ankah_runtime)
+install(FILES
+  ${stb_SOURCE_DIR}/LICENSE
+  DESTINATION notices RENAME stb-LICENSE.txt COMPONENT ankah_runtime)
+if(ANKAH_BUNDLED_RUNTIME_DEPS)
+  install(FILES
+    ${mbedtls_SOURCE_DIR}/LICENSE
+    DESTINATION notices RENAME mbedtls-LICENSE.txt COMPONENT ankah_runtime)
+  install(FILES
+    ${libuv_SOURCE_DIR}/LICENSE
+    DESTINATION notices RENAME libuv-LICENSE.txt COMPONENT ankah_runtime)
+  install(FILES
+    ${libuv_SOURCE_DIR}/LICENSE-extra
+    DESTINATION notices RENAME libuv-LICENSE-extra.txt COMPONENT ankah_runtime)
 endif()

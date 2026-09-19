@@ -61,6 +61,11 @@ cmake --build build
 ctest --test-dir build --output-on-failure
 ```
 
+Windows x64 builds use MinGW and can be tested from Linux with Wine. The
+Windows build uses pinned static copies of libuv and Mbed TLS and produces a
+runtime package containing the executable and browser assets. See
+[Windows builds](docs/windows.md).
+
 ## Local example
 
 Create a private 32-byte secret as 64 lowercase hexadecimal characters:
@@ -79,6 +84,5 @@ trusted local processes.
 
 ## Release readiness
 
-TLS/HTTP/2, trusted proxy IP handling, and cross-platform
-builds are still pending. Do not place this
+TLS/HTTP/2 and trusted proxy IP handling are still pending. Do not place this
 prototype in front of a public service yet.

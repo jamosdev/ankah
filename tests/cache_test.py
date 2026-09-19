@@ -10,6 +10,8 @@ import sys
 import tempfile
 import time
 
+from process_support import gateway_command
+
 
 def check(condition, message):
     if not condition:
@@ -35,13 +37,13 @@ def main():
         secret = pathlib.Path(temp) / "secret"
         secret.write_text("a" * 64)
         process = subprocess.Popen(
-            [executable, "--listen", "127.0.0.1:%d" % port,
+            gateway_command(executable, ["--listen", "127.0.0.1:%d" % port,
              "--public-origin", "http://localhost:%d" % port,
-             "--secret-file", str(secret), "--assets-dir", str(root)],
+             "--secret-file", str(secret), "--assets-dir", str(root)]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         try:
-            for _ in range(50):
+            for _ in range(250):
                 if process.poll() is not None:
                     raise RuntimeError("gateway exited: " + process.stderr.read().decode())
                 try:
@@ -88,14 +90,14 @@ def main():
         secret_link = pathlib.Path(temp) / "secret-link"
         secret_link.symlink_to(secret)
         rejected = subprocess.run(
-            [executable, "--listen", "127.0.0.1:1",
+            gateway_command(executable, ["--listen", "127.0.0.1:1",
              "--public-origin", "http://localhost:1",
-             "--secret-file", str(secret_link), "--assets-dir", str(root)],
+             "--secret-file", str(secret_link), "--assets-dir", str(root)]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3)
         check(rejected.returncode != 0, "indirect secret path was accepted")
         rejected = subprocess.run(
-            [executable, "--public-origin", "http://localhost:1",
-             "--secret-file", str(secret), "--allow-prefix", ""],
+            gateway_command(executable, ["--public-origin", "http://localhost:1",
+             "--secret-file", str(secret), "--allow-prefix", ""]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3)
         check(rejected.returncode == 2, "empty allowed prefix was accepted")
 

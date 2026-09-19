@@ -12,6 +12,8 @@ import tempfile
 import threading
 import time
 
+from process_support import gateway_command
+
 
 def port():
     with socket.socket() as sock:
@@ -71,13 +73,13 @@ def main():
         secret = pathlib.Path(temp) / "secret"
         secret.write_text("a" * 64)
         process = subprocess.Popen(
-            [executable, "--listen", f"127.0.0.1:{gate_port}",
+            gateway_command(executable, ["--listen", f"127.0.0.1:{gate_port}",
              "--upstream", f"127.0.0.1:{app_port}",
              "--public-origin", f"http://localhost:{gate_port}",
-             "--secret-file", str(secret), "--assets-dir", root],
+             "--secret-file", str(secret), "--assets-dir", root]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
-            for _ in range(100):
+            for _ in range(250):
                 try:
                     status, _, _ = request("/ready")
                     if status == 428:

@@ -1,16 +1,13 @@
 #include "ankah/static.h"
 #include "ankah/http.h"
+#include "ankah/files.h"
 
 #include "ankah/sha256.h"
 #include <errno.h>
-#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 #define MAX_STATIC_FILES 100000
 
@@ -44,18 +41,41 @@ static int valid_prefix(const char *prefix) {
     return 1;
 }
 
+static char *copy_text(const char *text) {
+    size_t length = strlen(text) + 1;
+    char *copy = (char *)malloc(length);
+    if (copy) memcpy(copy, text, length);
+    return copy;
+}
+
+static int read_line(FILE *file, char *line, size_t capacity, size_t *length) {
+    size_t used = 0;
+    int byte;
+    while ((byte = fgetc(file)) != EOF) {
+        if (byte == 0 || used + 1 >= capacity) return -1;
+        if (byte == '\n') {
+            line[used] = 0;
+            *length = used + 1;
+            return 1;
+        }
+        line[used++] = (char)byte;
+    }
+    if (ferror(file) || used) return -1;
+    return 0;
+}
+
 static int parse_entry(ankah_static_entry *entry, char *line,
                        const char *directory, const char *prefix, int version) {
     char *fields[6], *cursor = line, *separator, *end;
     const char *digest_field, *size_field, *mime_field, *immutable_field;
     ankah_static_variant *variant;
     char path[4096];
-    struct stat metadata;
     unsigned char digest[32];
+    static const unsigned char empty = 0;
     size_t i;
     unsigned long long declared_size;
-    int descriptor, length, encoding = 0;
-    void *mapping = NULL;
+    int length, encoding = 0;
+    unsigned char *mapping = NULL;
     for (i = 0; i < (version == 2 ? 5U : 4U); ++i) {
         fields[i] = cursor;
         separator = strchr(cursor, '\t');
@@ -91,40 +111,30 @@ static int parse_entry(ankah_static_entry *entry, char *line,
     if (errno || *end || declared_size > SIZE_MAX) return -1;
     length = snprintf(path, sizeof(path), "%s/files/%s", directory, digest_field);
     if (length < 0 || (size_t)length >= sizeof(path)) return -1;
-    descriptor = open(path, O_RDONLY | O_NOFOLLOW);
-    if (descriptor < 0) return -1;
-    if (fstat(descriptor, &metadata) != 0 || !S_ISREG(metadata.st_mode) ||
-        metadata.st_size < 0 || (uint64_t)metadata.st_size != declared_size) {
-        close(descriptor);
+    if (ankah_file_map_exact(path, (size_t)declared_size, &mapping) != 0)
         return -1;
-    }
-    if (declared_size) {
-        mapping = mmap(NULL, (size_t)declared_size, PROT_READ, MAP_PRIVATE, descriptor, 0);
-        if (mapping == MAP_FAILED) { close(descriptor); return -1; }
-    }
-    close(descriptor);
-    if (ankah_sha256(declared_size ? mapping : "", (size_t)declared_size,
+    if (ankah_sha256(declared_size ? mapping : &empty, (size_t)declared_size,
                      digest) != 0) {
-        if (mapping) munmap(mapping, (size_t)declared_size);
+        ankah_file_unmap(mapping, (size_t)declared_size);
         return -1;
     }
     for (i = 0; i < 32; ++i) {
         static const char hex[] = "0123456789abcdef";
         if (digest_field[i * 2] != hex[digest[i] >> 4] ||
             digest_field[i * 2 + 1] != hex[digest[i] & 15]) {
-            if (mapping) munmap(mapping, (size_t)declared_size);
+            ankah_file_unmap(mapping, (size_t)declared_size);
             return -1;
         }
     }
     if (!entry->url) {
-        entry->url = strdup(fields[0]);
-        entry->mime = strdup(mime_field);
+        entry->url = copy_text(fields[0]);
+        entry->mime = copy_text(mime_field);
         if (!entry->url || !entry->mime) {
             free(entry->url);
             free(entry->mime);
             entry->url = NULL;
             entry->mime = NULL;
-            if (mapping) munmap(mapping, (size_t)declared_size);
+            ankah_file_unmap(mapping, (size_t)declared_size);
             return -1;
         }
         entry->immutable = immutable_field[0] == '1';
@@ -147,8 +157,8 @@ void ankah_static_free(ankah_static_bundle *bundle) {
         free(bundle->entries[i].mime);
         for (int j = 0; j < 3; ++j)
             if (bundle->entries[i].variants[j].data)
-                munmap(bundle->entries[i].variants[j].data,
-                       bundle->entries[i].variants[j].size);
+                ankah_file_unmap(bundle->entries[i].variants[j].data,
+                                 bundle->entries[i].variants[j].size);
     }
     free(bundle->entries);
     free(bundle->slots);
@@ -157,9 +167,8 @@ void ankah_static_free(ankah_static_bundle *bundle) {
 }
 
 int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
-    char path[4096], *line = NULL;
-    size_t line_capacity = 0, capacity = 0, i;
-    ssize_t read_size;
+    char path[4096], line[4098];
+    size_t line_size, capacity = 0, i;
     FILE *file = NULL;
     int length, result = -1, version;
     memset(bundle, 0, sizeof(*bundle));
@@ -167,21 +176,16 @@ int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
     if (length < 0 || (size_t)length >= sizeof(path)) return -1;
     file = fopen(path, "rb");
     if (!file) return -1;
-    read_size = getline(&line, &line_capacity, file);
-    if (read_size < 0 || read_size > ANKAH_MAX_TARGET + 32 ||
-        memchr(line, 0, (size_t)read_size) ||
-        line[read_size - 1] != '\n' ||
+    if (read_line(file, line, sizeof(line), &line_size) != 1 ||
+        line_size > ANKAH_MAX_TARGET + 32 ||
         (strncmp(line, "ANKAH_STATIC_V1\t", 16) != 0 &&
          strncmp(line, "ANKAH_STATIC_V2\t", 16) != 0)) goto done;
     version = line[14] == '2' ? 2 : 1;
-    line[read_size - 1] = 0;
-    bundle->prefix = strdup(line + 16);
+    bundle->prefix = copy_text(line + 16);
     if (!bundle->prefix || !valid_prefix(bundle->prefix)) goto done;
-    while ((read_size = getline(&line, &line_capacity, file)) >= 0) {
+    while ((length = read_line(file, line, sizeof(line), &line_size)) > 0) {
         ankah_static_entry *next;
-        if (read_size > 4096 || memchr(line, 0, (size_t)read_size) ||
-            line[read_size - 1] != '\n') goto done;
-        line[read_size - 1] = 0;
+        if (line_size > 4096) goto done;
         if (bundle->count == 0 || !bundle->entries[bundle->count - 1].url ||
             strncmp(line, bundle->entries[bundle->count - 1].url,
                     strlen(bundle->entries[bundle->count - 1].url)) != 0 ||
@@ -202,7 +206,7 @@ int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
         if (parse_entry(&bundle->entries[bundle->count - 1], line, directory,
                         bundle->prefix, version) != 0) goto done;
     }
-    if (ferror(file)) goto done;
+    if (length < 0) goto done;
     if (bundle->count && !bundle->entries[bundle->count - 1].variants[0].present)
         goto done;
     bundle->slot_count = 32;
@@ -220,7 +224,6 @@ int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
     }
     result = 0;
 done:
-    free(line);
     fclose(file);
     if (result != 0) ankah_static_free(bundle);
     return result;

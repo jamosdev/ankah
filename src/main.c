@@ -1,4 +1,5 @@
 #include "ankah/http.h"
+#include "ankah/files.h"
 #include "ankah/pow.h"
 #include "ankah/static.h"
 #include "ankah/session.h"
@@ -6,17 +7,12 @@
 #include <uv.h>
 
 #include <inttypes.h>
-#include <errno.h>
-#include <fcntl.h>
 #include <limits.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <strings.h>
-#include <sys/stat.h>
 #include <time.h>
-#include <unistd.h>
 #include "ankah/sha256.h"
 #if ANKAH_HAS_WASM
 #include "browser_pow_data.h"
@@ -304,37 +300,28 @@ static void erase_bytes(void *data, size_t size) {
 }
 
 static int load_secret(const char *path) {
-    char input[65];
-    struct stat metadata;
+    unsigned char *input = NULL;
     size_t size = 0, i;
-    int descriptor = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
-    if (descriptor < 0 || fstat(descriptor, &metadata) != 0 ||
-        !S_ISREG(metadata.st_mode) ||
-        (metadata.st_size != 64 && metadata.st_size != 65)) {
-        if (descriptor >= 0) close(descriptor);
+    if (ankah_file_read(path, 65, 1, &input, &size, NULL) != 0 ||
+        (size != 64 && size != 65)) {
+        free(input);
         return -1;
     }
-    while (size < (size_t)metadata.st_size) {
-        ssize_t amount = read(descriptor, input + size,
-                              (size_t)metadata.st_size - size);
-        if (amount < 0 && errno == EINTR) continue;
-        if (amount <= 0) { close(descriptor); erase_bytes(input, sizeof(input)); return -1; }
-        size += (size_t)amount;
-    }
-    close(descriptor);
     if (size == 65 && input[64] == '\n') size = 64;
-    if (size != 64) { erase_bytes(input, sizeof(input)); return -1; }
+    if (size != 64) { erase_bytes(input, 65); free(input); return -1; }
     for (i = 0; i < ANKAH_SECRET_SIZE; ++i) {
         int high = hex_value(input[i * 2]);
         int low = hex_value(input[i * 2 + 1]);
         if (high < 0 || low < 0) {
-            erase_bytes(input, sizeof(input));
+            erase_bytes(input, 65);
+            free(input);
             erase_bytes(config.secret, sizeof(config.secret));
             return -1;
         }
         config.secret[i] = (unsigned char)((high << 4) | low);
     }
-    erase_bytes(input, sizeof(input));
+    erase_bytes(input, 65);
+    free(input);
     return 0;
 }
 
@@ -355,25 +342,12 @@ static int finish_asset(static_asset *asset) {
 }
 
 static int load_asset(static_asset *asset, const char *directory) {
-    struct stat metadata;
     char path[1024];
-    FILE *file;
     unsigned char *data;
-    size_t i;
     int length = snprintf(path, sizeof(path), "%s/%s", directory, asset->name);
     if (length < 0 || (size_t)length >= sizeof(path) ||
-        stat(path, &metadata) != 0 || metadata.st_size < 0 ||
-        (uint64_t)metadata.st_size > MAX_ASSET_SIZE) return -1;
-    asset->size = (size_t)metadata.st_size;
-    asset->modified = metadata.st_mtime;
-    data = (unsigned char *)malloc(asset->size + 1);
-    if (!data) return -1;
-    file = fopen(path, "rb");
-    if (!file) { free(data); return -1; }
-    i = fread(data, 1, asset->size, file);
-    fclose(file);
-    data[asset->size] = 0;
-    if (i != asset->size) { free(data); return -1; }
+        ankah_file_read(path, MAX_ASSET_SIZE, 0, &data,
+                        &asset->size, &asset->modified) != 0) return -1;
     asset->data = data;
     return finish_asset(asset);
 }
@@ -810,7 +784,7 @@ static int encoding_quality(const ankah_request *request, const char *name,
             if (*p == ';') {
                 ++p;
                 while (*p == ' ' || *p == '\t') ++p;
-                if (strncasecmp(p, "q=", 2) != 0) q = 0;
+                if (!same_ascii_part(p, 2, "q=")) q = 0;
                 else {
                     p += 2;
                     q = parse_quality(p, &p);
@@ -820,7 +794,7 @@ static int encoding_quality(const ankah_request *request, const char *name,
             while (*p && *p != ',') ++p;
             end = token_end;
             if ((size_t)(end - token) == strlen(name) &&
-                strncasecmp(token, name, (size_t)(end - token)) == 0) explicit_q = q;
+                same_ascii_part(token, (size_t)(end - token), name)) explicit_q = q;
             if (end - token == 1 && *token == '*') wildcard_q = q;
         }
     }

@@ -14,6 +14,8 @@ import sys
 import tempfile
 import time
 
+from process_support import gateway_command
+
 
 def request(port, path, method="GET", headers=None):
     client = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
@@ -52,14 +54,14 @@ def main():
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
         process = subprocess.Popen(
-            [executable, "--listen", f"127.0.0.1:{port}",
+            gateway_command(executable, ["--listen", f"127.0.0.1:{port}",
              "--public-origin", f"http://localhost:{port}",
              "--secret-file", str(secret), "--assets-dir", assets,
-             "--static-bundle", str(bundle)],
+             "--static-bundle", str(bundle)]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         try:
-            for _ in range(50):
+            for _ in range(250):
                 if process.poll() is not None:
                     raise RuntimeError("gateway exited: " + process.stderr.read().decode())
                 try:
@@ -215,14 +217,14 @@ def main():
             sock.bind(("127.0.0.1", 0))
             root_port = sock.getsockname()[1]
         root_process = subprocess.Popen(
-            [executable, "--listen", f"127.0.0.1:{root_port}",
+            gateway_command(executable, ["--listen", f"127.0.0.1:{root_port}",
              "--public-origin", f"http://localhost:{root_port}",
              "--secret-file", str(secret), "--assets-dir", assets,
-             "--static-bundle", str(root_bundle)],
+             "--static-bundle", str(root_bundle)]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         try:
-            for _ in range(50):
+            for _ in range(250):
                 if root_process.poll() is not None:
                     raise RuntimeError("root gateway exited: " + root_process.stderr.read().decode())
                 try:
@@ -250,14 +252,14 @@ def main():
             sock.bind(("127.0.0.1", 0))
             legacy_port = sock.getsockname()[1]
         legacy_process = subprocess.Popen(
-            [executable, "--listen", f"127.0.0.1:{legacy_port}",
+            gateway_command(executable, ["--listen", f"127.0.0.1:{legacy_port}",
              "--public-origin", f"http://localhost:{legacy_port}",
              "--secret-file", str(secret), "--assets-dir", assets,
-             "--static-bundle", str(legacy), "--static-cache-mb", "0"],
+             "--static-bundle", str(legacy), "--static-cache-mb", "0"]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         try:
-            for _ in range(50):
+            for _ in range(250):
                 if legacy_process.poll() is not None:
                     raise RuntimeError("legacy gateway exited: " +
                                        legacy_process.stderr.read().decode())
@@ -293,14 +295,14 @@ def main():
             sock.bind(("127.0.0.1", 0))
             cache_port = sock.getsockname()[1]
         cache_process = subprocess.Popen(
-            [executable, "--listen", f"127.0.0.1:{cache_port}",
+            gateway_command(executable, ["--listen", f"127.0.0.1:{cache_port}",
              "--public-origin", f"http://localhost:{cache_port}",
              "--secret-file", str(secret), "--assets-dir", assets,
-             "--static-bundle", str(cache_bundle), "--static-cache-mb", "1"],
+             "--static-bundle", str(cache_bundle), "--static-cache-mb", "1"]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
         try:
-            for _ in range(50):
+            for _ in range(250):
                 if cache_process.poll() is not None:
                     raise RuntimeError("cache gateway exited: " +
                                        cache_process.stderr.read().decode())
@@ -335,9 +337,9 @@ def main():
         blob = bundle / "files" / compressed_digest
         blob.write_bytes(b"tampered")
         rejected = subprocess.run(
-            [executable, "--listen", "127.0.0.1:0",
+            gateway_command(executable, ["--listen", "127.0.0.1:0",
              "--public-origin", "http://localhost:8000", "--secret-file", str(secret),
-             "--assets-dir", assets, "--static-bundle", str(bundle)],
+             "--assets-dir", assets, "--static-bundle", str(bundle)]),
             capture_output=True, timeout=3,
         )
         require(rejected.returncode != 0, "tampered bundle was accepted")
