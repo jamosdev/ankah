@@ -156,5 +156,29 @@ still cover them. Days older than the daily ring are merged into a single
 them, so the average before the ring stays exact. Each record is 256 bytes, so
 the whole store is about 1.2 MiB and never grows.
 
-Counters are 64 bit and are never reset automatically. A process restart or
-`POST /stats/reset` starts a new epoch.
+Counters are 64 bit and are never reset automatically. `POST /stats/reset`
+starts a new epoch.
+
+## Persistent history
+
+Dashboard statistics are saved every 15 minutes, after a reset, and when the
+event loop exits normally. The default snapshot basename is `ankah.stats` in
+the process working directory. Use `--stats-file path` to choose another
+basename, or `--no-stats-file` to keep statistics only in memory. These
+options are valid only when the dashboard is enabled.
+
+Ankah keeps two generations named with `.0` and `.1` suffixes and uses a
+`.tmp` file while replacing one. At most three snapshots exist, for a maximum
+of about 3.7 MiB. A crash can lose up to 15 minutes of recent counts. A normal
+restart restores the newest valid generation and retains its epoch and
+history.
+
+Missing, unreadable, incompatible, or corrupt snapshots do not prevent Ankah
+from starting. It falls back to an older valid generation or an empty store
+and writes a warning to standard error. Snapshot write failures also leave the
+gateway and dashboard running, so a read-only filesystem is supported with
+in-memory statistics. A later successful save reports recovery.
+
+The reset response includes `persistence` with a value of `saved`, `disabled`,
+or `failed`. A failed save still resets the running process, but the dashboard
+warns that older data could return after a restart.

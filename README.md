@@ -57,9 +57,18 @@ CMake downloads llhttp 9.4.3, qrcodegen, and
 stb_image_write during the build. qrcodegen is MIT licensed; stb_image_write
 is available under the public domain or MIT license.
 
-The generated HTTP header classifier is checked in. GNU gperf 3.1 is needed
-only after changing `src/header_names.gperf`; the next build refreshes its C
-output.
+The generated HTTP header classifier is checked in, so normal builds do not
+need gperf or write into the source tree. After changing
+`src/header_names.gperf`, install GNU gperf 3.1 and run:
+
+```sh
+cmake -S . -B build
+cmake --build build --target regenerate-header-names
+cmake --build build --target verify-header-names
+```
+
+If gperf was installed after the build directory was configured, rerun the
+first command so CMake refreshes its cached program path.
 
 ```sh
 cmake -S . -B build
@@ -95,4 +104,5 @@ configuration, see [TLS and proxy configuration](docs/tls-and-proxies.md).
 on a separate token protected listener, with hourly history for 30 days and
 daily history for about 11 years in a fixed 1.2 MiB store. The listener also
 serves a browser dashboard for throughput, connections, resource limits and
-challenge outcomes. See the [operator dashboard](docs/dashboard.md).
+challenge outcomes. Statistics are saved to bounded snapshots in the working
+directory by default. See the [operator dashboard](docs/dashboard.md).

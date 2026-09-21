@@ -1078,7 +1078,12 @@
     button.classList.remove("is-armed");
     button.textContent = "Reset statistics";
     try {
-      await api("/stats/reset", "POST");
+      const result = await api("/stats/reset", "POST");
+      const warning = $("persistence-warning");
+      warning.hidden = result.persistence !== "failed";
+      warning.textContent = result.persistence === "failed"
+        ? "Statistics were reset in memory, but the snapshot could not be updated. Older data may return after a restart."
+        : "";
       state.samples = [];
       await loadHistory(state.fullHistory);
       poll();

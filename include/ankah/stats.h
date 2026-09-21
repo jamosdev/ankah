@@ -8,6 +8,10 @@
 #define ANKAH_STAT_HOURS 720
 #define ANKAH_STAT_DAYS 4096
 #define ANKAH_TEXT_MAX (8U * 1024U * 1024U)
+#define ANKAH_STATS_PATH_MAX 512
+
+#define ANKAH_STATS_RESTORED 1
+#define ANKAH_STATS_DEGRADED 2
 
 /* SUM fields merge by addition, MAX fields by maximum. Order is the wire order. */
 #define ANKAH_STAT_FIELDS(SUM, MAX) \
@@ -72,6 +76,13 @@ void ankah_stats_init(uint64_t wall);
 void ankah_stats_add(unsigned int field, uint64_t amount);
 void ankah_stats_max(unsigned int field, uint64_t value);
 void ankah_stats_roll(uint64_t wall);
+
+/* Restores the newest valid PATH.0 or PATH.1 snapshot, then rolls it to wall.
+ * Missing snapshots start a fresh epoch. The return value is a combination of
+ * ANKAH_STATS_RESTORED and ANKAH_STATS_DEGRADED. */
+int ankah_stats_restore(const char *path, uint64_t wall);
+/* Writes the next generation through PATH.tmp into the older snapshot slot. */
+int ankah_stats_save(const char *path, uint64_t wall);
 
 const char *ankah_stat_name(unsigned int field);
 int ankah_stat_is_max(unsigned int field);

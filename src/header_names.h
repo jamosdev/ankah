@@ -48,6 +48,7 @@ struct ankah_header_keyword {
 const struct ankah_header_keyword *ankah_header_lookup(const char *name,
                                                         size_t length);
 
+/* length defines the complete byte sequence examined; bytes after it are ignored. */
 static inline unsigned char ankah_header_name_kind(const char *name,
                                                     size_t length) {
     const struct ankah_header_keyword *keyword = ankah_header_lookup(name, length);

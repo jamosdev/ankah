@@ -13,7 +13,7 @@ static void check(int condition, const char *message) {
 
 static void header(ankah_request *request, const char *name, const char *value) {
     ankah_header *item = &request->headers[request->count++];
-    strcpy(item->name, name);
+    check(ankah_header_set_name(item, name, strlen(name)) == 0, "set header name");
     strcpy(item->value, value);
 }
 

@@ -43,12 +43,13 @@ int main(void) {
                        "duplicate expectation");
     memset(&request, 0, sizeof(request));
     request.count = 1;
-    strcpy(request.headers[0].name, "hOsT");
+    failures += expect(ankah_header_set_name(&request.headers[0], "hOsT", 4) == 0,
+                       "set manual header name");
     strcpy(request.headers[0].value, "manual.test");
     manual = ankah_header_value(&request, "Host");
-    failures += expect(manual && strcmp(manual, "manual.test") == 0,
-                       "unclassified header lookup");
-    strcpy(request.headers[0].name, "X-Custom");
+    failures += expect(manual && strcmp(manual, "manual.test") == 0, "classified lookup");
+    failures += expect(ankah_header_set_name(&request.headers[0], "X-Custom", 8) == 0,
+                       "replace manual header name");
     manual = ankah_header_value(&request, "x-custom");
     failures += expect(manual && strcmp(manual, "manual.test") == 0,
                        "unknown header lookup");

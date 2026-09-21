@@ -96,24 +96,38 @@ else()
 endif()
 target_link_libraries(ankah_pow PUBLIC ${ANKAH_MBEDCRYPTO})
 find_program(ANKAH_GPERF NAMES gperf)
-set(ANKAH_HEADER_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/header_names.gperf")
+set(ANKAH_HEADER_INPUT "src/header_names.gperf")
 set(ANKAH_HEADER_OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/header_names_gperf.c")
-set(ANKAH_HEADER_BUILD_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/header_names_gperf.c")
-add_custom_command(OUTPUT "${ANKAH_HEADER_BUILD_OUTPUT}"
+add_custom_target(regenerate-header-names
   COMMAND "${CMAKE_COMMAND}"
     "-DANKAH_GPERF=${ANKAH_GPERF}"
     "-DANKAH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
     "-DANKAH_HEADER_INPUT=${ANKAH_HEADER_INPUT}"
     "-DANKAH_HEADER_OUTPUT=${ANKAH_HEADER_OUTPUT}"
-    "-DANKAH_HEADER_BUILD_OUTPUT=${ANKAH_HEADER_BUILD_OUTPUT}"
-    "-DANKAH_HEADER_TEMP=${CMAKE_CURRENT_BINARY_DIR}/header_names_gperf.c.tmp"
+    "-DANKAH_HEADER_TEMP=${CMAKE_CURRENT_BINARY_DIR}/header_names_gperf.regenerate.tmp"
+    -DANKAH_HEADER_MODE=regenerate
     -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_header_names.cmake"
-  DEPENDS "${ANKAH_HEADER_INPUT}" "${ANKAH_HEADER_OUTPUT}"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${ANKAH_HEADER_INPUT}"
     "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_header_names.cmake"
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
-  COMMENT "Generating HTTP header classifier"
+  COMMENT "Regenerating HTTP header classifier"
   VERBATIM)
-add_library(ankah_header_names STATIC "${ANKAH_HEADER_BUILD_OUTPUT}")
+add_custom_target(verify-header-names
+  COMMAND "${CMAKE_COMMAND}"
+    "-DANKAH_GPERF=${ANKAH_GPERF}"
+    "-DANKAH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DANKAH_HEADER_INPUT=${ANKAH_HEADER_INPUT}"
+    "-DANKAH_HEADER_OUTPUT=${ANKAH_HEADER_OUTPUT}"
+    "-DANKAH_HEADER_TEMP=${CMAKE_CURRENT_BINARY_DIR}/header_names_gperf.verify.tmp"
+    -DANKAH_HEADER_MODE=verify
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_header_names.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${ANKAH_HEADER_INPUT}"
+    "${ANKAH_HEADER_OUTPUT}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_header_names.cmake"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  COMMENT "Verifying HTTP header classifier"
+  VERBATIM)
+add_library(ankah_header_names STATIC src/header_names.c src/header_names_gperf.c)
 target_include_directories(ankah_header_names PUBLIC include)
 target_include_directories(ankah_header_names PRIVATE src)
 add_library(ankah_http STATIC src/http.c)
@@ -164,12 +178,14 @@ target_include_directories(ankah-header-names PRIVATE src)
 target_link_libraries(ankah-header-names PRIVATE ankah_header_names)
 add_executable(ankah-session tests/session_test.c src/session.c)
 target_link_libraries(ankah-session PRIVATE ankah_pow)
-add_executable(ankah-stats tests/stats_test.c src/stats.c)
+add_executable(ankah-stats tests/stats_test.c src/stats.c src/files.c)
 target_include_directories(ankah-stats PRIVATE include)
+target_link_libraries(ankah-stats PRIVATE ankah_pow)
 add_executable(ankah-proxy tests/proxy_test.c src/proxy.c)
 target_include_directories(ankah-proxy PRIVATE include)
 if(UNIX)
   target_compile_definitions(ankah-proxy PRIVATE _POSIX_C_SOURCE=200809L)
+  target_compile_definitions(ankah-stats PRIVATE _POSIX_C_SOURCE=200809L)
 endif()
 if(NOT ANKAH_BUNDLED_RUNTIME_DEPS)
   target_include_directories(ankah-proxy PRIVATE ${LIBUV_INCLUDE_DIR})

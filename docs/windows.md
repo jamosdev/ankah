@@ -34,9 +34,9 @@ cmake --build build-windows
 ctest --test-dir build-windows --output-on-failure --timeout 180
 ```
 
-The test launcher translates asset, secret, static bundle, certificate, and
-key paths into the default Wine `Z:` drive. Native Windows use accepts normal
-Windows paths.
+The test launcher translates asset, secret, statistics, static bundle,
+certificate, and key paths into the default Wine `Z:` drive. Native Windows
+use accepts normal Windows paths.
 
 ## Runtime package
 

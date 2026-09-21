@@ -137,6 +137,7 @@ button[aria-pressed="true"] {
 
 .label { color: var(--ink-2); font-size: 0.875rem; }
 .note { color: var(--muted); font-size: 0.8125rem; }
+.persistence-warning { color: var(--critical); font-size: 0.8125rem; }
 
 .login { max-width: 460px; display: grid; gap: 12px; }
 .login input {

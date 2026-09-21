@@ -693,11 +693,12 @@ static int h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
     if (stream->request.count >= ANKAH_MAX_HEADERS || name_size >= ANKAH_MAX_FIELD ||
         value_size >= ANKAH_MAX_VALUE) { stream->invalid = 1; return 0; }
     header = &stream->request.headers[stream->request.count++];
-    memcpy(header->name, name, name_size);
-    header->name[name_size] = 0;
+    if (ankah_header_set_name(header, (const char *)name, name_size) != 0) {
+        stream->invalid = 1;
+        return 0;
+    }
     memcpy(header->value, value, value_size);
     header->value[value_size] = 0;
-    header->kind = kind;
     return 0;
 }
 

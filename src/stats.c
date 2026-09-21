@@ -1,5 +1,8 @@
 #include "ankah/stats.h"
+#include "ankah/files.h"
+#include "ankah/sha256.h"
 
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -11,13 +14,16 @@ typedef struct {
     size_t capacity, head, count;
 } stat_ring;
 
-static struct {
+typedef struct {
     int enabled;
     uint64_t epoch, hour_index, day_index, evicted_days;
     ankah_stat_record cumulative, hour, day, evicted;
     ankah_stat_record hour_rows[ANKAH_STAT_HOURS];
     ankah_stat_record day_rows[ANKAH_STAT_DAYS];
-} stats;
+} stat_state;
+
+static stat_state stats;
+static uint64_t snapshot_generation;
 
 static stat_ring hours = {stats.hour_rows, ANKAH_STAT_HOURS, 0, 0};
 static stat_ring days = {stats.day_rows, ANKAH_STAT_DAYS, 0, 0};
@@ -164,6 +170,249 @@ void ankah_stats_roll(uint64_t wall) {
         memset(&stats.day, 0, sizeof(stats.day));
         stats.day_index = day;
     }
+}
+
+#define SNAPSHOT_HEADER_SIZE 80U
+#define SNAPSHOT_DIGEST_SIZE 32U
+#define SNAPSHOT_VERSION 1U
+#define SNAPSHOT_RECORD_SIZE (ANKAH_STAT_COUNT * 8U)
+#define SNAPSHOT_MAX_SIZE \
+    (SNAPSHOT_HEADER_SIZE + \
+     (4U + ANKAH_STAT_HOURS + ANKAH_STAT_DAYS) * SNAPSHOT_RECORD_SIZE + \
+     SNAPSHOT_DIGEST_SIZE)
+
+typedef struct {
+    stat_state state;
+    size_t hour_count, day_count;
+    uint64_t generation;
+} decoded_snapshot;
+
+static void put_u32(unsigned char **cursor, uint32_t value) {
+    unsigned int i;
+    for (i = 0; i < 4; ++i) {
+        *(*cursor)++ = (unsigned char)value;
+        value >>= 8;
+    }
+}
+
+static void put_u64(unsigned char **cursor, uint64_t value) {
+    unsigned int i;
+    for (i = 0; i < 8; ++i) {
+        *(*cursor)++ = (unsigned char)value;
+        value >>= 8;
+    }
+}
+
+static uint32_t get_u32(const unsigned char **cursor) {
+    uint32_t value = 0;
+    unsigned int i;
+    for (i = 0; i < 4; ++i) value |= (uint32_t)*(*cursor)++ << (i * 8);
+    return value;
+}
+
+static uint64_t get_u64(const unsigned char **cursor) {
+    uint64_t value = 0;
+    unsigned int i;
+    for (i = 0; i < 8; ++i) value |= (uint64_t)*(*cursor)++ << (i * 8);
+    return value;
+}
+
+static void put_record(unsigned char **cursor, const ankah_stat_record *record) {
+    unsigned int field;
+    for (field = 0; field < ANKAH_STAT_COUNT; ++field)
+        put_u64(cursor, record->v[field]);
+}
+
+static void get_record(const unsigned char **cursor, ankah_stat_record *record) {
+    unsigned int field;
+    for (field = 0; field < ANKAH_STAT_COUNT; ++field)
+        record->v[field] = get_u64(cursor);
+}
+
+static int snapshot_path(const char *base, const char *suffix,
+                         char out[ANKAH_STATS_PATH_MAX]) {
+    int length = snprintf(out, ANKAH_STATS_PATH_MAX, "%s%s", base, suffix);
+    return length > 0 && length < ANKAH_STATS_PATH_MAX ? 0 : -1;
+}
+
+static int totals_valid(const decoded_snapshot *snapshot) {
+    unsigned int field;
+    size_t row;
+    uint64_t elapsed_days;
+    if (snapshot->state.hour_index < snapshot->state.epoch / 3600 ||
+        snapshot->state.day_index < snapshot->state.epoch / 86400)
+        return 0;
+    if (snapshot->hour_count !=
+        (snapshot->state.hour_index - snapshot->state.epoch / 3600 < ANKAH_STAT_HOURS
+             ? (size_t)(snapshot->state.hour_index - snapshot->state.epoch / 3600)
+             : ANKAH_STAT_HOURS))
+        return 0;
+    elapsed_days = snapshot->state.day_index - snapshot->state.epoch / 86400;
+    if (snapshot->state.evicted_days > elapsed_days ||
+        (uint64_t)snapshot->day_count != elapsed_days - snapshot->state.evicted_days)
+        return 0;
+    for (field = 0; field < ANKAH_STAT_COUNT; ++field) {
+        uint64_t total = snapshot->state.evicted.v[field];
+        if (maxima[field]) {
+            if (snapshot->state.day.v[field] > total)
+                total = snapshot->state.day.v[field];
+            for (row = 0; row < snapshot->day_count; ++row)
+                if (snapshot->state.day_rows[row].v[field] > total)
+                    total = snapshot->state.day_rows[row].v[field];
+        } else {
+            total += snapshot->state.day.v[field];
+            for (row = 0; row < snapshot->day_count; ++row)
+                total += snapshot->state.day_rows[row].v[field];
+        }
+        if (total != snapshot->state.cumulative.v[field]) return 0;
+    }
+    return 1;
+}
+
+static decoded_snapshot *decode_snapshot(const unsigned char *data, size_t size) {
+    static const unsigned char magic[8] = {'A','N','K','H','S','T','A','T'};
+    unsigned char digest[SNAPSHOT_DIGEST_SIZE];
+    const unsigned char *cursor = data;
+    decoded_snapshot *snapshot;
+    uint32_t hour_count, day_count;
+    size_t expected, row;
+    if (size < SNAPSHOT_HEADER_SIZE + SNAPSHOT_DIGEST_SIZE ||
+        memcmp(cursor, magic, sizeof(magic)) != 0) return NULL;
+    cursor += sizeof(magic);
+    if (get_u32(&cursor) != SNAPSHOT_VERSION ||
+        get_u32(&cursor) != ANKAH_STAT_COUNT ||
+        get_u32(&cursor) != ANKAH_STAT_HOURS ||
+        get_u32(&cursor) != ANKAH_STAT_DAYS) return NULL;
+    snapshot = (decoded_snapshot *)calloc(1, sizeof(*snapshot));
+    if (!snapshot) return NULL;
+    snapshot->generation = get_u64(&cursor);
+    (void)get_u64(&cursor); /* Saved wall time is informational in version 1. */
+    snapshot->state.epoch = get_u64(&cursor);
+    snapshot->state.hour_index = get_u64(&cursor);
+    snapshot->state.day_index = get_u64(&cursor);
+    snapshot->state.evicted_days = get_u64(&cursor);
+    hour_count = get_u32(&cursor);
+    day_count = get_u32(&cursor);
+    if (!snapshot->generation || hour_count > ANKAH_STAT_HOURS ||
+        day_count > ANKAH_STAT_DAYS) { free(snapshot); return NULL; }
+    expected = SNAPSHOT_HEADER_SIZE +
+               (4U + (size_t)hour_count + (size_t)day_count) * SNAPSHOT_RECORD_SIZE +
+               SNAPSHOT_DIGEST_SIZE;
+    if (size != expected || ankah_sha256(data, size - SNAPSHOT_DIGEST_SIZE, digest) != 0 ||
+        memcmp(digest, data + size - SNAPSHOT_DIGEST_SIZE, SNAPSHOT_DIGEST_SIZE) != 0) {
+        free(snapshot);
+        return NULL;
+    }
+    get_record(&cursor, &snapshot->state.cumulative);
+    get_record(&cursor, &snapshot->state.hour);
+    get_record(&cursor, &snapshot->state.day);
+    get_record(&cursor, &snapshot->state.evicted);
+    for (row = 0; row < hour_count; ++row)
+        get_record(&cursor, &snapshot->state.hour_rows[row]);
+    for (row = 0; row < day_count; ++row)
+        get_record(&cursor, &snapshot->state.day_rows[row]);
+    snapshot->hour_count = hour_count;
+    snapshot->day_count = day_count;
+    snapshot->state.enabled = 1;
+    if (!totals_valid(snapshot)) { free(snapshot); return NULL; }
+    return snapshot;
+}
+
+static unsigned char *encode_snapshot(uint64_t generation, uint64_t wall, size_t *size) {
+    static const unsigned char magic[8] = {'A','N','K','H','S','T','A','T'};
+    unsigned char digest[SNAPSHOT_DIGEST_SIZE], *data, *cursor;
+    size_t age;
+    *size = SNAPSHOT_HEADER_SIZE +
+            (4U + hours.count + days.count) * SNAPSHOT_RECORD_SIZE +
+            SNAPSHOT_DIGEST_SIZE;
+    data = (unsigned char *)malloc(*size);
+    if (!data) return NULL;
+    cursor = data;
+    memcpy(cursor, magic, sizeof(magic)); cursor += sizeof(magic);
+    put_u32(&cursor, SNAPSHOT_VERSION);
+    put_u32(&cursor, ANKAH_STAT_COUNT);
+    put_u32(&cursor, ANKAH_STAT_HOURS);
+    put_u32(&cursor, ANKAH_STAT_DAYS);
+    put_u64(&cursor, generation);
+    put_u64(&cursor, wall);
+    put_u64(&cursor, stats.epoch);
+    put_u64(&cursor, stats.hour_index);
+    put_u64(&cursor, stats.day_index);
+    put_u64(&cursor, stats.evicted_days);
+    put_u32(&cursor, (uint32_t)hours.count);
+    put_u32(&cursor, (uint32_t)days.count);
+    put_record(&cursor, &stats.cumulative);
+    put_record(&cursor, &stats.hour);
+    put_record(&cursor, &stats.day);
+    put_record(&cursor, &stats.evicted);
+    for (age = hours.count; age > 0; --age)
+        put_record(&cursor, ring_age(&hours, age - 1));
+    for (age = days.count; age > 0; --age)
+        put_record(&cursor, ring_age(&days, age - 1));
+    if (ankah_sha256(data, *size - SNAPSHOT_DIGEST_SIZE, digest) != 0) {
+        free(data);
+        return NULL;
+    }
+    memcpy(cursor, digest, sizeof(digest));
+    return data;
+}
+
+int ankah_stats_restore(const char *path, uint64_t wall) {
+    decoded_snapshot *snapshots[2] = {NULL, NULL}, *chosen = NULL;
+    int result = 0, slot;
+    snapshot_generation = 0;
+    for (slot = 0; slot < 2; ++slot) {
+        char candidate_path[ANKAH_STATS_PATH_MAX];
+        unsigned char *data = NULL;
+        size_t size = 0;
+        int read_result;
+        if (snapshot_path(path, slot ? ".1" : ".0", candidate_path) != 0) {
+            result |= ANKAH_STATS_DEGRADED;
+            continue;
+        }
+        read_result = ankah_file_read_optional(candidate_path, SNAPSHOT_MAX_SIZE, 1,
+                                               &data, &size);
+        if (read_result == 0) {
+            snapshots[slot] = decode_snapshot(data, size);
+            if (!snapshots[slot]) result |= ANKAH_STATS_DEGRADED;
+            free(data);
+        } else if (read_result < 0) result |= ANKAH_STATS_DEGRADED;
+    }
+    if (snapshots[0] && snapshots[1])
+        chosen = snapshots[snapshots[1]->generation > snapshots[0]->generation ? 1 : 0];
+    else chosen = snapshots[0] ? snapshots[0] : snapshots[1];
+    if (chosen) {
+        stats = chosen->state;
+        hours.head = chosen->hour_count % ANKAH_STAT_HOURS;
+        hours.count = chosen->hour_count;
+        days.head = chosen->day_count % ANKAH_STAT_DAYS;
+        days.count = chosen->day_count;
+        snapshot_generation = chosen->generation;
+        result |= ANKAH_STATS_RESTORED;
+        ankah_stats_roll(wall);
+    } else ankah_stats_init(wall);
+    free(snapshots[0]);
+    free(snapshots[1]);
+    return result;
+}
+
+int ankah_stats_save(const char *path, uint64_t wall) {
+    unsigned char *data;
+    char temp_path[ANKAH_STATS_PATH_MAX], target_path[ANKAH_STATS_PATH_MAX];
+    uint64_t generation;
+    size_t size;
+    int result;
+    if (!stats.enabled || snapshot_generation == UINT64_MAX) return -1;
+    generation = snapshot_generation + 1;
+    if (snapshot_path(path, ".tmp", temp_path) != 0 ||
+        snapshot_path(path, generation & 1 ? ".1" : ".0", target_path) != 0)
+        return -1;
+    data = encode_snapshot(generation, wall, &size);
+    if (!data) return -1;
+    result = ankah_file_replace(temp_path, target_path, data, size);
+    free(data);
+    if (result == 0) snapshot_generation = generation;
+    return result;
 }
 
 const char *ankah_stat_name(unsigned int field) {

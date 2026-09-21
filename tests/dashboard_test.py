@@ -70,6 +70,8 @@ def main():
         secret.write_text("a" * 64)
         token = pathlib.Path(temp) / "token"
         token.write_text(TOKEN + "\n")
+        stats_file = pathlib.Path(temp) / "statistics"
+        pathlib.Path(str(stats_file) + ".0").write_bytes(b"corrupt")
         base = ["--listen", f"127.0.0.1:{public}", "--upstream", f"127.0.0.1:{app}",
                 "--public-origin", f"http://localhost:{public}",
                 "--secret-file", str(secret), "--assets-dir", root,
@@ -79,14 +81,20 @@ def main():
         for extra, reason in ((listen, "listen without a token"),
                               (["--dashboard-token-file", str(token)], "token without a listener"),
                               (listen + ["--dashboard-token-file", str(secret)],
-                               "token equal to the secret")):
+                               "token equal to the secret"),
+                              (["--stats-file", str(stats_file)], "statistics without a dashboard"),
+                              (["--no-stats-file"], "disabled statistics without a dashboard"),
+                              (listen + ["--dashboard-token-file", str(token),
+                                         "--stats-file", str(stats_file), "--no-stats-file"],
+                               "conflicting statistics options")):
             result = subprocess.run(gateway_command(executable, base + extra),
                                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                                     timeout=30)
             check(result.returncode == 2, f"started with {reason}")
 
         process = subprocess.Popen(
-            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token)]),
+            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token),
+                            "--stats-file", str(stats_file)]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             for _ in range(250):
@@ -243,11 +251,85 @@ def main():
 
             status, _, body = request(dashboard, "/stats/reset", "POST", authorized, b"")
             check(status == 200, "reset accepted")
-            epoch = json.loads(body)["epoch"]
+            reset_reply = json.loads(body)
+            epoch = reset_reply["epoch"]
+            check(reset_reply["persistence"] == "saved", "reset snapshot is saved")
             check(epoch >= history["epoch"], "reset moves the epoch forward")
             reset = stats("/stats/live")
             check(reset["epoch"] == epoch and reset["cumulative"][field["requests"]] == 0 and
                   reset["cumulative"][field["accepted"]] == 0, "reset clears counters")
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
+        process = subprocess.Popen(
+            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token),
+                            "--stats-file", str(stats_file)]),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            for _ in range(250):
+                if process.poll() is not None:
+                    raise RuntimeError("restarted gateway exited: " +
+                                       process.stderr.read().decode())
+                try:
+                    if request(dashboard, "/stats/live", headers=authorized)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(.02)
+            else:
+                raise RuntimeError("restarted dashboard did not listen")
+            check(stats("/stats/live")["epoch"] == epoch,
+                  "restart restores the statistics epoch")
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
+        unavailable = pathlib.Path(temp) / "missing" / "statistics"
+        process = subprocess.Popen(
+            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token),
+                            "--stats-file", str(unavailable)]),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            for _ in range(250):
+                if process.poll() is not None:
+                    raise RuntimeError("degraded gateway exited: " +
+                                       process.stderr.read().decode())
+                try:
+                    if request(dashboard, "/stats/live", headers=authorized)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(.02)
+            else:
+                raise RuntimeError("degraded dashboard did not listen")
+            status, _, body = request(dashboard, "/stats/reset", "POST", authorized, b"")
+            check(status == 200 and json.loads(body)["persistence"] == "failed",
+                  "snapshot write failure does not prevent reset")
+        finally:
+            process.terminate()
+            process.wait(timeout=10)
+
+        process = subprocess.Popen(
+            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token),
+                            "--no-stats-file"]),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            for _ in range(250):
+                if process.poll() is not None:
+                    raise RuntimeError("memory-only gateway exited: " +
+                                       process.stderr.read().decode())
+                try:
+                    if request(dashboard, "/stats/live", headers=authorized)[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(.02)
+            else:
+                raise RuntimeError("memory-only dashboard did not listen")
+            status, _, body = request(dashboard, "/stats/reset", "POST", authorized, b"")
+            check(status == 200 and json.loads(body)["persistence"] == "disabled",
+                  "memory-only reset reports disabled persistence")
         finally:
             process.terminate()
             process.wait(timeout=10)

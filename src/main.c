@@ -25,6 +25,7 @@
 #define MAX_CONNECTIONS 256
 #define MAX_DASHBOARD_CONNECTIONS 8
 #define LIVE_CACHE_NS UINT64_C(250000000)
+#define STATS_SAVE_NS UINT64_C(900000000000)
 #define TOP_CONNECTIONS 16
 #define MAX_BODY (16U * 1024U * 1024U)
 #define MAX_ALLOW 32
@@ -169,6 +170,10 @@ typedef struct {
     int dashboard_port;
     int dashboard;
     char dashboard_token_path[512];
+    char stats_path[ANKAH_STATS_PATH_MAX];
+    int stats_persistence_disabled;
+    int stats_persistence_failed;
+    uint64_t next_stats_save_ns;
     unsigned char dashboard_token[ANKAH_SECRET_SIZE];
     uv_tcp_t dashboard_listener;
     int dashboard_listener_initialized;
@@ -194,6 +199,7 @@ static int etag_matches(const ankah_request *request, const char *etag);
 static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer);
 static void on_upstream_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer);
 static size_t header_end(const char *bytes, size_t length);
+static int save_stats(void);
 
 /* Dashboard traffic never reaches the statistics it reports. */
 static void tally(const connection *c, unsigned int field, uint64_t amount) {
@@ -559,6 +565,11 @@ static int parse_options(int argc, char **argv, int *child_index) {
             *child_index = i + 1;
             break;
         }
+        if (strcmp(argv[i], "--no-stats-file") == 0) {
+            if (config.stats_persistence_disabled) return -1;
+            config.stats_persistence_disabled = 1;
+            continue;
+        }
         if (i + 1 >= argc) return -1;
         if (strcmp(argv[i], "--listen") == 0) {
             if (parse_address(argv[++i], config.listen_ip, sizeof(config.listen_ip),
@@ -601,6 +612,10 @@ static int parse_options(int argc, char **argv, int *child_index) {
         } else if (strcmp(argv[i], "--dashboard-token-file") == 0) {
             if (strlen(argv[++i]) >= sizeof(config.dashboard_token_path)) return -1;
             strcpy(config.dashboard_token_path, argv[i]);
+        } else if (strcmp(argv[i], "--stats-file") == 0) {
+            if (config.stats_path[0] || !argv[i + 1][0] ||
+                strlen(argv[i + 1]) + 4 >= sizeof(config.stats_path)) return -1;
+            strcpy(config.stats_path, argv[++i]);
         } else if (strcmp(argv[i], "--allow-prefix") == 0) {
             if (config.allow_count == MAX_ALLOW || !valid_allow_prefix(argv[i + 1])) return -1;
             config.allow[config.allow_count++] = argv[++i];
@@ -611,8 +626,13 @@ static int parse_options(int argc, char **argv, int *child_index) {
     config.public_https = prefix(config.public_origin, "https://");
     if (!!config.tls_certificate[0] != !!config.tls_key[0] ||
         (config.tls_certificate[0] && !config.public_https) ||
-        !!config.dashboard_ip[0] != !!config.dashboard_token_path[0]) return -1;
+        !!config.dashboard_ip[0] != !!config.dashboard_token_path[0] ||
+        (config.stats_path[0] && config.stats_persistence_disabled)) return -1;
     config.dashboard = config.dashboard_ip[0] != 0;
+    if (!config.dashboard && (config.stats_path[0] || config.stats_persistence_disabled))
+        return -1;
+    if (config.dashboard && !config.stats_path[0] && !config.stats_persistence_disabled)
+        strcpy(config.stats_path, "ankah.stats");
     {
         const char *host = strstr(config.public_origin, "://") + 3;
         if (!*host || strspn(host, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -2121,7 +2141,9 @@ static void handle_dashboard(connection *c, size_t end) {
     }
     if (route == RESET) {
         ankah_session_totals sessions;
-        char reply[64];
+        const char *persistence;
+        char reply[112];
+        int saved;
         uint64_t wall = (uint64_t)time(NULL);
         if (strcmp(c->request.method, "POST") != 0) {
             respond(c, 405, "Method Not Allowed", "text/plain", "Use POST\n", "Allow: POST\r\n");
@@ -2131,7 +2153,11 @@ static void handle_dashboard(connection *c, size_t end) {
         body_release(config.live_body);
         config.live_body = NULL;
         stats_sample(wall, &sessions);
-        snprintf(reply, sizeof(reply), "{\"epoch\":%" PRIu64 "}\n", wall);
+        saved = save_stats();
+        persistence = saved > 0 ? "saved" : saved == 0 ? "disabled" : "failed";
+        snprintf(reply, sizeof(reply),
+                 "{\"epoch\":%" PRIu64 ",\"persistence\":\"%s\"}\n",
+                 wall, persistence);
         respond(c, 200, "OK", "application/json", reply, NULL);
         return;
     }
@@ -2408,10 +2434,36 @@ static void on_dashboard_connection(uv_stream_t *server, int status) {
     if (status >= 0) accept_connection(server, 1);
 }
 
+/* Returns 1 after a durable save, 0 when persistence is disabled, and -1
+ * after a nonfatal persistence failure. */
+static int save_stats(void) {
+    uint64_t wall;
+    if (!config.stats_path[0]) return 0;
+    wall = (uint64_t)time(NULL);
+    ankah_stats_roll(wall);
+    if (ankah_stats_save(config.stats_path, wall) != 0) {
+        if (!config.stats_persistence_failed)
+            fprintf(stderr, "Ankah statistics persistence unavailable: %s\n",
+                    config.stats_path);
+        config.stats_persistence_failed = 1;
+        return -1;
+    }
+    if (config.stats_persistence_failed)
+        fprintf(stderr, "Ankah statistics persistence recovered: %s\n",
+                config.stats_path);
+    config.stats_persistence_failed = 0;
+    return 1;
+}
+
 static void on_stats_tick(uv_timer_t *timer) {
     ankah_session_totals sessions;
+    uint64_t now = uv_hrtime();
     (void)timer;
     stats_sample((uint64_t)time(NULL), &sessions);
+    if (config.stats_path[0] && now >= config.next_stats_save_ns) {
+        (void)save_stats();
+        config.next_stats_save_ns = now + STATS_SAVE_NS;
+    }
 }
 
 static void on_child_exit(uv_process_t *process, int64_t status, int signal_number) {
@@ -2439,6 +2491,7 @@ int main(int argc, char **argv) {
                         "[--allow-prefix /path] [--static-bundle dir] [--static-cache-mb n] "
                         "[--tls-cert path --tls-key path] [--trusted-proxy cidr] "
                         "[--dashboard-listen ip:port --dashboard-token-file path] "
+                        "[--stats-file path | --no-stats-file] "
                         "[-- child command]\n");
         return 2;
     }
@@ -2485,7 +2538,16 @@ int main(int argc, char **argv) {
     }
     if (config.dashboard) {
         struct sockaddr_storage dashboard_address;
-        ankah_stats_init((uint64_t)time(NULL));
+        uint64_t wall = (uint64_t)time(NULL);
+        int restore = config.stats_path[0]
+            ? ankah_stats_restore(config.stats_path, wall) : 0;
+        if (!config.stats_path[0]) ankah_stats_init(wall);
+        if (restore & ANKAH_STATS_DEGRADED) {
+            fprintf(stderr, "Ankah statistics snapshot was unavailable or invalid: %s\n",
+                    config.stats_path);
+            config.stats_persistence_failed = 1;
+        }
+        config.next_stats_save_ns = uv_hrtime() + STATS_SAVE_NS;
         if (socket_address(config.dashboard_ip, config.dashboard_port,
                            &dashboard_address) != 0 ||
             uv_tcp_init(config.loop, &config.dashboard_listener) != 0) {
@@ -2524,6 +2586,7 @@ int main(int argc, char **argv) {
     }
     fprintf(stderr, "Ankah listening on %s:%d\n", config.listen_ip, config.listen_port);
     result = uv_run(config.loop, UV_RUN_DEFAULT) == 0 ? 0 : 1;
+    if (config.dashboard) (void)save_stats();
     if (config.tls_certificate[0]) ankah_frontend_shutdown();
     return result;
 }

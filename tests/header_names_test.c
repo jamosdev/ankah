@@ -51,6 +51,10 @@ static void check(int condition, const char *message, const char *name) {
 
 int main(void) {
     char folded[64];
+    ankah_header header = {{0}, {0}, 0};
+    ankah_header saved;
+    char embedded[] = {'h', 'o', 0, 's', 't'};
+    char oversized[ANKAH_MAX_FIELD];
     size_t i, j;
     for (i = 0; i < sizeof(expected) / sizeof(expected[0]); ++i) {
         size_t length = strlen(expected[i].name);
@@ -68,5 +72,33 @@ int main(void) {
           "near miss", "hostile");
     check(ankah_header_name_kind(":path-extra", 5) == ANKAH_HEADER_PSEUDO_PATH,
           "bounded lookup", ":path");
+    check(ankah_header_name_kind(":path-extra", strlen(":path-extra")) ==
+              ANKAH_HEADER_OTHER,
+          "full-length near miss", ":path-extra");
+    check(ankah_header_set_name(&header, "Host", 4) == 0 &&
+              ankah_header_effective_kind(&header) == ANKAH_HEADER_HOST,
+          "setter classification", "Host");
+    check(ankah_header_set_name(&header, "X-Custom", 8) == 0 &&
+              ankah_header_effective_kind(&header) == ANKAH_HEADER_OTHER,
+          "setter reclassification", "X-Custom");
+    check(ankah_header_set_name(&header, "Range", 5) == 0 &&
+              ankah_header_effective_kind(&header) == ANKAH_HEADER_RANGE,
+          "setter recognized reclassification", "Range");
+    saved = header;
+    memset(oversized, 'a', sizeof(oversized));
+    check(ankah_header_set_name(&header, oversized, sizeof(oversized)) != 0 &&
+              memcmp(&header, &saved, sizeof(header)) == 0,
+          "reject oversized name unchanged", "oversized");
+    check(ankah_header_set_name(&header, embedded, sizeof(embedded)) != 0 &&
+              memcmp(&header, &saved, sizeof(header)) == 0,
+          "reject embedded NUL unchanged", "embedded NUL");
+    check(ankah_header_set_name(&header, "", 0) != 0 &&
+              memcmp(&header, &saved, sizeof(header)) == 0,
+          "reject empty name unchanged", "empty");
+    check(ankah_header_set_name(&header, NULL, 1) != 0 &&
+              memcmp(&header, &saved, sizeof(header)) == 0,
+          "reject null name unchanged", "null");
+    check(ankah_header_set_name(NULL, "Host", 4) != 0,
+          "reject null header", "null");
     return failures ? 1 : 0;
 }

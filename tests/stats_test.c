@@ -237,6 +237,73 @@ static int writer_test(void) {
     return failures;
 }
 
+static void remove_snapshots(const char *base) {
+    char path[128];
+    snprintf(path, sizeof(path), "%s.0", base); remove(path);
+    snprintf(path, sizeof(path), "%s.1", base); remove(path);
+    snprintf(path, sizeof(path), "%s.tmp", base); remove(path);
+}
+
+static int damage_file(const char *path) {
+    FILE *file = fopen(path, "r+b");
+    int byte, result = 0;
+    if (!file) return -1;
+    byte = fgetc(file);
+    if (byte == EOF || fseek(file, 0, SEEK_SET) != 0 ||
+        fputc(byte ^ 0xff, file) == EOF) result = -1;
+    if (fclose(file) != 0) result = -1;
+    return result;
+}
+
+static int persistence_test(void) {
+    static const char base[] = "ankah-stats-test-state";
+    const uint64_t start = 30000 * DAY + 5 * HOUR;
+    int failures = 0, restored;
+    remove_snapshots(base);
+
+    restored = ankah_stats_restore(base, start);
+    failures += expect(restored == 0 && ankah_stats_epoch() == start,
+                       "missing snapshots start empty");
+    ankah_stats_add(ANKAH_STAT_requests, 12);
+    ankah_stats_roll(start + HOUR);
+    ankah_stats_add(ANKAH_STAT_requests, 3);
+    failures += expect(ankah_stats_save(base, start + HOUR) == 0,
+                       "first snapshot saves");
+    ankah_stats_add(ANKAH_STAT_requests, 5);
+    failures += expect(ankah_stats_save(base, start + HOUR) == 0,
+                       "second snapshot saves");
+
+    ankah_stats_init(start + 10);
+    restored = ankah_stats_restore(base, start + 2 * HOUR);
+    failures += expect((restored & ANKAH_STATS_RESTORED) &&
+                       !(restored & ANKAH_STATS_DEGRADED) &&
+                       ankah_stats_cumulative()->v[ANKAH_STAT_requests] == 20 &&
+                       ankah_stats_hour_index() == start / HOUR + 2,
+                       "newest snapshot restores and rolls forward");
+
+    failures += expect(damage_file("ankah-stats-test-state.0") == 0,
+                       "newest snapshot can be damaged");
+    restored = ankah_stats_restore(base, start + HOUR);
+    failures += expect((restored & ANKAH_STATS_RESTORED) &&
+                       (restored & ANKAH_STATS_DEGRADED) &&
+                       ankah_stats_cumulative()->v[ANKAH_STAT_requests] == 15,
+                       "corrupt newest snapshot falls back");
+
+    failures += expect(damage_file("ankah-stats-test-state.1") == 0,
+                       "older snapshot can be damaged");
+    restored = ankah_stats_restore(base, start + 3 * HOUR);
+    failures += expect(!(restored & ANKAH_STATS_RESTORED) &&
+                       (restored & ANKAH_STATS_DEGRADED) &&
+                       ankah_stats_epoch() == start + 3 * HOUR &&
+                       is_zero(ankah_stats_cumulative()),
+                       "two corrupt snapshots degrade to empty");
+
+    failures += expect(ankah_stats_save("missing-directory/ankah", start) != 0,
+                       "write failure is reported");
+    remove_snapshots(base);
+    return failures;
+}
+
 int main(void) {
     int failures = 0;
     failures += text_test();
@@ -245,5 +312,6 @@ int main(void) {
     failures += eviction_test();
     failures += random_test();
     failures += writer_test();
+    failures += persistence_test();
     return failures ? 1 : 0;
 }

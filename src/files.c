@@ -1,6 +1,7 @@
 #include "ankah/files.h"
 
 #include <stdint.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -100,6 +101,16 @@ int ankah_file_read(const char *path, size_t maximum, int reject_links,
     return 0;
 }
 
+int ankah_file_read_optional(const char *path, size_t maximum, int reject_links,
+                             unsigned char **data, size_t *size) {
+    int result = ankah_file_read(path, maximum, reject_links, data, size, NULL);
+    DWORD error;
+    if (result == 0) return 0;
+    if (GetFileAttributesA(path) != INVALID_FILE_ATTRIBUTES) return -1;
+    error = GetLastError();
+    return error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND ? 1 : -1;
+}
+
 int ankah_file_map_exact(const char *path, size_t expected,
                          unsigned char **data) {
     HANDLE mapping, file;
@@ -124,6 +135,35 @@ int ankah_file_map_exact(const char *path, size_t expected,
 void ankah_file_unmap(unsigned char *data, size_t size) {
     (void)size;
     if (data) UnmapViewOfFile(data);
+}
+
+int ankah_file_replace(const char *temp_path, const char *target_path,
+                       const unsigned char *data, size_t size) {
+    BY_HANDLE_FILE_INFORMATION information;
+    HANDLE file = CreateFileA(temp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT, NULL);
+    size_t used = 0;
+    if (file == INVALID_HANDLE_VALUE) return -1;
+    if (!GetFileInformationByHandle(file, &information) ||
+        (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY |
+                                         FILE_ATTRIBUTE_REPARSE_POINT))) {
+        CloseHandle(file);
+        return -1;
+    }
+    while (used < size) {
+        DWORD written = 0;
+        size_t remaining = size - used;
+        DWORD request = remaining > UINT32_MAX ? UINT32_MAX : (DWORD)remaining;
+        if (!WriteFile(file, data + used, request, &written, NULL) || !written) {
+            CloseHandle(file);
+            return -1;
+        }
+        used += written;
+    }
+    if (!FlushFileBuffers(file)) { CloseHandle(file); return -1; }
+    if (!CloseHandle(file)) return -1;
+    return MoveFileExA(temp_path, target_path,
+                       MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) ? 0 : -1;
 }
 
 #else
@@ -195,6 +235,15 @@ int ankah_file_read(const char *path, size_t maximum, int reject_links,
     return 0;
 }
 
+int ankah_file_read_optional(const char *path, size_t maximum, int reject_links,
+                             unsigned char **data, size_t *size) {
+    struct stat metadata;
+    int result = ankah_file_read(path, maximum, reject_links, data, size, NULL);
+    if (result == 0) return 0;
+    if (lstat(path, &metadata) == 0) return -1;
+    return errno == ENOENT || errno == ENOTDIR ? 1 : -1;
+}
+
 int ankah_file_map_exact(const char *path, size_t expected,
                          unsigned char **data) {
     struct stat metadata;
@@ -215,6 +264,69 @@ int ankah_file_map_exact(const char *path, size_t expected,
 
 void ankah_file_unmap(unsigned char *data, size_t size) {
     if (data) munmap(data, size);
+}
+
+static void sync_parent(const char *path) {
+    char directory[1024];
+    const char *slash = strrchr(path, '/');
+    size_t length;
+    int descriptor, flags = O_RDONLY;
+    if (!slash) {
+        strcpy(directory, ".");
+    } else {
+        length = slash == path ? 1 : (size_t)(slash - path);
+        if (length >= sizeof(directory)) return;
+        memcpy(directory, path, length);
+        directory[length] = 0;
+    }
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_DIRECTORY
+    flags |= O_DIRECTORY;
+#endif
+    descriptor = open(directory, flags);
+    if (descriptor >= 0) {
+        (void)fsync(descriptor);
+        close(descriptor);
+    }
+}
+
+int ankah_file_replace(const char *temp_path, const char *target_path,
+                       const unsigned char *data, size_t size) {
+    struct stat metadata;
+    size_t used = 0;
+    int descriptor, flags = O_WRONLY | O_CREAT | O_TRUNC;
+#ifdef O_CLOEXEC
+    flags |= O_CLOEXEC;
+#endif
+#ifdef O_NOFOLLOW
+    flags |= O_NOFOLLOW;
+#else
+    {
+        struct stat link_metadata;
+        if (lstat(temp_path, &link_metadata) == 0) {
+            if (S_ISLNK(link_metadata.st_mode)) return -1;
+        } else if (errno != ENOENT && errno != ENOTDIR) return -1;
+    }
+#endif
+    descriptor = open(temp_path, flags, S_IRUSR | S_IWUSR);
+    if (descriptor < 0 || fstat(descriptor, &metadata) != 0 ||
+        !S_ISREG(metadata.st_mode) || fchmod(descriptor, S_IRUSR | S_IWUSR) != 0) {
+        if (descriptor >= 0) close(descriptor);
+        return -1;
+    }
+    while (used < size) {
+        ssize_t amount = write(descriptor, data + used, size - used);
+        if (amount < 0 && errno == EINTR) continue;
+        if (amount <= 0) { close(descriptor); return -1; }
+        used += (size_t)amount;
+    }
+    if (fsync(descriptor) != 0) { close(descriptor); return -1; }
+    if (close(descriptor) != 0) return -1;
+    if (rename(temp_path, target_path) != 0) return -1;
+    sync_parent(target_path);
+    return 0;
 }
 
 #endif
