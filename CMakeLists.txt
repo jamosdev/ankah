@@ -95,9 +95,30 @@ else()
   set(ANKAH_MBEDTLS_TLS ${MBEDTLS_LIBRARY} ${MBEDX509_LIBRARY})
 endif()
 target_link_libraries(ankah_pow PUBLIC ${ANKAH_MBEDCRYPTO})
+find_program(ANKAH_GPERF NAMES gperf)
+set(ANKAH_HEADER_INPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/header_names.gperf")
+set(ANKAH_HEADER_OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/header_names_gperf.c")
+set(ANKAH_HEADER_BUILD_OUTPUT "${CMAKE_CURRENT_BINARY_DIR}/header_names_gperf.c")
+add_custom_command(OUTPUT "${ANKAH_HEADER_BUILD_OUTPUT}"
+  COMMAND "${CMAKE_COMMAND}"
+    "-DANKAH_GPERF=${ANKAH_GPERF}"
+    "-DANKAH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DANKAH_HEADER_INPUT=${ANKAH_HEADER_INPUT}"
+    "-DANKAH_HEADER_OUTPUT=${ANKAH_HEADER_OUTPUT}"
+    "-DANKAH_HEADER_BUILD_OUTPUT=${ANKAH_HEADER_BUILD_OUTPUT}"
+    "-DANKAH_HEADER_TEMP=${CMAKE_CURRENT_BINARY_DIR}/header_names_gperf.c.tmp"
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_header_names.cmake"
+  DEPENDS "${ANKAH_HEADER_INPUT}" "${ANKAH_HEADER_OUTPUT}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_header_names.cmake"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  COMMENT "Generating HTTP header classifier"
+  VERBATIM)
+add_library(ankah_header_names STATIC "${ANKAH_HEADER_BUILD_OUTPUT}")
+target_include_directories(ankah_header_names PUBLIC include)
+target_include_directories(ankah_header_names PRIVATE src)
 add_library(ankah_http STATIC src/http.c)
 target_include_directories(ankah_http PUBLIC include)
-target_link_libraries(ankah_http PUBLIC llhttp_static)
+target_link_libraries(ankah_http PUBLIC llhttp_static ankah_header_names)
 if(ANKAH_BUNDLED_RUNTIME_DEPS)
   set(LIBUV_BUILD_SHARED OFF CACHE BOOL "" FORCE)
   set(LIBUV_BUILD_TESTS OFF CACHE BOOL "" FORCE)
@@ -117,7 +138,7 @@ else()
   set(ANKAH_LIBUV ${LIBUV_LIBRARY})
 endif()
 add_executable(ankah src/main.c src/static.c src/session.c src/files.c
-  src/proxy.c src/frontend.c)
+  src/proxy.c src/frontend.c src/stats.c)
 if(ANKAH_WASM_SOLVER)
   add_dependencies(ankah ankah-browser-pow)
   target_include_directories(ankah PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -138,8 +159,13 @@ add_executable(ankah-pow tests/pow_test.c)
 target_link_libraries(ankah-pow PRIVATE ankah_pow)
 add_executable(ankah-http tests/http_test.c)
 target_link_libraries(ankah-http PRIVATE ankah_http)
+add_executable(ankah-header-names tests/header_names_test.c)
+target_include_directories(ankah-header-names PRIVATE src)
+target_link_libraries(ankah-header-names PRIVATE ankah_header_names)
 add_executable(ankah-session tests/session_test.c src/session.c)
 target_link_libraries(ankah-session PRIVATE ankah_pow)
+add_executable(ankah-stats tests/stats_test.c src/stats.c)
+target_include_directories(ankah-stats PRIVATE include)
 add_executable(ankah-proxy tests/proxy_test.c src/proxy.c)
 target_include_directories(ankah-proxy PRIVATE include)
 if(UNIX)
@@ -148,9 +174,9 @@ endif()
 if(NOT ANKAH_BUNDLED_RUNTIME_DEPS)
   target_include_directories(ankah-proxy PRIVATE ${LIBUV_INCLUDE_DIR})
 endif()
-target_link_libraries(ankah-proxy PRIVATE ${ANKAH_LIBUV})
+target_link_libraries(ankah-proxy PRIVATE ${ANKAH_LIBUV} ankah_header_names)
 set(ANKAH_PROJECT_TARGETS ankah ankah-pow ankah-http ankah-session ankah-proxy
-  ankah_qr ankah_pow ankah_http)
+  ankah-stats ankah-header-names ankah_qr ankah_pow ankah_http ankah_header_names)
 if(ANKAH_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   foreach(target IN LISTS ANKAH_PROJECT_TARGETS)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -158,15 +184,17 @@ if(ANKAH_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 if(MINGW)
   target_compile_definitions(ankah PRIVATE _WIN32_WINNT=0x0A00)
-  foreach(target ankah ankah-pow ankah-http ankah-session ankah-proxy)
+  foreach(target ankah ankah-pow ankah-http ankah-session ankah-proxy ankah-stats)
     target_link_options(${target} PRIVATE -static -static-libgcc)
   endforeach()
 endif()
 enable_testing()
 add_test(NAME pow COMMAND ankah-pow)
 add_test(NAME http COMMAND ankah-http)
+add_test(NAME header_names COMMAND ankah-header-names)
 add_test(NAME session COMMAND ankah-session)
 add_test(NAME proxy COMMAND ankah-proxy)
+add_test(NAME stats COMMAND ankah-stats)
 if(NOT Python3_Interpreter_FOUND)
   find_package(Python3 COMPONENTS Interpreter)
 endif()
@@ -187,8 +215,11 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME tls_http2 COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_http2_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME dashboard COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/dashboard_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
   if(CMAKE_CROSSCOMPILING)
-    set_tests_properties(cache static continuation platform tls_http2 PROPERTIES
+    set_tests_properties(cache static continuation platform tls_http2 dashboard PROPERTIES
       ENVIRONMENT "ANKAH_TEST_RUNNER=${ANKAH_TEST_RUNNER};ANKAH_TEST_WINDOWS_PATHS=1")
   endif()
 endif()
@@ -212,11 +243,16 @@ install(FILES
   phone-scan.png
   pow-worker.js
   DESTINATION assets COMPONENT ankah_runtime)
+install(FILES dashboard/index.html dashboard/dashboard.css dashboard/dashboard.js
+  dashboard/d3-subset.min.js DESTINATION assets/dashboard COMPONENT ankah_runtime)
 install(FILES docs/windows.md DESTINATION . RENAME README-WINDOWS.md
+  COMPONENT ankah_runtime)
+install(FILES docs/dashboard.md DESTINATION . RENAME DASHBOARD.md
   COMPONENT ankah_runtime)
 install(FILES docs/tls-and-proxies.md DESTINATION . RENAME TLS-AND-PROXIES.md
   COMPONENT ankah_runtime)
 install(FILES PARTICLES_LICENSE.md DESTINATION notices COMPONENT ankah_runtime)
+install(FILES D3_LICENSE.md DESTINATION notices COMPONENT ankah_runtime)
 install(FILES
   ${llhttp_SOURCE_DIR}/LICENSE-MIT
   DESTINATION notices RENAME llhttp-LICENSE.txt COMPONENT ankah_runtime)

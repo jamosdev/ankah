@@ -12,6 +12,7 @@
 typedef struct {
     char name[ANKAH_MAX_FIELD];
     char value[ANKAH_MAX_VALUE];
+    unsigned char kind;
 } ankah_header;
 
 typedef struct {

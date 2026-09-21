@@ -1,0 +1,48 @@
+%language=ANSI-C
+%readonly-tables
+%global-table
+%ignore-case
+%compare-lengths
+%compare-strncmp
+%struct-type
+%omit-struct-type
+%define lookup-function-name ankah_header_lookup
+%define hash-function-name ankah_header_hash
+%define word-array-name ankah_header_words
+%define slot-name name
+%{
+#include "header_names.h"
+%}
+struct ankah_header_keyword;
+%%
+:authority, ANKAH_HEADER_PSEUDO_AUTHORITY
+:method, ANKAH_HEADER_PSEUDO_METHOD
+:path, ANKAH_HEADER_PSEUDO_PATH
+:scheme, ANKAH_HEADER_PSEUDO_SCHEME
+accept-encoding, ANKAH_HEADER_ACCEPT_ENCODING
+authorization, ANKAH_HEADER_AUTHORIZATION
+connection, ANKAH_HEADER_CONNECTION
+content-length, ANKAH_HEADER_CONTENT_LENGTH
+content-type, ANKAH_HEADER_CONTENT_TYPE
+cookie, ANKAH_HEADER_COOKIE
+expect, ANKAH_HEADER_EXPECT
+forwarded, ANKAH_HEADER_FORWARDED
+host, ANKAH_HEADER_HOST
+http2-settings, ANKAH_HEADER_HTTP2_SETTINGS
+if-modified-since, ANKAH_HEADER_IF_MODIFIED_SINCE
+if-none-match, ANKAH_HEADER_IF_NONE_MATCH
+if-range, ANKAH_HEADER_IF_RANGE
+keep-alive, ANKAH_HEADER_KEEP_ALIVE
+proxy-authorization, ANKAH_HEADER_PROXY_AUTHORIZATION
+proxy-connection, ANKAH_HEADER_PROXY_CONNECTION
+range, ANKAH_HEADER_RANGE
+te, ANKAH_HEADER_TE
+trailer, ANKAH_HEADER_TRAILER
+transfer-encoding, ANKAH_HEADER_TRANSFER_ENCODING
+upgrade, ANKAH_HEADER_UPGRADE
+user-agent, ANKAH_HEADER_USER_AGENT
+x-ankah-internal-key, ANKAH_HEADER_X_ANKAH_INTERNAL_KEY
+x-ankah-internal-peer, ANKAH_HEADER_X_ANKAH_INTERNAL_PEER
+x-forwarded-for, ANKAH_HEADER_X_FORWARDED_FOR
+x-real-ip, ANKAH_HEADER_X_REAL_IP
+%%

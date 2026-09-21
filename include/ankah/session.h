@@ -25,6 +25,11 @@ typedef struct {
     int is_post;
 } ankah_session;
 
+typedef struct {
+    size_t active, solved, saved_posts, pending_bytes;
+    size_t capacity, pending_capacity;
+} ankah_session_totals;
+
 ankah_session *ankah_session_new(const unsigned char secret[ANKAH_SECRET_SIZE],
                                  const char *host, uint64_t now,
                                  const ankah_request *request, const char *peer_ip);
@@ -36,5 +41,7 @@ int ankah_session_solved(const ankah_session *session, uint64_t now);
 int ankah_session_take_post(ankah_session *session, const char *token, uint64_t now,
                              ankah_request **request, unsigned char **body,
                              size_t *size);
+/* Expires stale sessions as a side effect, like ankah_session_find. */
+void ankah_session_count(uint64_t now, ankah_session_totals *out);
 
 #endif

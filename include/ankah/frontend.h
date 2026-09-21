@@ -4,6 +4,8 @@
 #include <stddef.h>
 #include <uv.h>
 
+#define ANKAH_FRONTEND_MAX_CONNECTIONS 256
+
 typedef struct {
     uv_loop_t *loop;
     const char *certificate_path;
@@ -15,5 +17,6 @@ typedef struct {
 int ankah_frontend_init(const ankah_frontend_options *options);
 void ankah_frontend_accept(uv_stream_t *server, int status);
 void ankah_frontend_shutdown(void);
+unsigned int ankah_frontend_connections(void);
 
 #endif

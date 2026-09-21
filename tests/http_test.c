@@ -9,10 +9,11 @@ static int expect(int truth, const char *name) {
 
 int main(void) {
     const char *good = "GET /hello HTTP/1.1\r\nHost: example.test\r\n\r\n";
-    const char *smuggle = "POST / HTTP/1.1\r\nHost: example.test\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n";
-    const char *duplicate = "GET / HTTP/1.1\r\nHost: example.test\r\nHost: other.test\r\n\r\n";
-    const char *upgrade = "GET /ws HTTP/1.1\r\nHost: example.test\r\n"
-                          "Connection: Upgrade\r\nUpgrade: websocket\r\n\r\n";
+    const char *smuggle = "POST / HTTP/1.1\r\nhOsT: example.test\r\ncontent-LENGTH: 5\r\n"
+                           "TRANSFER-encoding: chunked\r\n\r\n";
+    const char *duplicate = "GET / HTTP/1.1\r\nHost: example.test\r\nhOsT: other.test\r\n\r\n";
+    const char *upgrade = "GET /ws HTTP/1.1\r\nhOsT: example.test\r\n"
+                          "cOnNeCtIoN: Upgrade\r\nuPgRaDe: websocket\r\n\r\n";
     const char *post_upgrade = "POST /ws HTTP/1.1\r\nHost: example.test\r\n"
                                "Connection: Upgrade\r\nUpgrade: websocket\r\n"
                                "Content-Length: 0\r\n\r\n";
@@ -21,6 +22,7 @@ int main(void) {
     const char *duplicate_expect = "POST / HTTP/1.1\r\nHost: example.test\r\n"
                                    "Content-Length: 0\r\nExpect: 100-continue\r\n"
                                    "Expect: other\r\n\r\n";
+    const char *manual;
     ankah_request request;
     int failures = 0;
     failures += expect(ankah_parse_request(good, strlen(good), &request) == 0, "valid request");
@@ -39,5 +41,16 @@ int main(void) {
     failures += expect(ankah_parse_request(duplicate_expect, strlen(duplicate_expect),
                                            &request) != 0,
                        "duplicate expectation");
+    memset(&request, 0, sizeof(request));
+    request.count = 1;
+    strcpy(request.headers[0].name, "hOsT");
+    strcpy(request.headers[0].value, "manual.test");
+    manual = ankah_header_value(&request, "Host");
+    failures += expect(manual && strcmp(manual, "manual.test") == 0,
+                       "unclassified header lookup");
+    strcpy(request.headers[0].name, "X-Custom");
+    manual = ankah_header_value(&request, "x-custom");
+    failures += expect(manual && strcmp(manual, "manual.test") == 0,
+                       "unknown header lookup");
     return failures ? 1 : 0;
 }

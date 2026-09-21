@@ -1,6 +1,8 @@
 #include "ankah/frontend.h"
 #include "ankah/files.h"
+#include "header_names.h"
 #include "ankah/http.h"
+#include "ankah/stats.h"
 
 #include <llhttp.h>
 #include <mbedtls/ctr_drbg.h>
@@ -17,7 +19,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define FRONT_MAX_CONNECTIONS 256
+#define FRONT_MAX_CONNECTIONS ANKAH_FRONTEND_MAX_CONNECTIONS
 #define FRONT_MAX_CIPHER_INPUT (256U * 1024U)
 #define FRONT_MAX_PLAIN_OUTPUT (2U * 1024U * 1024U)
 #define FRONT_MAX_H1_HEADER ANKAH_HEADER_LIMIT
@@ -171,10 +173,6 @@ static int same_ascii_part(const char *left, size_t left_size,
         if (a != b) return 0;
     }
     return 1;
-}
-
-static int same_ascii(const char *left, const char *right) {
-    return same_ascii_part(left, strlen(left), right, strlen(right));
 }
 
 static size_t find_header_end(const unsigned char *data, size_t size) {
@@ -653,34 +651,36 @@ static int h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
     front_connection *front = user_data;
     h2_stream *stream = find_stream(front, frame->hd.stream_id);
     ankah_header *header;
+    unsigned char kind;
     (void)session;
     (void)flags;
     if (!stream || stream->invalid || frame->hd.type != NGHTTP2_HEADERS) return 0;
     if (frame->headers.cat != NGHTTP2_HCAT_REQUEST) return 0;
+    kind = ankah_header_name_kind((const char *)name, name_size);
     if (name_size && name[0] == ':') {
         if (stream->regular_headers) { stream->invalid = 1; return 0; }
-        if (same_ascii_part((const char *)name, name_size, ":method", 7)) {
+        if (kind == ANKAH_HEADER_PSEUDO_METHOD) {
             if (stream->saw_method || value_size >= sizeof(stream->request.method)) stream->invalid = 1;
             else {
                 memcpy(stream->request.method, value, value_size);
                 stream->request.method[value_size] = 0;
                 stream->saw_method = 1;
             }
-        } else if (same_ascii_part((const char *)name, name_size, ":path", 5)) {
+        } else if (kind == ANKAH_HEADER_PSEUDO_PATH) {
             if (stream->saw_path || value_size >= sizeof(stream->request.target)) stream->invalid = 1;
             else {
                 memcpy(stream->request.target, value, value_size);
                 stream->request.target[value_size] = 0;
                 stream->saw_path = 1;
             }
-        } else if (same_ascii_part((const char *)name, name_size, ":authority", 10)) {
+        } else if (kind == ANKAH_HEADER_PSEUDO_AUTHORITY) {
             if (stream->saw_authority || value_size >= sizeof(stream->authority)) stream->invalid = 1;
             else {
                 memcpy(stream->authority, value, value_size);
                 stream->authority[value_size] = 0;
                 stream->saw_authority = 1;
             }
-        } else if (same_ascii_part((const char *)name, name_size, ":scheme", 7)) {
+        } else if (kind == ANKAH_HEADER_PSEUDO_SCHEME) {
             if (value_size >= sizeof(stream->scheme)) stream->invalid = 1;
             else {
                 memcpy(stream->scheme, value, value_size);
@@ -697,6 +697,7 @@ static int h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
     header->name[name_size] = 0;
     memcpy(header->value, value, value_size);
     header->value[value_size] = 0;
+    header->kind = kind;
     return 0;
 }
 
@@ -750,18 +751,19 @@ static ssize_t h2_data_read(nghttp2_session *session, int32_t stream_id,
     return (ssize_t)length;
 }
 
-static int response_hop_header(const char *name) {
-    return same_ascii(name, "Connection") || same_ascii(name, "Keep-Alive") ||
-           same_ascii(name, "Proxy-Connection") || same_ascii(name, "Transfer-Encoding") ||
-           same_ascii(name, "Upgrade") || same_ascii(name, "HTTP2-Settings") ||
-           same_ascii(name, "TE");
+static int response_hop_header(const ankah_header *header) {
+    unsigned char kind = ankah_header_effective_kind(header);
+    return kind == ANKAH_HEADER_CONNECTION || kind == ANKAH_HEADER_KEEP_ALIVE ||
+           kind == ANKAH_HEADER_PROXY_CONNECTION ||
+           kind == ANKAH_HEADER_TRANSFER_ENCODING || kind == ANKAH_HEADER_UPGRADE ||
+           kind == ANKAH_HEADER_HTTP2_SETTINGS || kind == ANKAH_HEADER_TE;
 }
 
 static int response_connection_names(const h2_stream *stream, const char *name) {
     unsigned int i;
     for (i = 0; i < stream->response_count; ++i) {
         const char *p;
-        if (!same_ascii(stream->response_headers[i].name, "Connection")) continue;
+        if (!ankah_header_is(&stream->response_headers[i], ANKAH_HEADER_CONNECTION)) continue;
         p = stream->response_headers[i].value;
         while (*p) {
             const char *start, *end;
@@ -792,7 +794,7 @@ static int submit_h2_trailers(h2_stream *stream) {
     lower_header_names(stream, stream->response_initial_count);
     for (i = stream->response_initial_count; i < stream->response_count; ++i) {
         ankah_header *header = &stream->response_headers[i];
-        if (response_hop_header(header->name) ||
+        if (response_hop_header(header) ||
             response_connection_names(stream, header->name)) continue;
         values[count].name = (uint8_t *)header->name;
         values[count].namelen = strlen(header->name);
@@ -818,7 +820,7 @@ static int submit_h2_headers(h2_stream *stream) {
     values[count++] = (nghttp2_nv)NV(":status", status);
     for (i = 0; i < stream->response_count; ++i) {
         ankah_header *header = &stream->response_headers[i];
-        if (response_hop_header(header->name) ||
+        if (response_hop_header(header) ||
             response_connection_names(stream, header->name)) continue;
         values[count].name = (uint8_t *)header->name;
         values[count].namelen = strlen(header->name);
@@ -859,8 +861,9 @@ static int append_response_value(h2_stream *stream, const char *data, size_t siz
     ankah_header *header;
     if (stream->response_count >= ANKAH_MAX_HEADERS ||
         (stream->response_stage != 1 && stream->response_stage != 2)) return -1;
-    stream->response_stage = 2;
     header = &stream->response_headers[stream->response_count];
+    if (stream->response_stage == 1) ankah_header_classify(header);
+    stream->response_stage = 2;
     return append_text(header->value, sizeof(header->value), (const uint8_t *)data, size);
 }
 
@@ -1002,11 +1005,11 @@ static void on_h2_core_connected(uv_connect_t *request, int status) {
     used = (size_t)length;
     for (i = 0; i < stream->request.count; ++i) {
         ankah_header *header = &stream->request.headers[i];
-        if (same_ascii(header->name, "host") || same_ascii(header->name, "content-length") ||
-            same_ascii(header->name, "connection") || same_ascii(header->name, "transfer-encoding") ||
-            same_ascii(header->name, "expect") ||
-            same_ascii_part(header->name, strlen(header->name), "x-ankah-internal-key", 20) ||
-            same_ascii_part(header->name, strlen(header->name), "x-ankah-internal-peer", 21)) continue;
+        unsigned char kind = ankah_header_effective_kind(header);
+        if (kind == ANKAH_HEADER_HOST || kind == ANKAH_HEADER_CONTENT_LENGTH ||
+            kind == ANKAH_HEADER_CONNECTION || kind == ANKAH_HEADER_TRANSFER_ENCODING ||
+            kind == ANKAH_HEADER_EXPECT || kind == ANKAH_HEADER_X_ANKAH_INTERNAL_KEY ||
+            kind == ANKAH_HEADER_X_ANKAH_INTERNAL_PEER) continue;
         length = snprintf(head + used, capacity - used, "%s: %s\r\n",
                           header->name, header->value);
         if (length < 0 || (size_t)length >= capacity - used) {
@@ -1302,12 +1305,17 @@ static int peer_text(uv_tcp_t *client, char *out, size_t capacity) {
     return -1;
 }
 
+unsigned int ankah_frontend_connections(void) {
+    return frontend.connections;
+}
+
 void ankah_frontend_accept(uv_stream_t *server, int status) {
     front_connection *front;
     int result;
     if (status < 0) return;
     if (frontend.connections >= FRONT_MAX_CONNECTIONS) {
         uv_tcp_t *discard = malloc(sizeof(*discard));
+        ankah_stats_add(ANKAH_STAT_refused, 1);
         if (discard && uv_tcp_init(frontend.options.loop, discard) == 0) {
             uv_accept(server, (uv_stream_t *)discard);
             uv_close((uv_handle_t *)discard, on_discard_closed);

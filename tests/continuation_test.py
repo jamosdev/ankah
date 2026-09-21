@@ -169,14 +169,15 @@ def main():
             assert "Forwarded" not in forwarded
 
             with socket.create_connection(("127.0.0.1", gate_port), timeout=5) as sock:
-                sock.sendall((f"GET /socket HTTP/1.1\r\nHost: localhost:{gate_port}\r\n"
-                              f"Cookie: {cookie}\r\nConnection: Upgrade, X-Remove\r\n"
-                              "Upgrade: websocket\r\nX-Remove: discarded\r\n\r\n").encode())
+                sock.sendall((f"GET /socket HTTP/1.1\r\nhOsT: localhost:{gate_port}\r\n"
+                              f"Cookie: {cookie}\r\ncOnNeCtIoN: Upgrade, X-Remove\r\n"
+                              "uPgRaDe: websocket\r\nX-Remove: discarded\r\n\r\n").encode())
                 assert sock.recv(1024).startswith(b"HTTP/1.0 200")
             forwarded = seen[-1][3]
-            assert forwarded["Connection"].lower() == "upgrade"
-            assert forwarded["Upgrade"].lower() == "websocket"
-            assert "X-Remove" not in forwarded
+            folded = {name.lower(): value for name, value in forwarded.items()}
+            assert folded["connection"].lower() == "upgrade"
+            assert folded["upgrade"].lower() == "websocket"
+            assert "x-remove" not in folded
 
             multipart = (b"--boundary\r\nContent-Disposition: form-data; name=\"file\"; "
                          b"filename=\"a.bin\"\r\nContent-Type: application/octet-stream\r\n\r\n"

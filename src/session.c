@@ -142,3 +142,18 @@ int ankah_session_take_post(ankah_session *session, const char *token, uint64_t 
     session->token[0] = 0;
     return 0;
 }
+
+void ankah_session_count(uint64_t now, ankah_session_totals *out) {
+    size_t i;
+    memset(out, 0, sizeof(*out));
+    out->capacity = MAX_SESSIONS;
+    out->pending_capacity = MAX_PENDING_BYTES;
+    for (i = 0; i < MAX_SESSIONS; ++i) {
+        expire(&sessions[i], now);
+        if (!sessions[i].active) continue;
+        ++out->active;
+        if (ankah_session_solved(&sessions[i], now)) ++out->solved;
+        if (sessions[i].saved_request) ++out->saved_posts;
+    }
+    out->pending_bytes = pending_bytes;
+}

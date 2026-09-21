@@ -1,0 +1,32 @@
+# D3 modules
+
+`dashboard/d3-subset.min.js` bundles parts of these modules, rebuilt by
+`dashboard/build-d3-subset.sh`. Each is released under the ISC license with
+the copyright line shown and the permission notice below.
+
+| Module | Version | Copyright |
+| --- | --- | --- |
+| d3-array | 3.2.4 | Copyright 2010-2023 Mike Bostock |
+| d3-axis | 3.0.0 | Copyright 2010-2021 Mike Bostock |
+| d3-color | 3.1.0 | Copyright 2010-2022 Mike Bostock |
+| d3-format | 3.1.2 | Copyright 2010-2026 Mike Bostock |
+| d3-interpolate | 3.0.1 | Copyright 2010-2021 Mike Bostock |
+| d3-path | 3.1.0 | Copyright 2015-2022 Mike Bostock |
+| d3-scale | 4.0.2 | Copyright 2010-2021 Mike Bostock |
+| d3-selection | 3.0.0 | Copyright 2010-2021 Mike Bostock |
+| d3-shape | 3.2.0 | Copyright 2010-2022 Mike Bostock |
+| d3-time | 3.1.0 | Copyright 2010-2022 Mike Bostock |
+| d3-time-format | 4.1.0 | Copyright 2010-2021 Mike Bostock |
+| internmap | 2.0.3 | Copyright 2021 Mike Bostock |
+
+Permission to use, copy, modify, and/or distribute this software for any purpose
+with or without fee is hereby granted, provided that the above copyright notice
+and this permission notice appear in all copies.
+
+THE SOFTWARE IS PROVIDED "AS IS" AND THE AUTHOR DISCLAIMS ALL WARRANTIES WITH
+REGARD TO THIS SOFTWARE INCLUDING ALL IMPLIED WARRANTIES OF MERCHANTABILITY AND
+FITNESS. IN NO EVENT SHALL THE AUTHOR BE LIABLE FOR ANY SPECIAL, DIRECT,
+INDIRECT, OR CONSEQUENTIAL DAMAGES OR ANY DAMAGES WHATSOEVER RESULTING FROM LOSS
+OF USE, DATA OR PROFITS, WHETHER IN AN ACTION OF CONTRACT, NEGLIGENCE OR OTHER
+TORTIOUS ACTION, ARISING OUT OF OR IN CONNECTION WITH THE USE OR PERFORMANCE OF
+THIS SOFTWARE.

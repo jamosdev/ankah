@@ -1,0 +1,139 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Ankah dashboard</title>
+<link rel="stylesheet" href="/dashboard/dashboard.css">
+<script src="/dashboard/d3-subset.min.js" defer></script>
+<script src="/dashboard/particles.min.js" defer></script>
+<script src="/dashboard/dashboard.js" defer></script>
+</head>
+<body>
+<div id="particles" aria-hidden="true"></div>
+<div class="shell">
+  <header class="masthead">
+    <div>
+      <h1>Ankah</h1>
+      <p id="status" class="status" role="status">Starting</p>
+    </div>
+    <div class="actions">
+      <button type="button" id="mask" aria-pressed="false">Mask addresses</button>
+      <button type="button" id="theme">Light theme</button>
+    </div>
+  </header>
+
+  <form id="login" class="card login" hidden>
+    <h2>Dashboard token</h2>
+    <p id="login-message" class="label">Enter the token from the dashboard token file.</p>
+    <label for="token" class="label">Token</label>
+    <input id="token" name="token" type="password" autocomplete="off" spellcheck="false"
+           pattern="[0-9a-f]{64}" title="64 lowercase hexadecimal characters" required>
+    <div><button type="submit">Open dashboard</button></div>
+  </form>
+
+  <main id="main" hidden>
+    <section class="now" aria-label="Now">
+      <div class="card">
+        <p class="label">Throughput to clients now</p>
+        <p class="hero-value" id="hero-value">Measuring</p>
+        <p class="note" id="hero-note"></p>
+      </div>
+      <div class="card meters">
+        <div class="meter" id="meter-connections">
+          <div class="meter-head"><span class="label">Connections</span><span class="meter-value"></span></div>
+          <div class="track"><div class="fill"></div></div>
+          <p class="note meter-note"></p>
+        </div>
+        <div class="meter" id="meter-pending">
+          <div class="meter-head"><span class="label">Saved POST memory</span><span class="meter-value"></span></div>
+          <div class="track"><div class="fill"></div></div>
+          <p class="note meter-note"></p>
+        </div>
+        <div class="meter" id="meter-cache">
+          <div class="meter-head"><span class="label">Static cache</span><span class="meter-value"></span></div>
+          <div class="track"><div class="fill"></div></div>
+          <p class="note meter-note"></p>
+        </div>
+      </div>
+    </section>
+
+    <nav class="filters" aria-label="Time range">
+      <button type="button" data-range="live" aria-pressed="true">Live</button>
+      <button type="button" data-range="24h" aria-pressed="false">24 hours</button>
+      <button type="button" data-range="7d" aria-pressed="false">7 days</button>
+      <button type="button" data-range="30d" aria-pressed="false">30 days</button>
+      <button type="button" data-range="all" aria-pressed="false">All</button>
+      <span class="note" id="range-note"></span>
+    </nav>
+
+    <section class="kpis" aria-label="Summary">
+      <article class="card" id="tile-connections">
+        <p class="label"></p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+      </article>
+      <article class="card" id="tile-requests">
+        <p class="label">Requests per second</p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+      </article>
+      <article class="card" id="tile-challenges">
+        <p class="label">Challenge pass rate</p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+      </article>
+      <article class="card" id="tile-latency">
+        <p class="label">Mean upstream latency</p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+      </article>
+    </section>
+
+    <div class="charts">
+      <section class="card" id="chart-throughput">
+        <div class="chart-head">
+          <h2>Throughput</h2>
+          <button type="button" class="table-toggle" aria-pressed="false">Table</button>
+        </div>
+        <div class="legend"></div>
+        <div class="plot"></div>
+        <div class="table-wrap" hidden></div>
+        <p class="note">The gap between the lines is traffic Ankah served itself: challenge pages, its own files and packaged static files.</p>
+      </section>
+
+      <section class="card" id="chart-connections">
+        <div class="chart-head">
+          <h2 id="connections-title">Connections</h2>
+          <button type="button" class="table-toggle" aria-pressed="false">Table</button>
+        </div>
+        <div class="legend"></div>
+        <div class="plot"></div>
+        <div class="table-wrap" hidden></div>
+      </section>
+
+      <section class="card" id="chart-heatmap">
+        <div class="chart-head">
+          <h2>Bytes to clients by hour</h2>
+          <button type="button" class="table-toggle" aria-pressed="false">Table</button>
+        </div>
+        <div class="plot"></div>
+        <div class="table-wrap" hidden></div>
+        <div class="scale"></div>
+        <p class="note">Cells are UTC hours placed at their local start time. Hourly detail covers the last 30 days.</p>
+      </section>
+    </div>
+
+    <section class="card connections" aria-labelledby="connections-heading">
+      <h2 id="connections-heading">Open connections now</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr><th>Address</th><th>State</th><th class="number">Age</th><th class="number">In</th><th class="number">Out</th></tr>
+          </thead>
+          <tbody id="connections-body"></tbody>
+        </table>
+      </div>
+      <p class="note" id="connections-note"></p>
+    </section>
+
+    <footer class="card footer">
+      <p class="note" id="epoch-note"></p>
+      <button type="button" id="reset">Reset statistics</button>
+    </footer>
+  </main>
+</div>
+</body>
+</html>

@@ -52,6 +52,20 @@ int main(void) {
     assert(ankah_session_find(id, now + 302));
     assert(!ankah_session_find(id, now + 302)->saved_request);
 
+    {
+        ankah_session_totals totals;
+        ankah_session_count(now + 2, &totals);
+        assert(totals.active == 1 && totals.solved == 1 && totals.saved_posts == 0);
+        assert(totals.pending_bytes == 0 && totals.capacity == 4096);
+        session = ankah_session_new(secret, "localhost", now, &request, "127.0.0.1");
+        assert(session);
+        ankah_session_count(now + 2, &totals);
+        assert(totals.active == 2 && totals.solved == 1 && totals.saved_posts == 1);
+        assert(totals.pending_bytes == 4 + sizeof(ankah_request));
+        ankah_session_count(now + 2000, &totals);
+        assert(totals.active == 0 && totals.pending_bytes == 0);
+    }
+
     request.content_length = ANKAH_POST_REPLAY_MAX + 1;
     assert(!ankah_session_new(secret, "localhost", now, &request, "127.0.0.1"));
     return 0;

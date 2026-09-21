@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 PATH_OPTIONS = {"--assets-dir", "--secret-file", "--static-bundle",
-                "--tls-cert", "--tls-key"}
+                "--tls-cert", "--tls-key", "--dashboard-token-file"}
 
 
 def windows_path(value):

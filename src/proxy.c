@@ -1,4 +1,5 @@
 #include "ankah/proxy.h"
+#include "header_names.h"
 #include <uv.h>
 
 #include <ctype.h>
@@ -159,8 +160,7 @@ static int parse_xff(const ankah_request *request, ip_address *chain, size_t *co
     unsigned int i;
     for (i = 0; i < request->count; ++i) {
         const char *p, *start;
-        if (!same_ascii_part(request->headers[i].name,
-                             strlen(request->headers[i].name), "X-Forwarded-For")) continue;
+        if (!ankah_header_is(&request->headers[i], ANKAH_HEADER_X_FORWARDED_FOR)) continue;
         p = request->headers[i].value;
         while (*p) {
             start = p;
@@ -236,8 +236,7 @@ static int parse_forwarded_value(const char *value, ip_address *chain, size_t *c
 static int parse_forwarded(const ankah_request *request, ip_address *chain, size_t *count) {
     unsigned int i;
     for (i = 0; i < request->count; ++i) {
-        if (!same_ascii_part(request->headers[i].name,
-                             strlen(request->headers[i].name), "Forwarded")) continue;
+        if (!ankah_header_is(&request->headers[i], ANKAH_HEADER_FORWARDED)) continue;
         if (parse_forwarded_value(request->headers[i].value, chain, count) != 0) return -1;
     }
     return *count ? 0 : -1;
@@ -255,9 +254,8 @@ int ankah_resolve_client_ip(const ankah_request *request, const char *peer,
     selected = direct;
     if (!is_trusted(&direct, trusted, trusted_count)) return format_ip(&direct, out, capacity);
     for (h = 0; h < request->count; ++h) {
-        size_t name_length = strlen(request->headers[h].name);
-        if (same_ascii_part(request->headers[h].name, name_length, "Forwarded")) has_forwarded = 1;
-        if (same_ascii_part(request->headers[h].name, name_length, "X-Forwarded-For")) has_xff = 1;
+        if (ankah_header_is(&request->headers[h], ANKAH_HEADER_FORWARDED)) has_forwarded = 1;
+        if (ankah_header_is(&request->headers[h], ANKAH_HEADER_X_FORWARDED_FOR)) has_xff = 1;
     }
     if (has_forwarded) {
         if (parse_forwarded(request, chain, &count) != 0) return -1;
