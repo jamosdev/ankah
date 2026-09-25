@@ -1,0 +1,15 @@
+X-Fuzz
+X-Forwarded-For
+Forwarded
+Accept
+Accept-Encoding
+Accept-Language
+Cache-Control
+Content-Type
+Origin
+Referer
+User-Agent
+Via
+X-Real-IP
+X-Request-ID
+X-Trace-ID

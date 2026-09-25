@@ -33,6 +33,8 @@ def main():
         output = result.stderr.decode(errors="replace")
         if "status=7" not in output:
             raise RuntimeError("child exit was not observed: " + output)
+        if result.returncode != 7:
+            raise RuntimeError(f"child exit status was not propagated: {result.returncode}")
 
 
 if __name__ == "__main__":

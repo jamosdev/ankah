@@ -8,6 +8,7 @@
 #define ANKAH_MAX_FIELD 128
 #define ANKAH_MAX_VALUE 4096
 #define ANKAH_MAX_TARGET 2048
+#define ANKAH_CHUNK_LINE_LIMIT 4096
 
 typedef struct {
     char name[ANKAH_MAX_FIELD];
@@ -27,8 +28,26 @@ typedef struct {
     size_t content_length;
 } ankah_request;
 
+typedef struct {
+    size_t remaining;
+    size_t decoded;
+    size_t trailer_size;
+    size_t line_size;
+    unsigned char state;
+    int complete;
+    int limit_exceeded;
+    char line[ANKAH_CHUNK_LINE_LIMIT];
+} ankah_chunked_body;
+
 /* Pass exactly one complete header block ending in CRLFCRLF. */
 int ankah_parse_request(const char *bytes, size_t length, ankah_request *out);
+void ankah_chunked_body_init(ankah_chunked_body *body);
+/* Validate one piece of HTTP/1.1 chunked wire data. Returns 1 after the
+ * terminating empty trailer line, 0 while more input is required, and -1 for
+ * invalid framing or a decoded body larger than max_decoded. */
+int ankah_chunked_body_consume(ankah_chunked_body *body,
+                               const char *bytes, size_t length,
+                               size_t max_decoded, size_t *decoded);
 /* Set exactly length name bytes and refresh the internal classification cache.
  * The bytes need not be NUL terminated. Null, empty, embedded-NUL, or oversized
  * names return -1 without changing header. */

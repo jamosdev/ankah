@@ -1,0 +1,27 @@
+services:
+  edge:
+    environment:
+      ANKAH_EDGE_PORT: ${ANKAH_EDGE_PORT:-8443}
+      ANKAH_NATIVE_PORT: ${ANKAH_NATIVE_PORT:-9443}
+    ports:
+      - "127.0.0.1:${ANKAH_EDGE_PORT:-8443}:443/tcp"
+      - "127.0.0.1:${ANKAH_EDGE_PORT:-8443}:443/udp"
+      - "[::1]:${ANKAH_EDGE_PORT:-8443}:443/tcp"
+      - "[::1]:${ANKAH_EDGE_PORT:-8443}:443/udp"
+    networks:
+      - debug
+    volumes:
+      - ./Caddyfile.debug:/etc/caddy/Caddyfile:ro
+  native:
+    environment:
+      ANKAH_PUBLIC_ORIGIN: https://localhost:${ANKAH_NATIVE_PORT:-9443}
+    ports:
+      - "127.0.0.1:${ANKAH_NATIVE_PORT:-9443}:8443/tcp"
+      - "127.0.0.1:${ANKAH_NATIVE_PORT:-9443}:8443/udp"
+      - "[::1]:${ANKAH_NATIVE_PORT:-9443}:8443/tcp"
+      - "[::1]:${ANKAH_NATIVE_PORT:-9443}:8443/udp"
+    networks:
+      - debug
+
+networks:
+  debug:

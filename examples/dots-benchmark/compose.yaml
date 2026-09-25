@@ -1,0 +1,272 @@
+name: dots-benchmark
+
+# Resource budgets. Each protection layer and each backend gets the same
+# budget as its counterpart on the other path.
+x-protection-limits: &protection-limits
+  cpus: "1.0"
+  mem_limit: 256m
+x-backend-limits: &backend-limits
+  cpus: "1.0"
+  mem_limit: 256m
+
+x-demo-hosts: &demo-hosts
+  - "anubis.test:172.30.0.10"
+  - "ankah.test:172.30.0.11"
+
+x-certs: &certs-mount
+  - demo-certs:/run/demo-certs:ro
+
+services:
+  # One-shot: demo CA, DOTS server and client certificates, tokens.
+  certs:
+    build: certs
+    environment:
+      OUT: /out
+    volumes:
+      - demo-certs:/out
+    network_mode: none
+    restart: "no"
+
+  # go-dots data channel state (customer, blocker, ACL rows).
+  mysql:
+    build: mysql
+    environment:
+      MYSQL_RANDOM_ROOT_PASSWORD: "yes"
+      MYSQL_DATABASE: dots
+      MYSQL_USER: dots
+      MYSQL_PASSWORD: dots-demo-only
+    tmpfs:
+      - /var/lib/mysql
+    networks:
+      backend:
+        ipv4_address: 172.30.1.40
+    healthcheck:
+      test: ["CMD-SHELL", "mysql -udots -pdots-demo-only -h127.0.0.1 -e 'SELECT id FROM dots.blocker' >/dev/null 2>&1"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+      start_period: 10s
+
+  # Go reverse proxy: anubis.test on 172.30.0.10, ankah.test on 172.30.0.11,
+  # go-dots data channel on 172.30.1.10:4443 (backend network only).
+  edge:
+    build: edge
+    # Only used by start.sh to add the secondary frontend address; the
+    # process drops every capability before serving. See edge/start.sh.
+    cap_add: [NET_ADMIN]
+    cpus: "2.0"
+    mem_limit: 256m
+    environment:
+      EDGE_DOTS_LOG_LEVEL: warning
+    volumes: *certs-mount
+    depends_on:
+      certs: {condition: service_completed_successfully}
+      mysql: {condition: service_healthy}
+    networks:
+      front:
+        ipv4_address: 172.30.0.10
+      backend:
+        ipv4_address: 172.30.1.10
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://172.30.1.10:9100/readyz"]
+      interval: 3s
+      timeout: 3s
+      retries: 60
+
+  anubis:
+    image: ghcr.io/techarohq/anubis:v1.27.0@sha256:8828275668b7bc675679f100970f9714f731388fbbf66ae94de8aca952e3fc4a
+    <<: *protection-limits
+    environment:
+      BIND: ":8923"
+      TARGET: http://fastapi:8000
+      POLICY_FNAME: /policy.yaml
+      METRICS_BIND: ":9090"
+      DIFFICULTY: "4"
+      COOKIE_SECURE: "false"
+      COOKIE_SAME_SITE: Lax
+      SERVE_ROBOTS_TXT: "false"
+      ED25519_PRIVATE_KEY_HEX_FILE: /run/demo-certs/anubis-ed25519.hex
+      SLOG_LEVEL: WARN
+    volumes:
+      - ./anubis/policy.yaml:/policy.yaml:ro
+      - demo-certs:/run/demo-certs:ro
+    depends_on:
+      certs: {condition: service_completed_successfully}
+      fastapi: {condition: service_healthy}
+    networks:
+      backend:
+        ipv4_address: 172.30.1.20
+    healthcheck:
+      test: ["CMD", "anubis", "--healthcheck"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  ankah:
+    build:
+      context: ../..
+      dockerfile: examples/dots-benchmark/ankah/Dockerfile
+      args:
+        ANKAH_PACKAGE_STAGE: ${ANKAH_PACKAGE_STAGE:-release-fetch}
+        ANKAH_VERSION: ${ANKAH_VERSION:-}
+        ANKAH_SHA256: ${ANKAH_SHA256:-}
+    <<: *protection-limits
+    environment:
+      DOTS_THRESHOLD: ${DOTS_THRESHOLD:-10}
+      DOTS_WINDOW_SECONDS: ${DOTS_WINDOW_SECONDS:-5}
+      DOTS_BLOCK_SECONDS: ${DOTS_BLOCK_SECONDS:-45}
+    volumes: *certs-mount
+    depends_on:
+      certs: {condition: service_completed_successfully}
+      django: {condition: service_healthy}
+      edge: {condition: service_healthy}
+    networks:
+      backend:
+        ipv4_address: 172.30.1.21
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "--header", "Host: ankah.test", "http://127.0.0.1:8080/livez"]
+      interval: 3s
+      timeout: 3s
+      retries: 40
+
+  fastapi:
+    build:
+      context: .
+      dockerfile: fastapi/Dockerfile
+    <<: *backend-limits
+    networks:
+      backend:
+        ipv4_address: 172.30.1.30
+
+  django:
+    build:
+      context: .
+      dockerfile: django/Dockerfile
+    <<: *backend-limits
+    networks:
+      backend:
+        ipv4_address: 172.30.1.31
+
+  attacker:
+    build: loadgen
+    command: ["attacker"]
+    cpus: "1.0"
+    mem_limit: 128m
+    environment:
+      ATTACK_RPS: ${ATTACK_RPS:-40}
+      ATTACK_CONCURRENCY: ${ATTACK_CONCURRENCY:-32}
+      PI_N: ${PI_N:-200000}
+      LISTEN: ":9300"
+      READY_URLS: http://anubis.test/healthz,http://ankah.test/healthz
+    extra_hosts: *demo-hosts
+    depends_on:
+      edge: {condition: service_healthy}
+      anubis: {condition: service_healthy}
+      ankah: {condition: service_healthy}
+    networks:
+      front:
+        ipv4_address: 172.30.0.20
+
+  legit-probe:
+    build: loadgen
+    command: ["legit-probe"]
+    cpus: "0.5"
+    mem_limit: 128m
+    environment:
+      PROBE_RPS: ${PROBE_RPS:-1}
+      PROBE_PI_N: ${PI_N:-200000}
+      LISTEN: ":9301"
+      READY_URLS: http://anubis.test/healthz,http://ankah.test/healthz
+    extra_hosts: *demo-hosts
+    depends_on:
+      edge: {condition: service_healthy}
+      anubis: {condition: service_healthy}
+      ankah: {condition: service_healthy}
+    networks:
+      front:
+        ipv4_address: 172.30.0.21
+
+  cadvisor:
+    image: ghcr.io/google/cadvisor:v0.60.6@sha256:b8e7d1093144fd088f425ff003d75a4aa405de075db78dae3bc563730b1bd07a
+    privileged: true
+    devices:
+      - /dev/kmsg
+    command:
+      - --docker_only=true
+      - --housekeeping_interval=5s
+      - --disable_metrics=disk,diskIO,percpu,sched,tcp,udp,process,hugetlb,referenced_memory,cpu_topology,resctrl,advtcp
+      - --store_container_labels=false
+      - --whitelisted_container_labels=com.docker.compose.service,com.docker.compose.project
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:ro
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+      - /dev/disk/:/dev/disk:ro
+    networks:
+      monitor:
+        ipv4_address: 172.30.2.30
+
+  prometheus:
+    image: prom/prometheus:v3.14.0@sha256:5ce7540c3c00ef4ab0c9d2c995c6a5b9c421f44b4a115d97a2c7af3b1c21cbb0
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=6h
+      - --web.enable-lifecycle
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - demo-certs:/run/demo-certs:ro
+    depends_on:
+      certs: {condition: service_completed_successfully}
+    ports:
+      - "127.0.0.1:${PROMETHEUS_PORT:-9090}:9090"
+    networks:
+      front:
+        ipv4_address: 172.30.0.30
+      backend:
+        ipv4_address: 172.30.1.50
+      monitor:
+        ipv4_address: 172.30.2.10
+
+  grafana:
+    image: grafana/grafana:13.2.2@sha256:ac461fb352abc50da10a51c7d02462e9c05488f11f53f14b3ad79a8145f638a0
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/dots-demo.json
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "127.0.0.1:${GRAFANA_PORT:-3000}:3000"
+    networks:
+      monitor:
+        ipv4_address: 172.30.2.20
+
+networks:
+  front:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
+          # Dynamic addresses stay away from the fixed demo addresses,
+          # in particular the edge's secondary address 172.30.0.11.
+          ip_range: 172.30.0.128/25
+  backend:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.1.0/24
+          ip_range: 172.30.1.128/25
+  monitor:
+    ipam:
+      config:
+        - subnet: 172.30.2.0/24
+          ip_range: 172.30.2.128/25
+
+volumes:
+  # Demo-only CA, keys and tokens, created by the certs service.
+  demo-certs:

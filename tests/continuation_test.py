@@ -97,6 +97,12 @@ def main():
 
             status, _, _ = request("/ankah/open-extra?challenge=x&answer=0", "POST", b"")
             assert status == 404
+            status, unlock_headers, unlock_page = request(
+                "/method", "DELETE",
+                headers={"Accept": "text/html", "Accept-Language": "es"})
+            assert status == 405 and unlock_headers["Content-Language"] == "es"
+            assert b"<html lang=es>" in unlock_page
+            assert "Se requiere desbloquear".encode() in unlock_page
 
             with socket.create_connection(("127.0.0.1", gate_port), timeout=5) as sock:
                 sock.sendall((f"POST /expectation HTTP/1.1\r\nHost: localhost:{gate_port}\r\n"
@@ -110,6 +116,12 @@ def main():
             assert headers["X-Content-Type-Options"] == "nosniff"
             assert headers["Referrer-Policy"] == "no-referrer"
             gate_headers = headers
+            status, localized_headers, localized_page = request(
+                "/localized", headers={"Accept-Language": "ja-JP"})
+            assert status == 428 and localized_headers["Content-Language"] == "ja"
+            assert b"<html lang=ja>" in localized_page
+            assert "ブラウザーを確認しています".encode() in localized_page
+            assert b"<!--#" not in localized_page
             assert b"setTimeout(() => { panel.hidden = false; }, 10000)" in pathlib.Path(root, "challenge.js").read_bytes()
             worker_path = re.search(rb"data-worker='([^']*)'", page).group(1).decode()
             wasm_path = re.search(rb"data-wasm='([^']*)'", page).group(1).decode()
@@ -124,12 +136,25 @@ def main():
                 assert hashlib.sha256(module).hexdigest() in wasm_path
             sid = re.search(rb"data-session='([a-f0-9]{32})'", page).group(1).decode()
             challenge = re.search(rb"data-challenge='([^']+)'", page).group(1).decode()
+            status, script_headers, script = request(
+                f"/ankah/challenge/{challenge}", headers={"Accept-Language": "es-MX"})
+            assert status == 200 and script_headers["Content-Language"] == "es"
+            assert b"@ANKAH_LANG@" not in script
+            assert b"ankah_language='es'" in script
+            assert "Falta Python 3".encode() in script
+            status, script_headers, script = request(
+                f"/ankah/challenge/{challenge}", headers={"Accept-Language": "ja-JP"})
+            assert status == 200 and script_headers["Content-Language"] == "ja"
+            assert b"ankah_language='ja'" in script
+            assert "Python 3 がありません".encode() in script
             cookie = gate_headers["Set-Cookie"].split(";", 1)[0]
             status, headers, png = request(f"/ankah/qr/{sid}.png")
             assert status == 200 and headers["Content-Type"] == "image/png"
             assert png.startswith(b"\x89PNG\r\n\x1a\n")
-            status, _, phone = request(f"/ankah/solve/{sid}")
-            assert status == 200 and b"original page" in phone
+            status, phone_headers, phone = request(
+                f"/ankah/solve/{sid}", headers={"Accept-Language": "es"})
+            assert status == 200 and phone_headers["Content-Language"] == "es"
+            assert b"<html lang=es>" in phone and "Resolver el desafío".encode() in phone
             status, headers, _ = request(f"/ankah/answer/{sid}?answer={solve(challenge)}", "POST")
             assert status == 200 and "Set-Cookie" not in headers
             status, headers, _ = request(f"/ankah/finish/{sid}", headers={"Cookie": cookie})

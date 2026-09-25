@@ -1,0 +1,55 @@
+services:
+  haproxy:
+    build:
+      context: haproxy
+    ports:
+      - "8443:8443"
+    networks:
+      proxy:
+        ipv4_address: 172.30.71.10
+  ankah:
+    build:
+      context: ../..
+      dockerfile: examples/haproxy-django/ankah/Dockerfile
+      args:
+        ANKAH_PACKAGE_STAGE: ${ANKAH_PACKAGE_STAGE:-release-fetch}
+        ANKAH_VERSION: ${ANKAH_VERSION:-}
+        ANKAH_SHA256: ${ANKAH_SHA256:-}
+    networks:
+      proxy:
+        ipv4_address: 172.30.71.11
+      app:
+    depends_on:
+      - django
+  client_a:
+    image: python:3.12-alpine
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./smoke_client.py:/smoke.py:ro
+    networks:
+      proxy:
+        ipv4_address: 172.30.71.20
+  client_b:
+    image: python:3.12-alpine
+    command: ["sleep", "infinity"]
+    volumes:
+      - ./smoke_client.py:/smoke.py:ro
+    networks:
+      proxy:
+        ipv4_address: 172.30.71.21
+  django:
+    build:
+      context: django
+    networks:
+      app:
+        ipv4_address: 172.30.72.10
+networks:
+  proxy:
+    ipam:
+      config:
+        - subnet: 172.30.71.0/24
+  app:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.72.0/24

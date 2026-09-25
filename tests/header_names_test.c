@@ -13,6 +13,7 @@ static const expected_header expected[] = {
     {":path", ANKAH_HEADER_PSEUDO_PATH},
     {":scheme", ANKAH_HEADER_PSEUDO_SCHEME},
     {"accept-encoding", ANKAH_HEADER_ACCEPT_ENCODING},
+    {"accept-language", ANKAH_HEADER_ACCEPT_LANGUAGE},
     {"authorization", ANKAH_HEADER_AUTHORIZATION},
     {"connection", ANKAH_HEADER_CONNECTION},
     {"content-length", ANKAH_HEADER_CONTENT_LENGTH},

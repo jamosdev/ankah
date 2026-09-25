@@ -1,5 +1,13 @@
 /build/
+/build-release-*/
+/ci-build/
+/ci-windows/
+/ci-package/
+/ci-wine/
+/.venv-release/
 /dist/
 /.cache/
 __pycache__/
 *.pyc
+/protocol-matrix-artifacts/
+/protocol-matrix-ca.pem

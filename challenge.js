@@ -9,6 +9,17 @@
   const [nonce, , bitText] = challenge.split(".");
   const bits = Number(bitText);
   const encoder = new TextEncoder();
+  const locale = document.documentElement.lang || "en";
+  const languageText = new Map([...document.querySelectorAll("#challenge-text [data-name]")]
+    .map((node) => [node.dataset.name, node.textContent]));
+  const number = new Intl.NumberFormat(locale);
+  const decimal = new Intl.NumberFormat(locale, {minimumFractionDigits: 1, maximumFractionDigits: 1});
+  const text = (name, ...values) => {
+    const result = languageText.get(name);
+    if (!result) throw new Error("missing challenge text: " + name);
+    return result.replace(/\{(\d+)\}/g, (_, index) => String(values[Number(index)]));
+  };
+  const failure = (name) => Object.assign(new Error(text(name)), {localized: true});
   let guesses = 0;
   const started = performance.now();
 
@@ -21,9 +32,8 @@
     const elapsed = Math.max((performance.now() - started) / 1000, 0.001);
     const rate = Math.round(guesses / elapsed);
     const chance = 100 * (1 - Math.exp(-guesses / (2 ** bits)));
-    progress.textContent =
-      `${guesses.toLocaleString()} guesses · ${rate.toLocaleString()}/s · ` +
-      `${chance.toFixed(1)}% chance of success by now`;
+    progress.textContent = text("challenge_progress",
+      number.format(guesses), number.format(rate), decimal.format(chance));
   }
 
   function passes(hash) {
@@ -34,7 +44,7 @@
   }
 
   async function solveWithWebCrypto() {
-    if (!crypto.subtle) throw new Error("This browser cannot solve the challenge");
+    if (!crypto.subtle) throw failure("challenge_browser_unsupported");
     guesses = 0;
     for (let counter = 0; counter < Number.MAX_SAFE_INTEGER; counter++) {
       const data = encoder.encode(`${nonce}:${counter}`);
@@ -46,7 +56,7 @@
         return counter;
       }
     }
-    throw new Error("Challenge search exhausted");
+    throw failure("challenge_search_exhausted");
   }
 
   function solveWithWorker() {
@@ -60,8 +70,8 @@
         worker.terminate();
         reject(reason);
       };
-      const startup = setTimeout(() => fail(new Error("Solver startup timed out")), 5000);
-      worker.onerror = () => fail(new Error("Solver worker failed"));
+      const startup = setTimeout(() => fail(failure("challenge_startup_timeout")), 5000);
+      worker.onerror = () => fail(failure("challenge_worker_failed"));
       worker.onmessage = ({data}) => {
         if (settled) return;
         if (data.type === "ready") {
@@ -78,7 +88,8 @@
           worker.terminate();
           resolve(data.counter);
         } else if (data.type === "error") {
-          fail(new Error(data.message || "Solver worker failed"));
+          fail(failure(languageText.has(data.code) ?
+            data.code : "challenge_worker_failed"));
         }
       };
       worker.postMessage({nonce, bits, wasm: document.body.dataset.wasm});
@@ -87,7 +98,7 @@
 
   async function solve() {
     if (!/^[0-9a-f]{32}$/.test(nonce) || !Number.isInteger(bits) ||
-        bits < 8 || bits > 24) throw new Error("Invalid challenge");
+        bits < 8 || bits > 24) throw failure("challenge_invalid");
     let counter;
     if (document.body.dataset.worker && document.body.dataset.wasm &&
         typeof Worker !== "undefined" && typeof WebAssembly !== "undefined") {
@@ -99,22 +110,22 @@
     } else {
       counter = await solveWithWebCrypto();
     }
-    progress.textContent = "Challenge passed. Continuing...";
+    progress.textContent = text("challenge_passed_continuing");
     const endpoint = session
       ? `/ankah/answer/${session}?answer=${counter}`
       : `/ankah/open?challenge=${encodeURIComponent(challenge)}&answer=${counter}`;
     const response = await fetch(endpoint,
       {method: "POST", credentials: "same-origin", cache: "no-store"});
-    if (!response.ok) throw new Error("The answer was rejected");
+    if (!response.ok) throw failure("challenge_answer_rejected");
     if (mobile) {
-      progress.textContent = "Challenge passed. Click Finished on the original page.";
+      progress.textContent = text("challenge_passed_mobile");
     } else {
       document.getElementById("finish").submit();
     }
   }
 
   solve().catch((error) => {
-    progress.textContent = error.message;
+    progress.textContent = error.localized ? error.message : text("challenge_failed");
     if (panel) panel.hidden = false;
   });
 })();

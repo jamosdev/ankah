@@ -1,0 +1,188 @@
+# go-dots server configuration for the dots-benchmark demo.
+# Derived from dots_server/dots_server.yaml at go-dots commit
+# 4e631d1257fd6a5d1f7201c2d06d63c7ace88940 (Apache License 2.0).
+# Changed: secureFile, network and database sections.
+system:
+  signalConfigurationParameter:
+    heartbeatInterval: 15-240
+    missingHbAllowed: 3-15
+    maxRetransmit: 2-15
+    ackTimeout: 1.0-30.0
+    ackRandomFactor: 1.1-4.0
+    maxPayload: 1-20
+    nonMaxRetransmit: 1-20
+    nonTimeout: 1.0-30.0
+    nonReceiveTimeout: 1.0-60.0
+    nonProbingWait: 1.0-300
+    nonPartialWait: 1.0-300
+    heartbeatIntervalIdle: 15-240
+    missingHbAllowedIdle: 3-15
+    maxRetransmitIdle: 2-15
+    ackTimeoutIdle: 1.0-30.0
+    ackRandomFactorIdle: 1.1-4.0
+    maxPayloadIdle: 1-20
+    nonMaxRetransmitIdle: 1-20
+    nonTimeoutIdle: 1.0-30.0
+    nonReceiveTimeoutIdle: 1.0-60.0
+    nonProbingWaitIdle: 1.0-300
+    nonPartialWaitIdle: 1.0-300
+
+# Default current values of session configuration
+  defaultSignalConfiguration:
+    heartbeatInterval: 30
+    missingHbAllowed: 15
+    maxRetransmit: 3
+    ackTimeout: 2.0
+    ackRandomFactor: 1.5
+    maxPayload: 10
+    nonMaxRetransmit: 4
+    nonTimeout: 2.0
+    nonReceiveTimeout: 4.0
+    nonProbingWait: 247.0
+    nonPartialWait: 247.0
+    heartbeatIntervalIdle: 30
+    missingHbAllowedIdle: 15
+    maxRetransmitIdle: 3
+    ackTimeoutIdle: 2.0
+    ackRandomFactorIdle: 1.5
+    maxPayloadIdle: 10
+    nonMaxRetransmitIdle: 4
+    nonTimeoutIdle: 2.0
+    nonReceiveTimeoutIdle: 4.0
+    nonProbingWaitIdle: 247.0
+    nonPartialWaitIdle: 247.0
+
+# Range min-max values of telemetry configuration
+  telemetryConfigurationParameter:
+    measurementInterval: 1-7
+    measurementSample: 1-8
+    lowPercentile: 0.0-10.0
+    midPercentile: 10.1-50.0
+    highPercentile: 50.1-90.0
+    serverOriginatedTelemetry: true
+    telemetryNotifyInterval: 1-3600
+    unit: 1
+    unitStatus: true
+
+# Default values of telemetry configuration
+  defaultTelemetryConfiguration:
+    measurementInterval: 1
+    measurementSample: 1
+    lowPercentile: 10.0
+    midPercentile: 50.0
+    highPercentile: 90.0
+    serverOriginatedTelemetry: false
+    telemetryNotifyInterval: 50
+    unit: 2
+    unitStatus: true
+
+# Default values of total pipe capacity
+  defaultTotalPipeCapacity:
+    linkId: link1
+    capacity: 100
+    unit: 1
+
+# Default value of target
+  defaultTarget:
+    targetPrefix: 1.1.2.0/24
+    tagetLowerPort: 80
+    targetUpperPort: 8080
+    targetProtocol: 6
+    targetFqdn:
+    targetUri:
+
+# Default value of total traffic normal baseline
+  defaultTotalTrafficNormalBaseline:
+    unit: 1
+    protocol: 6
+    lowPercentileG: 100
+    midPercentileG: 500
+    highPercentileG: 900
+    peakG: 1000
+
+# Default values of total connection capacity
+  defaultTotalConnectionCapacity:
+    protocol: 6
+    connection: 80
+    connectionClient: 81
+    embryonic: 82
+    embryonicClient: 83
+    connectionPs: 84
+    connectionClientPs: 85
+    requestPs: 86
+    requestClientPs: 87
+    partialRequestMax: 88
+    partialRequestClientMax: 89
+
+  secureFile:
+    serverCertFile: /run/demo-certs/edge-dots.crt
+    serverKeyFile: /run/demo-certs/edge-dots.key
+    crlFile: /run/demo-certs/unused-crl.pem
+    certFile: /run/demo-certs/ca.crt
+  network:
+    bindAddress: "172.30.1.10"
+    # Required by the go-dots config parser. The demo never opens the CoAP
+    # signal channel or the DB notification listener.
+    signalChannelPort: 4646
+    dbNotificationPort: 9999
+    dataChannelPort: 4443
+    hrefOrigin: https://edge-dots.demo.test:4443
+    hrefPathname: /v1/restconf
+  database:
+    username: dots
+    password: dots-demo-only
+    protocol: tcp
+    host: mysql
+    port: 3306
+    databaseName: dots
+
+  lifetimeConfiguration:
+    activeButTerminatingPeriod: 120
+    maxActiveButTerminatingPeriod: 300
+    manageLifetimeInterval: 100
+    conflictRetryTimer: 120
+
+  # Default value of Filtering capabilities
+  capabilities:
+    addressFamily: ipv4,ipv6
+    forwardingActions: drop,accept
+    rateLimit: true
+    transportProtocols: 1,6,17,58
+    ipv4:
+      length: true
+      protocol: true
+      destinationPrefix: true
+      sourcePrefix: true
+      fragment: true
+    ipv6:
+      length: true
+      protocol: true
+      destinationPrefix: true
+      sourcePrefix: true
+      fragment: true
+    tcp:
+      flagsBitmask: true
+      sourcePort: true
+      destinationPort: true
+      portRange: true
+    udp:
+      length: true
+      sourcePort: true
+      destinationPort: true
+      portRange: true
+    icmp:
+      type: true
+      code: true
+
+  # Time(seconds) max-age of session configuration
+  maxAgeOption: 45
+  # on/off cache blockwise transfer
+  isCacheBlockwiseTransfer: true
+  # Time interval to delete expired items in cache
+  cacheInterval: 10
+  # The queries are supported by go-dots
+  queryType: 1,2,3,4,6,8,9,10,11
+  # vendor-mapping-enabled to get the Dots server's vendor attack mapping
+  vendorMappingEnabled: false
+  # Time(seconds) session is timed out
+  sessionTimeout: 86400

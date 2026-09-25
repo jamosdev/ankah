@@ -23,7 +23,13 @@ int main(void) {
                                    "Content-Length: 0\r\nExpect: 100-continue\r\n"
                                    "Expect: other\r\n\r\n";
     const char *manual;
+    const char *chunk_rest = "\nWiki\r\n5\r\npedia\r\n0\r\nX-Result: yes\r\n\r\n";
+    const char *bad_chunk = "3\r\nabc\n0\r\n\r\n";
+    const char *large_chunk = "5\r\nhello\r\n0\r\n\r\n";
+    const char *bad_trailer = "0\r\nContent-Length: 2\r\n\r\n";
     ankah_request request;
+    ankah_chunked_body chunks;
+    size_t decoded;
     int failures = 0;
     failures += expect(ankah_parse_request(good, strlen(good), &request) == 0, "valid request");
     failures += expect(strcmp(request.target, "/hello") == 0, "target");
@@ -53,5 +59,26 @@ int main(void) {
     manual = ankah_header_value(&request, "x-custom");
     failures += expect(manual && strcmp(manual, "manual.test") == 0,
                        "unknown header lookup");
+    ankah_chunked_body_init(&chunks);
+    failures += expect(ankah_chunked_body_consume(&chunks, "4;ok=yes\r", 9, 64,
+                                                   &decoded) == 0 && decoded == 0,
+                       "split chunk size");
+    failures += expect(ankah_chunked_body_consume(&chunks, chunk_rest, strlen(chunk_rest),
+                                                   64, &decoded) == 1 && decoded == 9 &&
+                                                   chunks.decoded == 9,
+                       "chunked body and trailer");
+    ankah_chunked_body_init(&chunks);
+    failures += expect(ankah_chunked_body_consume(&chunks, bad_chunk, strlen(bad_chunk),
+                                                   64, &decoded) == -1,
+                       "invalid chunk delimiter");
+    ankah_chunked_body_init(&chunks);
+    failures += expect(ankah_chunked_body_consume(&chunks, large_chunk, strlen(large_chunk),
+                                                   4, &decoded) == -1 &&
+                       chunks.limit_exceeded,
+                       "chunk decoded limit");
+    ankah_chunked_body_init(&chunks);
+    failures += expect(ankah_chunked_body_consume(&chunks, bad_trailer, strlen(bad_trailer),
+                                                   64, &decoded) == -1,
+                       "forbidden chunk trailer");
     return failures ? 1 : 0;
 }

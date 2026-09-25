@@ -1,0 +1,114 @@
+name: Build and release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify-tag:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify published tag
+        shell: bash
+        run: |
+          [[ "$GITHUB_REF_NAME" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]
+          git fetch origin +refs/heads/main:refs/remotes/origin/main
+          git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+          test -z "$(git ls-tree --name-only "$GITHUB_SHA" .gitlab-ci.yml AGENTS.md tools .githooks)"
+
+  linux:
+    needs: verify-tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test Linux musl package
+        run: |
+          docker run --rm -v "$PWD:/src" -w /src \
+            alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc \
+            sh -ec 'apk add --no-cache cmake ninja gcc g++ musl-dev linux-headers binutils git gperf clang lld nodejs curl openssl python3 py3-brotli py3-hpack && sh scripts/package-release.sh linux-musl-x64'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: dist/ankah-linux-musl-x64.tar.gz
+          if-no-files-found: error
+
+  macos:
+    needs: verify-tag
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: brew install cmake ninja llvm lld node gperf python@3.12 openssl@3 curl
+      - name: Build and test macOS arm64 package
+        run: |
+          export PATH="$(brew --prefix gperf)/bin:$(brew --prefix curl)/bin:$PATH"
+          export ANKAH_WASM_CLANG="$(brew --prefix llvm)/bin/clang"
+          export ANKAH_WASM_LLD="$(brew --prefix lld)/bin/wasm-ld"
+          "$(brew --prefix python@3.12)/bin/python3.12" -m venv .venv-release
+          export PATH="$PWD/.venv-release/bin:$PATH"
+          python3 -m pip install --disable-pip-version-check Brotli==1.2.0 hpack==4.2.0
+          sh scripts/package-release.sh macos-arm64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: dist/ankah-macos-arm64.tar.gz
+          if-no-files-found: error
+
+  windows:
+    needs: verify-tag
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            binutils-mingw-w64-x86-64 ca-certificates clang cmake curl \
+            g++-mingw-w64-x86-64 gcc-mingw-w64-x86-64 git lld make \
+            ninja-build nodejs openssl python3 python3-brotli python3-hpack wine wine64 zip
+      - name: Build and test Windows package
+        env:
+          WINEARCH: win64
+          WINEDEBUG: -all
+          WINEPREFIX: ${{ runner.temp }}/ankah-wine
+        run: |
+          wineboot --init
+          wineserver -w
+          sh scripts/package-release.sh windows-x64
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-release
+          path: dist/ankah-windows-x64.zip
+          if-no-files-found: error
+
+  publish:
+    needs: [linux, macos, windows]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: '*-release'
+          merge-multiple: true
+          path: dist
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd dist
+          sha256sum ankah-linux-musl-x64.tar.gz ankah-macos-arm64.tar.gz ankah-windows-x64.zip > SHA256SUMS
+          gh release create "$GITHUB_REF_NAME" ./* --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" --title "Ankah $GITHUB_REF_NAME" \
+            --notes "Validated packages from published main commit $GITHUB_SHA." --latest

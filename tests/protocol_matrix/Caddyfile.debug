@@ -1,0 +1,24 @@
+{
+	admin off
+	persist_config off
+	servers :443 {
+		protocols h1 h2 h3
+	}
+}
+
+:443 {
+	tls /run/ankah-protocol/leaf.pem /run/ankah-protocol/leaf-key.pem
+	header Alt-Svc "h3=\":{$ANKAH_EDGE_PORT:8443}\"; ma=2592000"
+
+	@connect method CONNECT
+	respond @connect 405
+
+	reverse_proxy https://native.ankah.test:8443 {
+		header_up Host localhost:{$ANKAH_NATIVE_PORT:9443}
+		transport http {
+			versions 1.1 2
+			tls_trust_pool file /run/ankah-protocol/ca.pem
+			tls_server_name native.ankah.test
+		}
+	}
+}

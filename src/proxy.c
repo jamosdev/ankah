@@ -149,6 +149,12 @@ static int is_trusted(const ip_address *ip, const ankah_network *trusted, size_t
     return 0;
 }
 
+int ankah_peer_is_trusted(const char *peer, const ankah_network *trusted, size_t count) {
+    ip_address ip;
+    return peer && parse_ip_text(peer, strlen(peer), &ip) == 0 &&
+           is_trusted(&ip, trusted, count);
+}
+
 static int append_chain(ip_address *chain, size_t *count,
                         const char *text, size_t length) {
     if (*count == MAX_CHAIN || parse_ip_text(text, length, &chain[*count]) != 0) return -1;

@@ -1,10 +1,15 @@
 """Exercise the operator dashboard listener and its statistics endpoints."""
 
 import hashlib
+import hmac
 import http.client
 import http.server
+import csv
+import io
 import json
+import struct
 import pathlib
+import re
 import socket
 import subprocess
 import sys
@@ -16,6 +21,14 @@ from process_support import gateway_command
 
 
 TOKEN = "b" * 64
+
+
+def dashboard_code(step):
+    secret = hmac.new(bytes.fromhex(TOKEN), b"ankah dashboard totp v1",
+                      hashlib.sha256).digest()[:20]
+    digest = hmac.new(secret, struct.pack(">Q", step), hashlib.sha1).digest()
+    offset = digest[-1] & 15
+    return f"{(struct.unpack('>I', digest[offset:offset + 4])[0] & 0x7fffffff) % 1000000:06d}"
 
 
 def check(condition, message):
@@ -46,6 +59,8 @@ def main():
 
     class App(http.server.BaseHTTPRequestHandler):
         def do_GET(self):
+            if self.path == "/app/delay":
+                time.sleep(.05)
             payload = self.path.encode()
             self.send_response(404 if self.path.endswith("/missing") else 200)
             self.send_header("Content-Length", str(len(payload)))
@@ -72,13 +87,25 @@ def main():
         token.write_text(TOKEN + "\n")
         stats_file = pathlib.Path(temp) / "statistics"
         pathlib.Path(str(stats_file) + ".0").write_bytes(b"corrupt")
+        public_route = "/ankah-admin/"
         base = ["--listen", f"127.0.0.1:{public}", "--upstream", f"127.0.0.1:{app}",
                 "--public-origin", f"http://localhost:{public}",
                 "--secret-file", str(secret), "--assets-dir", root,
-                "--allow-prefix", "/app"]
+                "--allow-prefix", "/app", "--allow-prefix", "/ankah-admin"]
         listen = ["--dashboard-listen", f"127.0.0.1:{dashboard}"]
+        public_route_option = ["--dashboard-public-route=" + public_route]
 
         for extra, reason in ((listen, "listen without a token"),
+                              (public_route_option, "public route without a token"),
+                              (["--dashboard-public-route", "/", "--dashboard-token-file",
+                                str(token)], "root public dashboard route"),
+                              (["--dashboard-public-route", "/without-slash",
+                                "--dashboard-token-file", str(token)],
+                               "unterminated public dashboard route"),
+                              (["--dashboard-public-route", "/health/",
+                                "--dashboard-token-file", str(token),
+                                "--ankah-healthz=/health/check"],
+                               "public dashboard health route conflict"),
                               (["--dashboard-token-file", str(token)], "token without a listener"),
                               (listen + ["--dashboard-token-file", str(secret)],
                                "token equal to the secret"),
@@ -93,7 +120,8 @@ def main():
             check(result.returncode == 2, f"started with {reason}")
 
         process = subprocess.Popen(
-            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token),
+            gateway_command(executable, base + listen + public_route_option +
+                            ["--dashboard-token-file", str(token),
                             "--stats-file", str(stats_file)]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
@@ -120,26 +148,170 @@ def main():
                                    headers={"Authorization": "bearer " + TOKEN})
             check(status == 200, "scheme is case insensitive")
 
+            check(request(dashboard, "/auth/qr")[0] == 401,
+                  "setup QR requires the dashboard token")
+            status, headers, qr = request(dashboard, "/auth/qr", headers=authorized)
+            check(status == 200 and headers["Content-Type"] == "image/png" and
+                  qr.startswith(b"\x89PNG\r\n\x1a\n"), "setup QR is served")
+            check(request(dashboard, "/auth/login", "POST",
+                          {"X-Ankah-Code": "123"})[0] == 401,
+                  "short authenticator codes are refused")
+            code = dashboard_code(int(time.time()) // 30)
+            status, _, body = request(dashboard, "/auth/login", "POST",
+                                      {"X-Ankah-Code": code})
+            check(status == 200, "valid authenticator code is accepted")
+            session = json.loads(body)["token"]
+            check(re.fullmatch("[0-9a-f]{64}", session) and session != TOKEN,
+                  "login returns a distinct session token")
+            session_auth = {"Authorization": "Bearer " + session}
+            check(request(dashboard, "/stats/live", headers=session_auth)[0] == 200,
+                  "session opens statistics")
+            check(request(dashboard, "/auth/qr", headers=session_auth)[0] == 401,
+                  "session cannot reveal the setup QR")
+            check(request(dashboard, "/auth/login", "POST",
+                          {"X-Ankah-Code": code})[0] == 401,
+                  "authenticator code cannot be reused")
+            for _ in range(4):
+                check(request(dashboard, "/auth/login", "POST",
+                              {"X-Ankah-Code": "xxxxxx"})[0] == 401,
+                      "invalid code is refused")
+            check(request(dashboard, "/auth/login", "POST",
+                          {"X-Ankah-Code": "xxxxxx"})[0] == 429,
+                  "code attempts are limited")
+
+            status, headers, _ = request(dashboard, "/metrics")
+            check(status == 401 and headers["WWW-Authenticate"].startswith("Bearer"),
+                  "metrics require a token")
+            status, headers, _ = request(dashboard, "/metrics", "POST", authorized)
+            check(status == 405 and headers.get("Allow") == "GET",
+                  "metrics reject unsupported methods")
+            status, headers, _ = request(dashboard, "/stats/export.csv")
+            check(status == 401 and headers["WWW-Authenticate"].startswith("Bearer"),
+                  "export requires a token")
+            status, headers, _ = request(dashboard, "/stats/export.csv", "POST", authorized)
+            check(status == 405 and headers.get("Allow") == "GET",
+                  "export rejects unsupported methods")
+
+            def metrics():
+                status, headers, body = request(dashboard, "/metrics?source=test",
+                                                headers=authorized)
+                check(status == 200, "metrics returned " + str(status))
+                check(headers["Content-Type"] ==
+                      "text/plain; version=0.0.4; charset=utf-8", "metrics content type")
+                check(headers["Cache-Control"] == "no-store", "metrics cache control")
+                check(body.endswith(b"\n"), "metrics final newline")
+                text = body.decode("ascii")
+                samples = [line for line in text.splitlines() if line and not line.startswith("#")]
+                check(len(samples) == len({line.split(" ", 1)[0] for line in samples}),
+                      "metrics contain duplicate samples")
+                values = {line.split(" ", 1)[0]: float(line.rsplit(" ", 1)[1])
+                          for line in samples}
+                types = {line.split()[2]: line.split()[3] for line in text.splitlines()
+                         if line.startswith("# TYPE ")}
+                return text, values, types
+
+            metric_text, metric_before, metric_types = metrics()
+            check(metric_types["ankah_http_requests_total"] == "counter" and
+                  metric_types["ankah_connections_current"] == "gauge" and
+                  metric_types["ankah_upstream_response_latency_seconds"] == "summary" and
+                  metric_types["ankah_static_throttle_queue_wait_seconds"] == "summary",
+                  "metrics types")
+            classes = {name for name in metric_before
+                       if name.startswith("ankah_http_responses_total{")}
+            check(classes == {f'ankah_http_responses_total{{class="{kind}"}}'
+                              for kind in ("2xx", "3xx", "4xx", "5xx")},
+                  "response class labels are bounded")
+            check(metric_before["ankah_connections_limit"] == 256 and
+                  metric_before["ankah_tls_connections_limit"] == 0 and
+                  metric_before["ankah_sessions_limit"] == 4096 and
+                  metric_before["ankah_static_cache_bytes_limit"] == 64 * 1024 * 1024 and
+                  metric_before["ankah_static_throttle_connections_limit"] == 0 and
+                  metric_before["ankah_static_throttle_queue_current"] == 0,
+                  "metrics limits")
+            check("127.0.0.1" not in metric_text and "/app/" not in metric_text,
+                  "metrics exclude addresses and paths")
+            status, _, _ = request(public, "/app/delay")
+            check(status == 200, "metric delay request")
+            _, metric_after, _ = metrics()
+            check(metric_after["ankah_http_requests_total"] ==
+                  metric_before["ankah_http_requests_total"] + 1,
+                  "request counter changes")
+            check(metric_after["ankah_upstream_response_latency_seconds_count"] ==
+                  metric_before["ankah_upstream_response_latency_seconds_count"] + 1,
+                  "latency count changes")
+            check(metric_after["ankah_upstream_response_latency_seconds_sum"] >=
+                  metric_before["ankah_upstream_response_latency_seconds_sum"] + .04 and
+                  metric_after["ankah_upstream_response_latency_peak_seconds"] >= .04,
+                  "latency milliseconds convert to seconds")
+            _, metric_quiet, _ = metrics()
+            check(metric_quiet["ankah_http_requests_total"] ==
+                  metric_after["ankah_http_requests_total"],
+                  "metric scrapes are not counted")
+
             schema = stats("/stats/schema")
             fields = schema["fields"]
-            check(len(fields) == 32 and len(schema["kinds"]) == 32, "schema has 32 fields")
+            check(schema["v"] == 3 and len(fields) == 45 and
+                  len(schema["kinds"]) == 45, "schema has 45 fields")
             check(fields[0] == "client_bytes_in" and schema["kinds"][fields.index(
                 "peak_connections")] == "max", "schema names and kinds")
             check(schema["hour_capacity"] == 720 and schema["day_capacity"] == 4096,
                   "schema ring sizes")
             check(schema["limits"]["connections"] == 256 and
                   schema["limits"]["tls_connections"] == 0 and
-                  schema["limits"]["sessions"] == 4096, "schema limits")
+                  schema["limits"]["sessions"] == 4096 and
+                  schema["limits"]["throttle_connections"] == 0 and
+                  schema["limits"]["throttle_queue"] == 0, "schema limits")
             field = {name: index for index, name in enumerate(fields)}
 
-            status, headers, page = request(dashboard, "/")
+            status, headers, page = request(dashboard, "/",
+                                            headers={"Accept-Language": "fr-CA, en;q=0.5"})
             policy = headers.get("Content-Security-Policy", "")
             check(status == 200 and headers["Content-Type"].startswith("text/html") and
-                  b"/dashboard/dashboard.js" in page, "page is served without a token")
+                  b"dashboard/dashboard.js" in page, "page is served without a token")
+            check(headers.get("Content-Language") == "en" and
+                  "Accept-Language" in headers.get("Vary", ""),
+                  "page language is negotiated")
+            check(b"<!--#" not in page and b'<html lang="en">' in page and
+                  b"Ankah dashboard" in page and
+                  b'id="export"' in page and
+                  b"Rates between polls, last five minutes." in page,
+                  "dashboard SSI is rendered")
+            english_etag = headers["ETag"]
+            for preference, tag, title in (
+                ("ja-JP, es;q=0.5", "ja", "Ankah ダッシュボード"),
+                ("es-MX, ja;q=0.5", "es", "Panel de Ankah"),
+            ):
+                localized_status, localized_headers, localized_page = request(
+                    dashboard, "/", headers={"Accept-Language": preference})
+                check(localized_status == 200 and
+                      localized_headers.get("Content-Language") == tag and
+                      "Accept-Language" in localized_headers.get("Vary", "") and
+                      localized_headers["ETag"] != english_etag and
+                      f'<html lang="{tag}">'.encode() in localized_page and
+                      title.encode() in localized_page and
+                      b"<!--#" not in localized_page,
+                      f"{tag} dashboard translation and metadata")
+                cached_status, cached_headers, _ = request(
+                    dashboard, "/", headers={"Accept-Language": tag,
+                                             "If-None-Match": localized_headers["ETag"]})
+                check(cached_status == 304 and
+                      cached_headers.get("Content-Language") == tag,
+                      f"{tag} dashboard revalidation")
+            page_names = re.findall(rb'data-name="([^"]+)"', page)
+            script = (pathlib.Path(root) / "dashboard/dashboard.js").read_text()
+            script_names = {name.encode() for name in
+                            re.findall(r'text\("([^"]+)"', script)}
+            check(len(page_names) == len(set(page_names)) and
+                  set(page_names) == script_names,
+                  "runtime dashboard text catalog is complete")
             check("default-src 'none'" in policy and "script-src 'self'" in policy and
                   "unsafe" not in policy and "frame-ancestors 'none'" in policy, "page policy")
-            status, _, _ = request(dashboard, "/", headers={"If-None-Match": headers["ETag"]})
-            check(status == 304, "page revalidates")
+            status, revalidated, _ = request(
+                dashboard, "/", headers={"If-None-Match": headers["ETag"],
+                                          "Accept-Language": "en"})
+            check(status == 304 and revalidated.get("Content-Language") == "en" and
+                  "Accept-Language" in revalidated.get("Vary", ""),
+                  "page revalidates with language metadata")
             for name, kind in (("dashboard.js", "application/javascript"),
                                ("dashboard.css", "text/css"),
                                ("d3-subset.min.js", "application/javascript"),
@@ -150,6 +322,39 @@ def main():
                                                if name.startswith(("dashboard", "d3")) else name)
                 check(status == 200 and headers["Content-Type"].startswith(kind) and
                       body == source.read_bytes(), name + " is served")
+            status, headers, _ = request(public, public_route[:-1])
+            check(status == 308 and headers.get("Location") == public_route,
+                  "public dashboard adds its trailing slash")
+            status, headers, page = request(public, public_route)
+            check(status == 200 and b'dashboard/dashboard.js' in page and
+                  "connect-src 'self'" in headers.get("Content-Security-Policy", ""),
+                  "public dashboard page is served through normal public routing")
+            for name, kind in (("dashboard.js", "application/javascript"),
+                               ("dashboard.css", "text/css"),
+                               ("d3-subset.min.js", "application/javascript"),
+                               ("particles.min.js", "application/javascript"),
+                               ("particlejs.json", "application/json")):
+                status, headers, body = request(public, public_route + "dashboard/" + name)
+                source = pathlib.Path(root) / ("dashboard/" + name
+                                               if name.startswith(("dashboard", "d3")) else name)
+                check(status == 200 and headers["Content-Type"].startswith(kind) and
+                      body == source.read_bytes(), "public " + name + " is served")
+            before_public_api = stats("/stats/live")
+            status, headers, _ = request(public, public_route + "stats/live")
+            check(status == 401 and headers["WWW-Authenticate"].startswith("Bearer"),
+                  "public statistics require a token")
+            public_live = request(public, public_route + "stats/live", headers=authorized)
+            check(public_live[0] == 200 and json.loads(public_live[2])["v"] == 3,
+                  "public statistics accept a token")
+            check(request(public, public_route + "stats/live", headers=session_auth)[0] == 200,
+                  "public statistics accept an authenticator session")
+            check(request(public, public_route + "auth/logout", "POST", session_auth)[0] == 204,
+                  "session can sign out through the public route")
+            check(request(dashboard, "/stats/live", headers=session_auth)[0] == 401,
+                  "signed-out session is revoked")
+            after_public_api = stats("/stats/live")
+            check(after_public_api["cumulative"] == before_public_api["cumulative"],
+                  "public dashboard API traffic is excluded from statistics")
             digest = hashlib.sha256((pathlib.Path(root) / "dashboard/dashboard.js")
                                     .read_bytes()).hexdigest()
             for path in ("/dashboard/dashboard.js", f"/ankah/assets/{digest}/dashboard.js"):
@@ -171,6 +376,8 @@ def main():
             time.sleep(.3)
             before = stats("/stats/live")
             check(before["gauges"]["tls_connections"] == 0, "no TLS sockets")
+            check(before["gauges"]["throttle_connections"] == 0 and
+                  before["gauges"]["throttle_queue"] == 0, "throttle gauges are idle")
             for _ in range(5):
                 status, _, body = request(public, "/app/ok")
                 check(status == 200 and body == b"/app/ok", "forwarded request")
@@ -240,14 +447,34 @@ def main():
             history = stats("/stats/history")
             for series, index in (("hours", "hour_index"), ("days", "day_index")):
                 rows = history[series]["rows"]
-                check(len(rows) <= 1 and all(len(row) == 32 for row in rows),
+                check(len(rows) <= 1 and all(len(row) == 45 for row in rows),
                       f"new process has at most one completed {series[:-1]}")
                 check(history[series]["first"] + len(rows) == history[index],
                       f"{series} end at the current bucket")
-            check(len(history["evicted"]) == 32 and history["evicted_days"] == 0,
+            check(len(history["evicted"]) == 45 and history["evicted_days"] == 0,
                   "history shape")
             check(stats("/stats/history?hours=1&days=1&other=2")["epoch"] == history["epoch"],
                   "history accepts a range")
+
+            status, headers, body = request(dashboard, "/stats/export.csv", headers=authorized)
+            check(status == 200 and headers["Content-Type"] == "text/csv; charset=utf-8",
+                  "export content type")
+            check(headers["Cache-Control"] == "no-store" and
+                  re.fullmatch(r'attachment; filename="ankah-metrics-\d{8}T\d{6}Z\.csv"',
+                               headers.get("Content-Disposition", "")),
+                  "export download headers")
+            check(body.startswith(b"\xef\xbb\xbf") and body.endswith(b"\r\n"),
+                  "export spreadsheet encoding")
+            export_rows = list(csv.reader(io.StringIO(body.decode("utf-8-sig"), newline="")))
+            check(len(export_rows) >= 2 and len(export_rows[0]) == 5 + len(fields) and
+                  export_rows[0][5:] == fields, "export columns follow the schema")
+            check(export_rows[-1][0] == "current_hour" and export_rows[-1][3] == "1" and
+                  len(export_rows[-1]) == len(export_rows[0]), "export has a partial current hour")
+            request_column = export_rows[0].index("requests")
+            check(sum(int(row[request_column]) for row in export_rows[1:]) ==
+                  after["cumulative"][field["requests"]], "export includes current metrics")
+            for previous, current in zip(export_rows[1:], export_rows[2:]):
+                check(previous[2] == current[1], "export periods are continuous")
 
             status, _, body = request(dashboard, "/stats/reset", "POST", authorized, b"")
             check(status == 200, "reset accepted")
@@ -258,6 +485,10 @@ def main():
             reset = stats("/stats/live")
             check(reset["epoch"] == epoch and reset["cumulative"][field["requests"]] == 0 and
                   reset["cumulative"][field["accepted"]] == 0, "reset clears counters")
+            _, reset_metrics, _ = metrics()
+            check(reset_metrics["ankah_stats_epoch_seconds"] == epoch and
+                  reset_metrics["ankah_http_requests_total"] == 0,
+                  "metrics reflect reset counters")
         finally:
             process.terminate()
             process.wait(timeout=10)
@@ -281,6 +512,10 @@ def main():
                 raise RuntimeError("restarted dashboard did not listen")
             check(stats("/stats/live")["epoch"] == epoch,
                   "restart restores the statistics epoch")
+            _, restored_metrics, _ = metrics()
+            check(restored_metrics["ankah_stats_epoch_seconds"] == epoch and
+                  restored_metrics["ankah_http_requests_total"] == 0,
+                  "metrics reflect restored counters")
         finally:
             process.terminate()
             process.wait(timeout=10)

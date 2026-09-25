@@ -135,18 +135,23 @@ int ankah_check_answer(const unsigned char secret[ANKAH_SECRET_SIZE],
 int ankah_issue_pass(const unsigned char secret[ANKAH_SECRET_SIZE],
                      const char *host, uint64_t expiry,
                      char out[ANKAH_PASS_TEXT_MAX]) {
-    char timestamp[32], signature[ANKAH_MAC_SIZE * 2 + 1];
+    unsigned char client_id[ANKAH_CLIENT_ID_SIZE];
+    char client_id_hex[ANKAH_CLIENT_ID_TEXT_SIZE];
+    char fields[96], signature[ANKAH_MAC_SIZE * 2 + 1];
     int length;
     if (!secret || !out) return -1;
-    length = snprintf(timestamp, sizeof(timestamp), "%" PRIu64, expiry);
-    if (length < 0 || (size_t)length >= sizeof(timestamp) ||
-        mac(secret, "pass", host, timestamp, signature) != 0) return -1;
-    length = snprintf(out, ANKAH_PASS_TEXT_MAX, "%s.%s", timestamp, signature);
+    if (ankah_random(client_id, sizeof(client_id)) != 0) return -1;
+    hex_encode(client_id, sizeof(client_id), client_id_hex);
+    length = snprintf(fields, sizeof(fields), "2.%s.%" PRIu64,
+                      client_id_hex, expiry);
+    if (length < 0 || (size_t)length >= sizeof(fields) ||
+        mac(secret, "pass", host, fields, signature) != 0) return -1;
+    length = snprintf(out, ANKAH_PASS_TEXT_MAX, "%s.%s", fields, signature);
     return length > 0 && length < ANKAH_PASS_TEXT_MAX ? 0 : -1;
 }
 
-int ankah_check_pass(const unsigned char secret[ANKAH_SECRET_SIZE],
-                     const char *host, uint64_t now, const char *pass) {
+static int check_legacy_pass(const unsigned char secret[ANKAH_SECRET_SIZE],
+                             const char *host, uint64_t now, const char *pass) {
     char copy[ANKAH_PASS_TEXT_MAX], expected[ANKAH_MAC_SIZE * 2 + 1];
     char *signature;
     uint64_t expiry;
@@ -159,4 +164,47 @@ int ankah_check_pass(const unsigned char secret[ANKAH_SECRET_SIZE],
         strlen(signature) != ANKAH_MAC_SIZE * 2 || lower_hex(signature, ANKAH_MAC_SIZE * 2) != 0 ||
         mac(secret, "pass", host, copy, expected) != 0) return -1;
     return equal_secret(signature, expected, ANKAH_MAC_SIZE * 2) ? 0 : -1;
+}
+
+int ankah_check_pass_identity(const unsigned char secret[ANKAH_SECRET_SIZE],
+                              const char *host, uint64_t now, const char *pass,
+                              char out[ANKAH_CLIENT_ID_TEXT_SIZE]) {
+    char copy[ANKAH_PASS_TEXT_MAX], fields[96];
+    char expected[ANKAH_MAC_SIZE * 2 + 1];
+    char *client_id, *timestamp, *signature, *dot;
+    uint64_t expiry;
+    int length;
+    if (!secret || !pass || !out || strlen(pass) >= sizeof(copy)) return -1;
+    strcpy(copy, pass);
+    dot = strchr(copy, '.');
+    if (!dot) return -1;
+    *dot++ = 0;
+    if (strcmp(copy, "2") != 0) return -1;
+    client_id = dot;
+    dot = strchr(client_id, '.');
+    if (!dot) return -1;
+    *dot++ = 0;
+    timestamp = dot;
+    dot = strchr(timestamp, '.');
+    if (!dot) return -1;
+    *dot++ = 0;
+    signature = dot;
+    if (strlen(client_id) != ANKAH_CLIENT_ID_SIZE * 2 ||
+        lower_hex(client_id, ANKAH_CLIENT_ID_SIZE * 2) != 0 ||
+        decimal_u64(timestamp, &expiry) != 0 || expiry < now || expiry > now + 86400 ||
+        strlen(signature) != ANKAH_MAC_SIZE * 2 ||
+        lower_hex(signature, ANKAH_MAC_SIZE * 2) != 0) return -1;
+    length = snprintf(fields, sizeof(fields), "2.%s.%s", client_id, timestamp);
+    if (length < 0 || (size_t)length >= sizeof(fields) ||
+        mac(secret, "pass", host, fields, expected) != 0 ||
+        !equal_secret(signature, expected, ANKAH_MAC_SIZE * 2)) return -1;
+    memcpy(out, client_id, ANKAH_CLIENT_ID_TEXT_SIZE);
+    return 0;
+}
+
+int ankah_check_pass(const unsigned char secret[ANKAH_SECRET_SIZE],
+                     const char *host, uint64_t now, const char *pass) {
+    char identity[ANKAH_CLIENT_ID_TEXT_SIZE];
+    if (ankah_check_pass_identity(secret, host, now, pass, identity) == 0) return 0;
+    return check_legacy_pass(secret, host, now, pass);
 }

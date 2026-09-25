@@ -1,0 +1,21 @@
+%language=ANSI-C
+%readonly-tables
+%global-table
+%ignore-case
+%compare-lengths
+%compare-strncmp
+%struct-type
+%omit-struct-type
+%define lookup-function-name ankah_language_lookup
+%define hash-function-name ankah_language_hash
+%define word-array-name ankah_language_words
+%define slot-name name
+%{
+#include "language_names.h"
+%}
+struct ankah_language_keyword;
+%%
+en, ANKAH_LANGUAGE_EN
+ja, ANKAH_LANGUAGE_JA
+es, ANKAH_LANGUAGE_ES
+%%

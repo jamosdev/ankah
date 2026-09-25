@@ -4,7 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#define ANKAH_STAT_SLOTS 32
+#define ANKAH_STAT_SLOTS 48
 #define ANKAH_STAT_HOURS 720
 #define ANKAH_STAT_DAYS 4096
 #define ANKAH_TEXT_MAX (8U * 1024U * 1024U)
@@ -46,7 +46,20 @@
     SUM(upstream_latency_ms_total) \
     MAX(upstream_latency_peak_ms) \
     MAX(peak_sessions) \
-    MAX(peak_pending_bytes)
+    MAX(peak_pending_bytes) \
+    SUM(throttled_static_requests) \
+    SUM(throttled_static_bytes) \
+    SUM(throttle_queue_responses) \
+    SUM(throttle_queued_requests) \
+    SUM(throttle_wait_ms_total) \
+    MAX(throttle_wait_ms_peak) \
+    MAX(peak_throttle_connections) \
+    MAX(peak_throttle_queue) \
+    SUM(rate_limited_anonymous) \
+    SUM(rate_limited_protected) \
+    SUM(anonymous_connection_rejected) \
+    SUM(pending_connection_refused) \
+    SUM(challenge_session_rejected)
 
 enum {
 #define ANKAH_STAT_ENUM(name) ANKAH_STAT_##name,
@@ -100,10 +113,12 @@ const ankah_stat_record *ankah_stats_evicted(void);
 const ankah_stat_record *ankah_stats_hour(size_t age);
 const ankah_stat_record *ankah_stats_day(size_t age);
 
-/* The writers emit JSON members without enclosing braces so the caller can
- * add its own members. Rows are arrays of ANKAH_STAT_COUNT numbers. */
+/* The JSON writers emit members without enclosing braces so the caller can
+ * add its own members. JSON rows are arrays of ANKAH_STAT_COUNT numbers. */
 void ankah_stats_write_schema(ankah_text *out);
 void ankah_stats_write_live(ankah_text *out);
 void ankah_stats_write_history(ankah_text *out, size_t hours, size_t days);
+/* Writes a complete, non-overlapping CSV timeline through wall. */
+void ankah_stats_write_csv(ankah_text *out, uint64_t wall);
 
 #endif

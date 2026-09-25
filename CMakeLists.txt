@@ -1,10 +1,14 @@
 cmake_minimum_required(VERSION 3.20)
-project(ankah LANGUAGES C)
+project(ankah LANGUAGES C CXX)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS OFF)
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CXX_EXTENSIONS OFF)
 option(ANKAH_WASM_SOLVER "Build the browser WebAssembly solver" ON)
 option(ANKAH_STRICT_WARNINGS "Treat project compiler warnings as errors" OFF)
+option(ANKAH_STATIC_LINUX "Link the Linux executable statically" OFF)
 if(WIN32)
   set(ANKAH_BUNDLED_DEFAULT ON)
 else()
@@ -35,6 +39,7 @@ if(ANKAH_WASM_SOLVER)
   add_custom_target(ankah-browser-pow DEPENDS "${ANKAH_WASM_HEADER}")
 endif()
 include(FetchContent)
+include(ExternalProject)
 set(LLHTTP_BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
 set(LLHTTP_BUILD_STATIC_LIBS ON CACHE BOOL "" FORCE)
 FetchContent_Declare(llhttp
@@ -95,6 +100,75 @@ else()
   set(ANKAH_MBEDTLS_TLS ${MBEDTLS_LIBRARY} ${MBEDX509_LIBRARY})
 endif()
 target_link_libraries(ankah_pow PUBLIC ${ANKAH_MBEDCRYPTO})
+
+set(ANKAH_H3_SOURCE_DIR "${CMAKE_CURRENT_BINARY_DIR}/h3_sources")
+set(ANKAH_H3_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/h3_build")
+foreach(name aws_lc ngtcp2 nghttp3)
+  file(MAKE_DIRECTORY "${ANKAH_H3_SOURCE_DIR}/${name}")
+endforeach()
+set(ANKAH_H3_CMAKE_ARGS
+  -DCMAKE_BUILD_TYPE=Release
+  -DCMAKE_C_COMPILER=${CMAKE_C_COMPILER}
+  -DCMAKE_CXX_COMPILER=${CMAKE_CXX_COMPILER}
+  -DCMAKE_SYSTEM_NAME=${CMAKE_SYSTEM_NAME}
+  -DCMAKE_SYSTEM_PROCESSOR=${CMAKE_SYSTEM_PROCESSOR}
+  -DCMAKE_OSX_ARCHITECTURES=${CMAKE_OSX_ARCHITECTURES}
+  -DCMAKE_OSX_DEPLOYMENT_TARGET=${CMAKE_OSX_DEPLOYMENT_TARGET})
+if(CMAKE_TOOLCHAIN_FILE)
+  get_filename_component(ANKAH_H3_TOOLCHAIN_FILE "${CMAKE_TOOLCHAIN_FILE}"
+    ABSOLUTE BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+  list(APPEND ANKAH_H3_CMAKE_ARGS
+    -DCMAKE_TOOLCHAIN_FILE=${ANKAH_H3_TOOLCHAIN_FILE})
+endif()
+if(MINGW)
+  find_program(ANKAH_NASM nasm REQUIRED)
+  list(APPEND ANKAH_H3_CMAKE_ARGS
+    -DCMAKE_ASM_NASM_COMPILER=${ANKAH_NASM})
+endif()
+set(ANKAH_AWS_SSL "${ANKAH_H3_BUILD_DIR}/aws_lc/ssl/libssl.a")
+set(ANKAH_AWS_CRYPTO "${ANKAH_H3_BUILD_DIR}/aws_lc/crypto/libcrypto.a")
+set(ANKAH_NGTCP2 "${ANKAH_H3_BUILD_DIR}/ngtcp2/lib/libngtcp2.a")
+set(ANKAH_NGTCP2_CRYPTO
+  "${ANKAH_H3_BUILD_DIR}/ngtcp2/crypto/boringssl/libngtcp2_crypto_boringssl.a")
+set(ANKAH_NGHTTP3 "${ANKAH_H3_BUILD_DIR}/nghttp3/lib/libnghttp3.a")
+ExternalProject_Add(ankah_aws_lc
+  URL https://github.com/aws/aws-lc/archive/refs/tags/v5.4.0.tar.gz
+  URL_HASH SHA256=ef310fdb20a4172a357ab60a1adb217b21aceb34f02e29758edec5a02b1bcc0f
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  SOURCE_DIR "${ANKAH_H3_SOURCE_DIR}/aws_lc"
+  BINARY_DIR "${ANKAH_H3_BUILD_DIR}/aws_lc"
+  CMAKE_ARGS ${ANKAH_H3_CMAKE_ARGS} -DBUILD_SHARED_LIBS=OFF
+    -DBUILD_TESTING=OFF -DDISABLE_GO=ON -DDISABLE_PERL=ON
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target ssl crypto
+  BUILD_BYPRODUCTS "${ANKAH_AWS_SSL}" "${ANKAH_AWS_CRYPTO}"
+  INSTALL_COMMAND "")
+ExternalProject_Add(ankah_ngtcp2
+  DEPENDS ankah_aws_lc
+  URL https://github.com/ngtcp2/ngtcp2/releases/download/v1.25.0/ngtcp2-1.25.0.tar.xz
+  URL_HASH SHA256=2a34d2484ba17847a5d11965704e9dd0fac4c6d8efc75ffe1ec7de66d8c6b6fb
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  SOURCE_DIR "${ANKAH_H3_SOURCE_DIR}/ngtcp2"
+  BINARY_DIR "${ANKAH_H3_BUILD_DIR}/ngtcp2"
+  CMAKE_ARGS ${ANKAH_H3_CMAKE_ARGS} -DENABLE_LIB_ONLY=ON
+    -DENABLE_STATIC_LIB=ON -DENABLE_SHARED_LIB=OFF -DENABLE_OPENSSL=OFF
+    -DENABLE_BORINGSSL=ON -DBUILD_TESTING=OFF
+    -DBORINGSSL_INCLUDE_DIR=${ANKAH_H3_SOURCE_DIR}/aws_lc/include
+    -DBORINGSSL_LIBRARIES=${ANKAH_AWS_SSL}
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR>
+    --target ngtcp2_static ngtcp2_crypto_boringssl_static
+  BUILD_BYPRODUCTS "${ANKAH_NGTCP2}" "${ANKAH_NGTCP2_CRYPTO}"
+  INSTALL_COMMAND "")
+ExternalProject_Add(ankah_nghttp3
+  URL https://github.com/ngtcp2/nghttp3/releases/download/v1.18.0/nghttp3-1.18.0.tar.xz
+  URL_HASH SHA256=aad782c23d3f01bd4bb52c8bac7a553b631ef8115fd1612703df6183449fef19
+  DOWNLOAD_EXTRACT_TIMESTAMP TRUE
+  SOURCE_DIR "${ANKAH_H3_SOURCE_DIR}/nghttp3"
+  BINARY_DIR "${ANKAH_H3_BUILD_DIR}/nghttp3"
+  CMAKE_ARGS ${ANKAH_H3_CMAKE_ARGS} -DENABLE_LIB_ONLY=ON
+    -DENABLE_STATIC_LIB=ON -DENABLE_SHARED_LIB=OFF -DBUILD_TESTING=OFF
+  BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target nghttp3_static
+  BUILD_BYPRODUCTS "${ANKAH_NGHTTP3}"
+  INSTALL_COMMAND "")
 find_program(ANKAH_GPERF NAMES gperf)
 set(ANKAH_HEADER_INPUT "src/header_names.gperf")
 set(ANKAH_HEADER_OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/header_names_gperf.c")
@@ -127,9 +201,48 @@ add_custom_target(verify-header-names
   WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
   COMMENT "Verifying HTTP header classifier"
   VERBATIM)
+set(ANKAH_LANGUAGE_INPUT "src/language_names.gperf")
+set(ANKAH_LANGUAGE_OUTPUT "${CMAKE_CURRENT_SOURCE_DIR}/src/language_names_gperf.c")
+add_custom_target(regenerate-language-names
+  COMMAND "${CMAKE_COMMAND}"
+    "-DANKAH_GPERF=${ANKAH_GPERF}"
+    "-DANKAH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DANKAH_LANGUAGE_INPUT=${ANKAH_LANGUAGE_INPUT}"
+    "-DANKAH_LANGUAGE_OUTPUT=${ANKAH_LANGUAGE_OUTPUT}"
+    "-DANKAH_LANGUAGE_TEMP=${CMAKE_CURRENT_BINARY_DIR}/language_names_gperf.regenerate.tmp"
+    -DANKAH_LANGUAGE_MODE=regenerate
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_language_names.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${ANKAH_LANGUAGE_INPUT}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_language_names.cmake"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  COMMENT "Regenerating language registry"
+  VERBATIM)
+add_custom_target(verify-language-names
+  COMMAND "${CMAKE_COMMAND}"
+    "-DANKAH_GPERF=${ANKAH_GPERF}"
+    "-DANKAH_SOURCE_DIR=${CMAKE_CURRENT_SOURCE_DIR}"
+    "-DANKAH_LANGUAGE_INPUT=${ANKAH_LANGUAGE_INPUT}"
+    "-DANKAH_LANGUAGE_OUTPUT=${ANKAH_LANGUAGE_OUTPUT}"
+    "-DANKAH_LANGUAGE_TEMP=${CMAKE_CURRENT_BINARY_DIR}/language_names_gperf.verify.tmp"
+    -DANKAH_LANGUAGE_MODE=verify
+    -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_language_names.cmake"
+  DEPENDS "${CMAKE_CURRENT_SOURCE_DIR}/${ANKAH_LANGUAGE_INPUT}"
+    "${ANKAH_LANGUAGE_OUTPUT}"
+    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/regenerate_language_names.cmake"
+  WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+  COMMENT "Verifying language registry"
+  VERBATIM)
 add_library(ankah_header_names STATIC src/header_names.c src/header_names_gperf.c)
 target_include_directories(ankah_header_names PUBLIC include)
 target_include_directories(ankah_header_names PRIVATE src)
+add_library(ankah_language STATIC src/language.c src/language_names_gperf.c)
+if(CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
+  set_source_files_properties(src/language_names_gperf.c PROPERTIES
+    COMPILE_OPTIONS -Wno-unused-parameter)
+endif()
+target_include_directories(ankah_language PUBLIC include)
+target_include_directories(ankah_language PRIVATE src)
+target_link_libraries(ankah_language PUBLIC ankah_header_names)
 add_library(ankah_http STATIC src/http.c)
 target_include_directories(ankah_http PUBLIC include)
 target_link_libraries(ankah_http PUBLIC llhttp_static ankah_header_names)
@@ -151,8 +264,16 @@ else()
   find_library(LIBUV_LIBRARY uv REQUIRED)
   set(ANKAH_LIBUV ${LIBUV_LIBRARY})
 endif()
-add_executable(ankah src/main.c src/static.c src/session.c src/files.c
-  src/proxy.c src/frontend.c src/stats.c)
+add_executable(ankah src/main.c src/rate.c src/crawler.c src/static.c src/session.c src/files.c
+  src/proxy.c src/frontend.c src/h3_frontend.cpp src/stats.c src/abuse_policy.c
+  src/dots.c src/dots_policy.c)
+add_dependencies(ankah ankah_ngtcp2 ankah_nghttp3)
+target_include_directories(ankah PRIVATE
+  "${ANKAH_H3_SOURCE_DIR}/ngtcp2/lib/includes"
+  "${ANKAH_H3_SOURCE_DIR}/ngtcp2/crypto/includes"
+  "${ANKAH_H3_SOURCE_DIR}/nghttp3/lib/includes"
+  "${ANKAH_H3_SOURCE_DIR}/aws_lc/include")
+target_compile_definitions(ankah PRIVATE NGTCP2_STATICLIB NGHTTP3_STATICLIB)
 if(ANKAH_WASM_SOLVER)
   add_dependencies(ankah ankah-browser-pow)
   target_include_directories(ankah PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")
@@ -168,7 +289,19 @@ if(UNIX)
   target_compile_definitions(ankah PRIVATE _POSIX_C_SOURCE=200809L)
 endif()
 target_link_libraries(ankah PRIVATE ankah_http ankah_pow ankah_qr ${ANKAH_LIBUV}
-  ${ANKAH_MBEDTLS_TLS} ${ANKAH_NGHTTP2})
+  ${ANKAH_MBEDTLS_TLS} ${ANKAH_NGHTTP2} ankah_language
+  ${ANKAH_NGTCP2_CRYPTO} ${ANKAH_NGTCP2} ${ANKAH_NGHTTP3}
+  ${ANKAH_AWS_SSL} ${ANKAH_AWS_CRYPTO})
+if(WIN32)
+  target_link_libraries(ankah PRIVATE ws2_32 bcrypt crypt32 winpthread)
+  target_link_options(ankah PRIVATE -static -static-libgcc -static-libstdc++)
+endif()
+if(ANKAH_STATIC_LINUX)
+  if(NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "ANKAH_STATIC_LINUX requires Linux")
+  endif()
+  target_link_options(ankah PRIVATE -static)
+endif()
 add_executable(ankah-pow tests/pow_test.c)
 target_link_libraries(ankah-pow PRIVATE ankah_pow)
 add_executable(ankah-http tests/http_test.c)
@@ -176,13 +309,24 @@ target_link_libraries(ankah-http PRIVATE ankah_http)
 add_executable(ankah-header-names tests/header_names_test.c)
 target_include_directories(ankah-header-names PRIVATE src)
 target_link_libraries(ankah-header-names PRIVATE ankah_header_names)
+add_executable(ankah-language tests/language_test.c)
+target_include_directories(ankah-language PRIVATE src)
+target_link_libraries(ankah-language PRIVATE ankah_language)
 add_executable(ankah-session tests/session_test.c src/session.c)
 target_link_libraries(ankah-session PRIVATE ankah_pow)
+add_executable(ankah-rate tests/rate_test.c src/rate.c)
+target_include_directories(ankah-rate PRIVATE src)
 add_executable(ankah-stats tests/stats_test.c src/stats.c src/files.c)
 target_include_directories(ankah-stats PRIVATE include)
 target_link_libraries(ankah-stats PRIVATE ankah_pow)
 add_executable(ankah-proxy tests/proxy_test.c src/proxy.c)
 target_include_directories(ankah-proxy PRIVATE include)
+add_executable(ankah-abuse-policy tests/abuse_policy_test.c src/abuse_policy.c)
+target_include_directories(ankah-abuse-policy PRIVATE src)
+add_executable(ankah-dots-policy tests/dots_policy_test.c src/dots_policy.c)
+target_include_directories(ankah-dots-policy PRIVATE src)
+add_executable(ankah-upload-policy tests/upload_policy_test.c)
+target_include_directories(ankah-upload-policy PRIVATE src)
 if(UNIX)
   target_compile_definitions(ankah-proxy PRIVATE _POSIX_C_SOURCE=200809L)
   target_compile_definitions(ankah-stats PRIVATE _POSIX_C_SOURCE=200809L)
@@ -191,8 +335,10 @@ if(NOT ANKAH_BUNDLED_RUNTIME_DEPS)
   target_include_directories(ankah-proxy PRIVATE ${LIBUV_INCLUDE_DIR})
 endif()
 target_link_libraries(ankah-proxy PRIVATE ${ANKAH_LIBUV} ankah_header_names)
-set(ANKAH_PROJECT_TARGETS ankah ankah-pow ankah-http ankah-session ankah-proxy
-  ankah-stats ankah-header-names ankah_qr ankah_pow ankah_http ankah_header_names)
+set(ANKAH_PROJECT_TARGETS ankah ankah-pow ankah-http ankah-session ankah-rate ankah-proxy
+  ankah-upload-policy ankah-dots-policy
+  ankah-stats ankah-header-names ankah-language ankah_qr ankah_pow ankah_http
+  ankah_header_names ankah_language)
 if(ANKAH_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   foreach(target IN LISTS ANKAH_PROJECT_TARGETS)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -208,13 +354,28 @@ enable_testing()
 add_test(NAME pow COMMAND ankah-pow)
 add_test(NAME http COMMAND ankah-http)
 add_test(NAME header_names COMMAND ankah-header-names)
+add_test(NAME language COMMAND ankah-language)
 add_test(NAME session COMMAND ankah-session)
+add_test(NAME rate COMMAND ankah-rate)
 add_test(NAME proxy COMMAND ankah-proxy)
+add_test(NAME upload_policy COMMAND ankah-upload-policy)
+add_test(NAME abuse_policy COMMAND ankah-abuse-policy)
+add_test(NAME dots_policy COMMAND ankah-dots-policy)
 add_test(NAME stats COMMAND ankah-stats)
 if(NOT Python3_Interpreter_FOUND)
   find_package(Python3 COMPONENTS Interpreter)
 endif()
 if(Python3_Interpreter_FOUND)
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(ankah-crawler-dns-fixture SHARED tests/crawler_dns_fixture.c)
+    target_link_libraries(ankah-crawler-dns-fixture PRIVATE ${CMAKE_DL_LIBS})
+    set(ANKAH_CRAWLER_DNS_FIXTURE $<TARGET_FILE:ankah-crawler-dns-fixture>)
+  else()
+    set(ANKAH_CRAWLER_DNS_FIXTURE "")
+  endif()
+  add_test(NAME admission COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/admission_test.py
+    $<TARGET_FILE:ankah> ${ANKAH_CRAWLER_DNS_FIXTURE})
   add_test(NAME cache COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/cache_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
@@ -234,8 +395,34 @@ if(Python3_Interpreter_FOUND)
   add_test(NAME dashboard COMMAND ${Python3_EXECUTABLE}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/dashboard_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME health COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/health_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR}/build_static_bundle.py
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME language_integration COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/language_integration_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME upload COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/upload_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME tus COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/tus_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME shutdown COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/shutdown_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME abuse_integration COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/abuse_integration_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME dots_integration COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/dots_integration_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME configuration COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/configuration_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
   if(CMAKE_CROSSCOMPILING)
-    set_tests_properties(cache static continuation platform tls_http2 dashboard PROPERTIES
+    set_tests_properties(admission cache static continuation platform tls_http2 dashboard health
+      language_integration upload tus shutdown abuse_integration dots_integration configuration PROPERTIES
       ENVIRONMENT "ANKAH_TEST_RUNNER=${ANKAH_TEST_RUNNER};ANKAH_TEST_WINDOWS_PATHS=1")
   endif()
 endif()
@@ -249,6 +436,7 @@ if(ANKAH_WASM_SOLVER)
 endif()
 
 install(TARGETS ankah RUNTIME DESTINATION . COMPONENT ankah_runtime)
+install(FILES LICENSE docs/release-packages.md DESTINATION . COMPONENT ankah_runtime)
 install(FILES
   ankah.png
   particles.min.js
@@ -261,11 +449,15 @@ install(FILES
   DESTINATION assets COMPONENT ankah_runtime)
 install(FILES dashboard/index.html dashboard/dashboard.css dashboard/dashboard.js
   dashboard/d3-subset.min.js DESTINATION assets/dashboard COMPONENT ankah_runtime)
-install(FILES docs/windows.md DESTINATION . RENAME README-WINDOWS.md
-  COMPONENT ankah_runtime)
+if(WIN32)
+  install(FILES docs/windows.md DESTINATION . RENAME README-WINDOWS.md
+    COMPONENT ankah_runtime)
+endif()
 install(FILES docs/dashboard.md DESTINATION . RENAME DASHBOARD.md
   COMPONENT ankah_runtime)
 install(FILES docs/tls-and-proxies.md DESTINATION . RENAME TLS-AND-PROXIES.md
+  COMPONENT ankah_runtime)
+install(FILES docs/monitoring.md DESTINATION . RENAME MONITORING.md
   COMPONENT ankah_runtime)
 install(FILES PARTICLES_LICENSE.md DESTINATION notices COMPONENT ankah_runtime)
 install(FILES D3_LICENSE.md DESTINATION notices COMPONENT ankah_runtime)
@@ -278,6 +470,15 @@ install(FILES
 install(FILES
   ${stb_SOURCE_DIR}/LICENSE
   DESTINATION notices RENAME stb-LICENSE.txt COMPONENT ankah_runtime)
+install(FILES
+  "${ANKAH_H3_SOURCE_DIR}/aws_lc/LICENSE"
+  DESTINATION notices RENAME aws-lc-LICENSE.txt COMPONENT ankah_runtime)
+install(FILES
+  "${ANKAH_H3_SOURCE_DIR}/ngtcp2/COPYING"
+  DESTINATION notices RENAME ngtcp2-LICENSE.txt COMPONENT ankah_runtime)
+install(FILES
+  "${ANKAH_H3_SOURCE_DIR}/nghttp3/COPYING"
+  DESTINATION notices RENAME nghttp3-LICENSE.txt COMPONENT ankah_runtime)
 if(ANKAH_BUNDLED_RUNTIME_DEPS)
   install(FILES
     ${mbedtls_SOURCE_DIR}/LICENSE

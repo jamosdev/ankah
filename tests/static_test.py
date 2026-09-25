@@ -4,6 +4,8 @@ import hashlib
 import http.client
 import gzip
 import brotli
+import json
+import os
 import shutil
 import random
 from concurrent.futures import ThreadPoolExecutor
@@ -13,12 +15,13 @@ import subprocess
 import sys
 import tempfile
 import time
+import urllib.parse
 
 from process_support import gateway_command
 
 
-def request(port, path, method="GET", headers=None):
-    client = http.client.HTTPConnection("127.0.0.1", port, timeout=3)
+def request(port, path, method="GET", headers=None, timeout=3):
+    client = http.client.HTTPConnection("127.0.0.1", port, timeout=timeout)
     client.request(method, path, headers={"Host": f"localhost:{port}", **(headers or {})})
     reply = client.getresponse()
     result = reply.status, dict(reply.getheaders()), reply.read()
@@ -31,6 +34,30 @@ def require(condition, message):
         raise RuntimeError(message)
 
 
+def solve(challenge):
+    nonce, _, bits, _ = challenge.split(".")
+    bits = int(bits)
+    full, remainder = divmod(bits, 8)
+    for counter in range(1 << 32):
+        digest = hashlib.sha256(f"{nonce}:{counter}".encode()).digest()
+        if not any(digest[:full]) and (not remainder or digest[full] >> (8 - remainder) == 0):
+            return counter
+    raise RuntimeError("proof of work search exhausted")
+
+
+def command_line_pass(port, path):
+    status, headers, _ = request(port, path, headers={"User-Agent": "curl/8.0"})
+    require(status == 302, "throttled file did not request proof of work")
+    marker = "/ankah/blocked/run-ankah-challenge-"
+    location = headers.get("Location", "")
+    require(location.startswith(marker), "challenge redirect missing")
+    challenge = location[len(marker):]
+    query = urllib.parse.urlencode({"challenge": challenge, "answer": solve(challenge)})
+    status, headers, _ = request(port, "/ankah/open?" + query, "POST")
+    require(status == 200 and "Set-Cookie" in headers, "challenge pass was not issued")
+    return headers["Set-Cookie"].split(";", 1)[0]
+
+
 def main():
     executable, builder, assets = sys.argv[1:]
     with tempfile.TemporaryDirectory() as temporary:
@@ -41,6 +68,14 @@ def main():
         (static / "large.txt").write_bytes(body)
         (static / "app.abcdef1234.js").write_text("let value = 1;\n")
         (static / "empty.txt").write_bytes(b"")
+        downloads = static / "downloads"
+        downloads.mkdir()
+        throttled_body = random.Random(41).randbytes(250000)
+        (downloads / "one.bin").write_bytes(throttled_body)
+        (downloads / "two.bin").write_bytes(throttled_body)
+        archives = static / "archives"
+        archives.mkdir()
+        (archives / "three.bin").write_bytes(throttled_body)
         bundle = root / "bundle"
         subprocess.run([sys.executable, builder, "--project-root", str(root / "app"),
                         "--output", str(bundle)], check=True, capture_output=True)
@@ -50,6 +85,21 @@ def main():
                 "compressed variants missing")
         secret = root / "secret"
         secret.write_text("a" * 64)
+        invalid_base = ["--listen", "127.0.0.1:1", "--public-origin", "http://localhost:1",
+                        "--secret-file", str(secret), "--assets-dir", assets,
+                        "--static-bundle", str(bundle)]
+        for extra, reason in (
+                (["--static-throttle-prefix", "/static/downloads/"], "prefix without limit"),
+                (["--static-throttle-global-mbps", "1"], "limit without prefix"),
+                (["--static-throttle-prefix", "/downloads/",
+                  "--static-throttle-global-mbps", "1"], "prefix outside bundle"),
+                (["--static-throttle-prefix", "/static/downloads",
+                  "--static-throttle-global-mbps", "1"], "prefix without slash"),
+                (["--static-throttle-prefix", "/static/downloads/",
+                  "--static-throttle-global-connections", "225"], "connection reserve")):
+            result = subprocess.run(gateway_command(executable, invalid_base + extra),
+                                    capture_output=True, timeout=3)
+            require(result.returncode == 2, "invalid throttle accepted: " + reason)
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
             port = sock.getsockname()[1]
@@ -104,6 +154,15 @@ def main():
             status, _, payload = request(port, "/static/large.txt", "HEAD", {
                 "Accept-Encoding": "identity;q=0, br;q=0, gzip;q=0"})
             require(status == 406 and not payload, "unacceptable HEAD sent a body")
+            status, language_headers, payload = request(port, "/static/large.txt", "HEAD", {
+                "Accept-Encoding": "identity;q=0, br;q=0, gzip;q=0",
+                "Accept-Language": "es-MX"})
+            require(status == 406 and not payload and
+                    language_headers.get("Content-Language") == "es" and
+                    "Accept-Language" in language_headers.get("Vary", "") and
+                    int(language_headers["Content-Length"]) ==
+                    len("No hay una representación estática aceptable\n".encode()),
+                    "unacceptable HEAD language metadata differs")
             status, headers, payload = request(port, "/static/large.txt", "HEAD")
             require(status == 200 and not payload and int(headers["Content-Length"]) == len(body),
                     "HEAD failed")
@@ -200,7 +259,9 @@ def main():
 
         frontend = root / "frontend" / "dist"
         frontend.mkdir(parents=True)
-        (frontend / "index.html").write_text("<h1>Ready</h1>\n")
+        shell = b"<h1>Ready</h1>\n" * 128
+        (frontend / "index.html").write_bytes(shell)
+        (frontend / "app.js").write_text("console.log('ready');\n")
         frontend_bundle = root / "frontend-bundle"
         subprocess.run([sys.executable, builder, "--project-root", str(frontend.parent),
                         "--output", str(frontend_bundle)], check=True, capture_output=True)
@@ -208,10 +269,40 @@ def main():
                 "ANKAH_STATIC_V2\t/assets/\n"), "frontend detection failed")
         root_bundle = root / "root-bundle"
         subprocess.run([sys.executable, builder, "--project-root", str(frontend.parent),
-                        "--source", "dist", "--url-prefix", "/", "--output", str(root_bundle)],
+                        "--source", "dist", "--url-prefix", "/",
+                        "--spa-fallback", "index.html", "--output", str(root_bundle)],
                        check=True, capture_output=True)
+        require((root_bundle / "manifest.tsv").read_text().startswith(
+                "ANKAH_STATIC_V3\t/\t/index.html\n"), "root SPA metadata missing")
         require("\n/\t" in (root_bundle / "manifest.tsv").read_text(),
                 "root index alias missing")
+
+        spa_bundle = root / "spa-bundle"
+        subprocess.run([sys.executable, builder, "--project-root", str(frontend.parent),
+                        "--source", "dist", "--url-prefix", "/dashboard/",
+                        "--spa-fallback", "index.html", "--output", str(spa_bundle)],
+                       check=True, capture_output=True)
+        require((spa_bundle / "manifest.tsv").read_text().startswith(
+                "ANKAH_STATIC_V3\t/dashboard/\t/dashboard/index.html\n"),
+                "SPA fallback metadata missing")
+        broken_bundle = root / "broken-spa-bundle"
+        shutil.copytree(spa_bundle, broken_bundle)
+        broken_manifest = (broken_bundle / "manifest.tsv").read_text().splitlines(True)
+        broken_manifest[0] = "ANKAH_STATIC_V3\t/dashboard/\t/dashboard/missing.html\n"
+        (broken_bundle / "manifest.tsv").write_text("".join(broken_manifest))
+        broken = subprocess.run(
+            gateway_command(executable, ["--listen", "127.0.0.1:1",
+             "--public-origin", "http://localhost:1", "--secret-file", str(secret),
+             "--assets-dir", assets, "--static-bundle", str(broken_bundle)]),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, timeout=3)
+        require(broken.returncode != 0, "invalid SPA manifest was loaded")
+        for value in ("missing.html", "app.js", "../index.html"):
+            result = subprocess.run(
+                [sys.executable, builder, "--project-root", str(frontend.parent),
+                 "--source", "dist", "--url-prefix", "/dashboard/",
+                 "--spa-fallback", value, "--output", str(root / ("bad-" + value.replace("/", "-")))],
+                capture_output=True)
+            require(result.returncode != 0, "invalid SPA fallback was accepted: " + value)
 
         with socket.socket() as sock:
             sock.bind(("127.0.0.1", 0))
@@ -223,6 +314,9 @@ def main():
              "--static-bundle", str(root_bundle)]),
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
         )
+        navigation = {"Accept": "text/html,application/xhtml+xml;q=0.9",
+                      "Sec-Fetch-Mode": "navigate", "Sec-Fetch-Dest": "document",
+                      "User-Agent": "Mozilla/5.0"}
         try:
             for _ in range(250):
                 if root_process.poll() is not None:
@@ -234,11 +328,122 @@ def main():
                     time.sleep(0.02)
             else:
                 raise RuntimeError("root gateway did not listen")
-            require(status == 200 and payload == b"<h1>Ready</h1>\n",
+            require(status == 200 and payload == shell,
                     "root index was not served")
+            require(request(root_port, "/account/settings", headers=navigation)[0] == 428,
+                    "root SPA fallback bypassed the challenge")
         finally:
             root_process.terminate()
             root_process.wait(timeout=3)
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            spa_port = sock.getsockname()[1]
+        spa_process = subprocess.Popen(
+            gateway_command(executable, ["--listen", f"127.0.0.1:{spa_port}",
+             "--public-origin", f"http://localhost:{spa_port}",
+             "--secret-file", str(secret), "--assets-dir", assets,
+             "--static-bundle", str(spa_bundle)]),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(250):
+                if spa_process.poll() is not None:
+                    raise RuntimeError("SPA gateway exited: " + spa_process.stderr.read().decode())
+                try:
+                    status, _, _ = request(spa_port, "/dashboard/settings", headers=navigation)
+                    break
+                except OSError:
+                    time.sleep(0.02)
+            else:
+                raise RuntimeError("SPA gateway did not listen")
+            require(status == 428, "SPA fallback bypassed the challenge")
+            status, _, payload = request(spa_port, "/dashboard/index.html")
+            require(status == 200 and payload == shell,
+                    "exact SPA shell was not public")
+            status, _, payload = request(spa_port, "/dashboard/app.js")
+            require(status == 200 and payload == b"console.log('ready');\n",
+                    "exact SPA asset was not public")
+        finally:
+            spa_process.terminate()
+            spa_process.wait(timeout=3)
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            allowed_spa_port = sock.getsockname()[1]
+        allowed_spa_process = subprocess.Popen(
+            gateway_command(executable, ["--listen", f"127.0.0.1:{allowed_spa_port}",
+             "--public-origin", f"http://localhost:{allowed_spa_port}",
+             "--secret-file", str(secret), "--assets-dir", assets,
+             "--static-bundle", str(spa_bundle), "--allow-prefix", "/dashboard/",
+             "--ankah-healthz=/dashboard/health"]),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(250):
+                if allowed_spa_process.poll() is not None:
+                    raise RuntimeError("allowed SPA gateway exited: " +
+                                       allowed_spa_process.stderr.read().decode())
+                try:
+                    status, headers, payload = request(
+                        allowed_spa_port, "/dashboard/settings?tab=profile", headers=navigation)
+                    break
+                except OSError:
+                    time.sleep(0.02)
+            else:
+                raise RuntimeError("allowed SPA gateway did not listen")
+            require(status == 200 and payload == shell,
+                    "authorized SPA navigation did not receive the shell")
+            require(headers.get("Cache-Control") == "private, no-cache" and
+                    headers.get("Vary") ==
+                    "Accept, Sec-Fetch-Mode, Sec-Fetch-Dest, Accept-Encoding",
+                    "SPA fallback cache policy missing")
+            etag = headers["ETag"]
+            status, gzip_headers, payload = request(
+                allowed_spa_port, "/dashboard/compressed", headers={
+                    **navigation, "Accept-Encoding": "gzip"})
+            require(status == 200 and gzip_headers.get("Content-Encoding") == "gzip" and
+                    gzip.decompress(payload) == shell, "SPA fallback compression failed")
+            status, _, payload = request(
+                allowed_spa_port, "/dashboard/without-fetch-metadata",
+                headers={"Accept": "text/html"})
+            require(status == 200 and payload == shell,
+                    "SPA fallback required optional fetch metadata")
+            status, head_headers, payload = request(
+                allowed_spa_port, "/dashboard/settings", "HEAD", navigation)
+            require(status == 200 and not payload and
+                    int(head_headers["Content-Length"]) == len(shell),
+                    "SPA fallback HEAD failed")
+            status, _, payload = request(
+                allowed_spa_port, "/dashboard/settings", headers={
+                    **navigation, "If-None-Match": etag})
+            require(status == 304 and not payload, "SPA fallback conditional request failed")
+            negative = [
+                ("/dashboard/settings", {"Accept": "*/*"}),
+                ("/dashboard/settings", {"Accept": "text/html;q=0, */*;q=1"}),
+                ("/dashboard/settings", {**navigation, "Sec-Fetch-Dest": "script"}),
+                ("/dashboard/settings", {**navigation, "Sec-Fetch-Mode": "cors"}),
+                ("/dashboard/missing.js", navigation),
+                ("/dashboard/missing%2Ejs", navigation),
+                ("/dashboard/settings", {**navigation, "Range": "bytes=0-3"}),
+            ]
+            for path, request_headers in negative:
+                status, _, payload = request(allowed_spa_port, path, headers=request_headers)
+                require(status == 404 and payload != shell,
+                        "non-navigation request received SPA HTML: " + path)
+            status, _, payload = request(allowed_spa_port, "/dashboard/settings", "POST",
+                                         navigation)
+            require(status == 404 and payload != shell,
+                    "SPA fallback accepted POST")
+            status, _, payload = request(allowed_spa_port, "/dashboard/health",
+                                         headers=navigation)
+            require(status == 200 and payload == b"ok\n", "health route lost precedence")
+            status, _, payload = request(allowed_spa_port, "/ankah/not-a-route",
+                                         headers=navigation)
+            require(payload != shell, "internal route received SPA HTML")
+        finally:
+            allowed_spa_process.terminate()
+            allowed_spa_process.wait(timeout=3)
 
         legacy = root / "legacy-bundle"
         shutil.copytree(bundle / "files", legacy / "files")
@@ -331,6 +536,113 @@ def main():
         finally:
             cache_process.terminate()
             cache_process.wait(timeout=3)
+
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            throttle_port = sock.getsockname()[1]
+        with socket.socket() as sock:
+            sock.bind(("127.0.0.1", 0))
+            throttle_dashboard = sock.getsockname()[1]
+        throttle_token = root / "throttle-dashboard-token"
+        throttle_token.write_text("b" * 64)
+        throttle_process = subprocess.Popen(
+            gateway_command(executable, ["--listen", f"127.0.0.1:{throttle_port}",
+             "--public-origin", f"http://localhost:{throttle_port}",
+             "--secret-file", str(secret), "--assets-dir", assets,
+             "--static-bundle", str(bundle),
+             "--static-throttle-prefix", "/static/downloads/",
+             "--static-throttle-prefix", "/static/archives/",
+             "--static-throttle-global-connections", "2",
+             "--static-throttle-client-connections", "2",
+             "--static-throttle-global-mbps", "1",
+             "--static-throttle-client-mbps", "1",
+             "--dashboard-listen", f"127.0.0.1:{throttle_dashboard}",
+             "--dashboard-token-file", str(throttle_token), "--no-stats-file"]),
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
+        )
+        try:
+            for _ in range(250):
+                if throttle_process.poll() is not None:
+                    raise RuntimeError("throttle gateway exited: " +
+                                       throttle_process.stderr.read().decode())
+                try:
+                    if request(throttle_port, "/static/large.txt")[0] == 200:
+                        break
+                except OSError:
+                    time.sleep(.02)
+            else:
+                raise RuntimeError("throttle gateway did not listen")
+            cookie = command_line_pass(throttle_port, "/static/downloads/one.bin")
+            require(request(throttle_port, "/static/large.txt")[0] == 200,
+                    "unconfigured static prefix was throttled")
+            status, headers, payload = request(
+                throttle_port, "/static/downloads/one.bin", "HEAD", {"Cookie": cookie})
+            require(status == 200 and not payload and
+                    int(headers["Content-Length"]) == len(throttled_body),
+                    "throttled HEAD consumed a transfer")
+            with ThreadPoolExecutor(max_workers=3) as workers:
+                started = time.monotonic()
+                first = workers.submit(request, throttle_port, "/static/downloads/one.bin",
+                                       "GET", {"Cookie": cookie}, 6)
+                second = workers.submit(request, throttle_port, "/static/downloads/two.bin",
+                                        "GET", {"Cookie": cookie}, 6)
+                time.sleep(.15)
+                status, headers, page = request(
+                    throttle_port, "/static/archives/three.bin",
+                    headers={"Cookie": cookie, "Accept-Language": "es"})
+                require(status == 429 and headers.get("Retry-After") == "1" and
+                        headers.get("Content-Language") == "es" and
+                        b"<html lang=es>" in page and
+                        "Tu posición es 1 de 1.".encode() in page and
+                        "RateLimit" not in headers,
+                        "queued response metadata differs")
+                first_status, _, first_body = first.result()
+                second_status, _, second_body = second.result()
+            elapsed = time.monotonic() - started
+            require(first_status == 200 and second_status == 200 and
+                    first_body == throttled_body and second_body == throttled_body and
+                    elapsed >= 3.2,
+                    "aggregate bandwidth cap or transfer sharing was not enforced")
+            time.sleep(.05)
+            status, _, payload = request(throttle_port, "/static/archives/three.bin",
+                                         headers={"Cookie": cookie}, timeout=6)
+            require(status == 200 and payload == throttled_body,
+                    "queued request was not eventually admitted across prefixes")
+            status, _, payload = request(
+                throttle_dashboard, "/stats/live",
+                headers={"Authorization": "Bearer " + "b" * 64})
+            live = json.loads(payload)
+            field = {name: index for index, name in enumerate(
+                json.loads(request(throttle_dashboard, "/stats/schema", headers={
+                    "Authorization": "Bearer " + "b" * 64})[2])["fields"])}
+            require(status == 200 and live["v"] == 3 and
+                    live["cumulative"][field["throttled_static_requests"]] >= 3 and
+                    live["cumulative"][field["throttle_queue_responses"]] >= 1 and
+                    live["cumulative"][field["throttle_queued_requests"]] >= 1 and
+                    live["cumulative"][field["throttled_static_bytes"]] >=
+                    len(throttled_body) * 3 and
+                    live["gauges"]["throttle_connections"] == 0 and
+                    live["gauges"]["throttle_queue"] == 0,
+                    "throttle statistics differ")
+            # Wine cannot deliver the POSIX graceful-shutdown signal to the child.
+            if os.environ.get("ANKAH_TEST_WINDOWS_PATHS") != "1":
+                with ThreadPoolExecutor(max_workers=1) as workers:
+                    started = time.monotonic()
+                    draining = workers.submit(
+                        request, throttle_port, "/static/downloads/one.bin",
+                        "GET", {"Cookie": cookie}, 6)
+                    time.sleep(.15)
+                    throttle_process.terminate()
+                    drain_status, _, drain_body = draining.result()
+                throttle_process.wait(timeout=3)
+                require(drain_status == 200 and drain_body == throttled_body and
+                        time.monotonic() - started < 1.5 and
+                        throttle_process.returncode == 0,
+                        "shutdown did not unthrottle an active download")
+        finally:
+            if throttle_process.poll() is None:
+                throttle_process.terminate()
+                throttle_process.wait(timeout=3)
 
         compressed_digest = next(row.split("\t")[2] for row in manifest.splitlines()[1:]
                                  if row.split("\t")[1] == "gzip")

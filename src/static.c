@@ -76,23 +76,23 @@ static int parse_entry(ankah_static_entry *entry, char *line,
     unsigned long long declared_size;
     int length, encoding = 0;
     unsigned char *mapping = NULL;
-    for (i = 0; i < (version == 2 ? 5U : 4U); ++i) {
+    for (i = 0; i < (version >= 2 ? 5U : 4U); ++i) {
         fields[i] = cursor;
         separator = strchr(cursor, '\t');
         if (!separator) return -1;
         *separator = 0;
         cursor = separator + 1;
     }
-    fields[version == 2 ? 5 : 4] = cursor;
-    if (version == 2) {
+    fields[version >= 2 ? 5 : 4] = cursor;
+    if (version >= 2) {
         if (strcmp(fields[1], "gzip") == 0) encoding = 1;
         else if (strcmp(fields[1], "br") == 0) encoding = 2;
         else if (strcmp(fields[1], "identity") != 0) return -1;
     }
-    digest_field = fields[version == 2 ? 2 : 1];
-    size_field = fields[version == 2 ? 3 : 2];
-    mime_field = fields[version == 2 ? 4 : 3];
-    immutable_field = fields[version == 2 ? 5 : 4];
+    digest_field = fields[version >= 2 ? 2 : 1];
+    size_field = fields[version >= 2 ? 3 : 2];
+    mime_field = fields[version >= 2 ? 4 : 3];
+    immutable_field = fields[version >= 2 ? 5 : 4];
     variant = &entry->variants[encoding];
     if (strchr(cursor, '\t') || !digest_name(digest_field) ||
         !fields[0][0] || strlen(fields[0]) >= ANKAH_MAX_TARGET ||
@@ -163,11 +163,12 @@ void ankah_static_free(ankah_static_bundle *bundle) {
     free(bundle->entries);
     free(bundle->slots);
     free(bundle->prefix);
+    free(bundle->fallback_url);
     memset(bundle, 0, sizeof(*bundle));
 }
 
 int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
-    char path[4096], line[4098];
+    char path[4096], line[ANKAH_MAX_TARGET * 2 + 64];
     size_t line_size, capacity = 0, i;
     FILE *file = NULL;
     int length, result = -1, version;
@@ -177,12 +178,27 @@ int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
     file = fopen(path, "rb");
     if (!file) return -1;
     if (read_line(file, line, sizeof(line), &line_size) != 1 ||
-        line_size > ANKAH_MAX_TARGET + 32 ||
         (strncmp(line, "ANKAH_STATIC_V1\t", 16) != 0 &&
-         strncmp(line, "ANKAH_STATIC_V2\t", 16) != 0)) goto done;
-    version = line[14] == '2' ? 2 : 1;
+         strncmp(line, "ANKAH_STATIC_V2\t", 16) != 0 &&
+         strncmp(line, "ANKAH_STATIC_V3\t", 16) != 0)) goto done;
+    version = line[14] - '0';
+    if ((version < 3 && line_size > ANKAH_MAX_TARGET + 32) ||
+        (version == 3 && line_size > ANKAH_MAX_TARGET * 2 + 32)) goto done;
+    if (version == 3) {
+        char *separator = strchr(line + 16, '\t');
+        if (!separator || !separator[1] || strchr(separator + 1, '\t')) goto done;
+        *separator++ = 0;
+        bundle->fallback_url = copy_text(separator);
+        if (!bundle->fallback_url || strlen(bundle->fallback_url) >= ANKAH_MAX_TARGET ||
+            strchr(bundle->fallback_url, '?') || strchr(bundle->fallback_url, '#') ||
+            strchr(bundle->fallback_url, '\r') || strchr(bundle->fallback_url, '\n'))
+            goto done;
+    }
     bundle->prefix = copy_text(line + 16);
-    if (!bundle->prefix || !valid_prefix(bundle->prefix)) goto done;
+    if (!bundle->prefix || !valid_prefix(bundle->prefix) ||
+        (bundle->fallback_url &&
+         strncmp(bundle->fallback_url, bundle->prefix, strlen(bundle->prefix)) != 0))
+        goto done;
     while ((length = read_line(file, line, sizeof(line), &line_size)) > 0) {
         ankah_static_entry *next;
         if (line_size > 4096) goto done;
@@ -222,6 +238,12 @@ int ankah_static_load(ankah_static_bundle *bundle, const char *directory) {
         }
         bundle->slots[slot] = i + 1;
     }
+    if (bundle->fallback_url) {
+        const ankah_static_entry *fallback =
+            ankah_static_find(bundle, bundle->fallback_url);
+        if (!fallback || (strcmp(fallback->mime, "text/html") != 0 &&
+            strncmp(fallback->mime, "text/html;", 10) != 0)) goto done;
+    }
     result = 0;
 done:
     fclose(file);
@@ -240,6 +262,11 @@ const ankah_static_entry *ankah_static_find(const ankah_static_bundle *bundle,
         slot = (slot + 1) & (bundle->slot_count - 1);
     }
     return NULL;
+}
+
+const ankah_static_entry *ankah_static_fallback(const ankah_static_bundle *bundle) {
+    if (!bundle->fallback_url) return NULL;
+    return ankah_static_find(bundle, bundle->fallback_url);
 }
 
 int ankah_static_in_namespace(const ankah_static_bundle *bundle, const char *url) {

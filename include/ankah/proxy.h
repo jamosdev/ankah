@@ -13,6 +13,7 @@ typedef struct {
 } ankah_network;
 
 int ankah_parse_network(const char *text, ankah_network *out);
+int ankah_peer_is_trusted(const char *peer, const ankah_network *trusted, size_t count);
 int ankah_normalize_ip(const char *text, char *out, size_t capacity);
 int ankah_resolve_client_ip(const ankah_request *request, const char *peer,
                             const ankah_network *trusted, size_t trusted_count,

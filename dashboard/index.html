@@ -1,13 +1,13 @@
 <!doctype html>
-<html lang="en">
+<html lang="<!--#echo var="language_tag" -->">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Ankah dashboard</title>
-<link rel="stylesheet" href="/dashboard/dashboard.css">
-<script src="/dashboard/d3-subset.min.js" defer></script>
-<script src="/dashboard/particles.min.js" defer></script>
-<script src="/dashboard/dashboard.js" defer></script>
+<title><!--#echo var="title" --></title>
+<link rel="stylesheet" href="dashboard/dashboard.css">
+<script src="dashboard/d3-subset.min.js" defer></script>
+<script src="dashboard/particles.min.js" defer></script>
+<script src="dashboard/dashboard.js" defer></script>
 </head>
 <body>
 <div id="particles" aria-hidden="true"></div>
@@ -15,89 +15,143 @@
   <header class="masthead">
     <div>
       <h1>Ankah</h1>
-      <p id="status" class="status" role="status">Starting</p>
+      <p id="status" class="status" role="status"><!--#echo var="starting" --></p>
     </div>
     <div class="actions">
-      <button type="button" id="mask" aria-pressed="false">Mask addresses</button>
-      <button type="button" id="theme">Light theme</button>
+      <button type="button" id="setup" hidden><!--#echo var="setup_authenticator" --></button>
+      <button type="button" id="signout" hidden><!--#echo var="sign_out" --></button>
+      <button type="button" id="export" class="export-button" hidden
+              aria-label="<!--#echo var="download_metrics_csv" -->"
+              title="<!--#echo var="download_metrics_csv" -->">
+        <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+          <path class="export-sheet" d="M7 2h10l4 4v16H7z"/>
+          <path class="export-grid" d="M11 9h7M11 13h7M11 17h7M14 7v12"/>
+          <path class="export-badge" d="M2 6h10v12H2z"/>
+          <path class="export-x" d="m5 9 4 6m0-6-4 6"/>
+        </svg>
+      </button>
+      <button type="button" id="mask" aria-pressed="false"><!--#echo var="mask_addresses" --></button>
+      <button type="button" id="theme"><!--#echo var="light_theme" --></button>
     </div>
   </header>
 
   <form id="login" class="card login" hidden>
-    <h2>Dashboard token</h2>
-    <p id="login-message" class="label">Enter the token from the dashboard token file.</p>
-    <label for="token" class="label">Token</label>
-    <input id="token" name="token" type="password" autocomplete="off" spellcheck="false"
-           pattern="[0-9a-f]{64}" title="64 lowercase hexadecimal characters" required>
-    <div><button type="submit">Open dashboard</button></div>
+    <h2><!--#echo var="authenticator_code" --></h2>
+    <p id="login-message" class="label"><!--#echo var="enter_code" --></p>
+    <label for="code" class="label"><!--#echo var="code" --></label>
+    <input id="code" name="code" type="text" inputmode="numeric" autocomplete="one-time-code"
+           pattern="[0-9]{6}" maxlength="6" required>
+    <div><button type="submit"><!--#echo var="open_dashboard" --></button></div>
   </form>
+  <form id="token-login" class="card login" hidden>
+    <h2><!--#echo var="dashboard_token" --></h2>
+    <p class="label"><!--#echo var="enter_token" --></p>
+    <label for="token" class="label"><!--#echo var="token" --></label>
+    <input id="token" name="token" type="password" autocomplete="off" spellcheck="false"
+           pattern="[0-9a-f]{64}" title="<!--#echo var="token_format" -->" required>
+    <div><button type="submit"><!--#echo var="open_dashboard" --></button></div>
+  </form>
+  <button type="button" id="login-mode" class="login-mode" hidden><!--#echo var="use_dashboard_token" --></button>
+
+  <dialog id="setup-dialog" aria-labelledby="setup-title">
+    <h2 id="setup-title"><!--#echo var="setup_authenticator" --></h2>
+    <p class="label"><!--#echo var="scan_authenticator" --></p>
+    <img id="setup-qr" alt="<!--#echo var="setup_qr_alt" -->" width="240" height="240">
+    <button type="button" id="setup-close"><!--#echo var="close" --></button>
+  </dialog>
 
   <main id="main" hidden>
-    <section class="now" aria-label="Now">
+    <section class="now" aria-label="<!--#echo var="now" -->">
       <div class="card">
-        <p class="label">Throughput to clients now</p>
-        <p class="hero-value" id="hero-value">Measuring</p>
+        <p class="label"><!--#echo var="throughput_now" --></p>
+        <p class="hero-value" id="hero-value"><!--#echo var="measuring" --></p>
         <p class="note" id="hero-note"></p>
       </div>
       <div class="card meters">
         <div class="meter" id="meter-connections">
-          <div class="meter-head"><span class="label">Connections</span><span class="meter-value"></span></div>
+          <div class="meter-head"><span class="label"><!--#echo var="connections" --></span><span class="meter-value"></span></div>
           <div class="track"><div class="fill"></div></div>
           <p class="note meter-note"></p>
         </div>
         <div class="meter" id="meter-pending">
-          <div class="meter-head"><span class="label">Saved POST memory</span><span class="meter-value"></span></div>
+          <div class="meter-head"><span class="label"><!--#echo var="saved_post_memory" --></span><span class="meter-value"></span></div>
           <div class="track"><div class="fill"></div></div>
           <p class="note meter-note"></p>
         </div>
         <div class="meter" id="meter-cache">
-          <div class="meter-head"><span class="label">Static cache</span><span class="meter-value"></span></div>
+          <div class="meter-head"><span class="label"><!--#echo var="static_cache" --></span><span class="meter-value"></span></div>
+          <div class="track"><div class="fill"></div></div>
+          <p class="note meter-note"></p>
+        </div>
+        <div class="meter" id="meter-throttle-connections">
+          <div class="meter-head"><span class="label"><!--#echo var="throttle_connections" --></span><span class="meter-value"></span></div>
+          <div class="track"><div class="fill"></div></div>
+          <p class="note meter-note"></p>
+        </div>
+        <div class="meter" id="meter-throttle-queue">
+          <div class="meter-head"><span class="label"><!--#echo var="download_queue" --></span><span class="meter-value"></span></div>
           <div class="track"><div class="fill"></div></div>
           <p class="note meter-note"></p>
         </div>
       </div>
     </section>
 
-    <nav class="filters" aria-label="Time range">
-      <button type="button" data-range="live" aria-pressed="true">Live</button>
-      <button type="button" data-range="24h" aria-pressed="false">24 hours</button>
-      <button type="button" data-range="7d" aria-pressed="false">7 days</button>
-      <button type="button" data-range="30d" aria-pressed="false">30 days</button>
-      <button type="button" data-range="all" aria-pressed="false">All</button>
+    <nav class="filters" aria-label="<!--#echo var="time_range" -->">
+      <button type="button" data-range="live" aria-pressed="true"><!--#echo var="live" --></button>
+      <button type="button" data-range="24h" aria-pressed="false"><!--#echo var="hours_24" --></button>
+      <button type="button" data-range="7d" aria-pressed="false"><!--#echo var="days_7" --></button>
+      <button type="button" data-range="30d" aria-pressed="false"><!--#echo var="days_30" --></button>
+      <button type="button" data-range="all" aria-pressed="false"><!--#echo var="all" --></button>
       <span class="note" id="range-note"></span>
     </nav>
 
-    <section class="kpis" aria-label="Summary">
+    <section class="kpis" aria-label="<!--#echo var="summary" -->">
       <article class="card" id="tile-connections">
         <p class="label"></p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
       </article>
       <article class="card" id="tile-requests">
-        <p class="label">Requests per second</p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+        <p class="label"><!--#echo var="requests_per_second" --></p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
       </article>
       <article class="card" id="tile-challenges">
-        <p class="label">Challenge pass rate</p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+        <p class="label"><!--#echo var="challenge_pass_rate" --></p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
       </article>
       <article class="card" id="tile-latency">
-        <p class="label">Mean upstream latency</p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+        <p class="label"><!--#echo var="mean_upstream_latency" --></p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+      </article>
+      <article class="card" id="tile-throttle">
+        <p class="label"><!--#echo var="throttle_throughput" --></p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
+      </article>
+      <article class="card" id="tile-queue-wait">
+        <p class="label"><!--#echo var="mean_queue_wait" --></p><p class="tile-value"></p><svg class="spark" aria-hidden="true"></svg>
       </article>
     </section>
 
     <div class="charts">
       <section class="card" id="chart-throughput">
         <div class="chart-head">
-          <h2>Throughput</h2>
-          <button type="button" class="table-toggle" aria-pressed="false">Table</button>
+          <h2><!--#echo var="throughput" --></h2>
+          <button type="button" class="table-toggle" aria-pressed="false"><!--#echo var="table" --></button>
         </div>
         <div class="legend"></div>
         <div class="plot"></div>
         <div class="table-wrap" hidden></div>
-        <p class="note">The gap between the lines is traffic Ankah served itself: challenge pages, its own files and packaged static files.</p>
+        <p class="note"><!--#echo var="throughput_note" --></p>
       </section>
 
       <section class="card" id="chart-connections">
         <div class="chart-head">
-          <h2 id="connections-title">Connections</h2>
-          <button type="button" class="table-toggle" aria-pressed="false">Table</button>
+          <h2 id="connections-title"><!--#echo var="connections" --></h2>
+          <button type="button" class="table-toggle" aria-pressed="false"><!--#echo var="table" --></button>
+        </div>
+        <div class="legend"></div>
+        <div class="plot"></div>
+        <div class="table-wrap" hidden></div>
+      </section>
+
+      <section class="card" id="chart-throttle">
+        <div class="chart-head">
+          <h2><!--#echo var="download_throttle" --></h2>
+          <button type="button" class="table-toggle" aria-pressed="false"><!--#echo var="table" --></button>
         </div>
         <div class="legend"></div>
         <div class="plot"></div>
@@ -106,22 +160,22 @@
 
       <section class="card" id="chart-heatmap">
         <div class="chart-head">
-          <h2>Bytes to clients by hour</h2>
-          <button type="button" class="table-toggle" aria-pressed="false">Table</button>
+          <h2><!--#echo var="bytes_by_hour" --></h2>
+          <button type="button" class="table-toggle" aria-pressed="false"><!--#echo var="table" --></button>
         </div>
         <div class="plot"></div>
         <div class="table-wrap" hidden></div>
         <div class="scale"></div>
-        <p class="note">Cells are UTC hours placed at their local start time. Hourly detail covers the last 30 days.</p>
+        <p class="note"><!--#echo var="heatmap_note" --></p>
       </section>
     </div>
 
     <section class="card connections" aria-labelledby="connections-heading">
-      <h2 id="connections-heading">Open connections now</h2>
+      <h2 id="connections-heading"><!--#echo var="open_connections_now" --></h2>
       <div class="table-wrap">
         <table>
           <thead>
-            <tr><th>Address</th><th>State</th><th class="number">Age</th><th class="number">In</th><th class="number">Out</th></tr>
+            <tr><th><!--#echo var="address" --></th><th><!--#echo var="state" --></th><th class="number"><!--#echo var="age" --></th><th class="number"><!--#echo var="in" --></th><th class="number"><!--#echo var="out" --></th></tr>
           </thead>
           <tbody id="connections-body"></tbody>
         </table>
@@ -132,9 +186,96 @@
     <footer class="card footer">
       <p class="note" id="epoch-note"></p>
       <p class="persistence-warning" id="persistence-warning" role="status" hidden></p>
-      <button type="button" id="reset">Reset statistics</button>
+      <button type="button" id="reset"><!--#echo var="reset_statistics" --></button>
     </footer>
   </main>
+  <div id="language-text" hidden>
+    <span data-name="age_seconds"><!--#echo var="age_seconds" --></span>
+    <span data-name="age_minutes"><!--#echo var="age_minutes" --></span>
+    <span data-name="age_hours"><!--#echo var="age_hours" --></span>
+    <span data-name="age_days"><!--#echo var="age_days" --></span>
+    <span data-name="range_live_words"><!--#echo var="range_live_words" --></span>
+    <span data-name="range_live_note"><!--#echo var="range_live_note" --></span>
+    <span data-name="range_24h_words"><!--#echo var="range_24h_words" --></span>
+    <span data-name="range_24h_note"><!--#echo var="range_24h_note" --></span>
+    <span data-name="range_7d_words"><!--#echo var="range_7d_words" --></span>
+    <span data-name="range_7d_note"><!--#echo var="range_7d_note" --></span>
+    <span data-name="range_30d_words"><!--#echo var="range_30d_words" --></span>
+    <span data-name="range_30d_note"><!--#echo var="range_30d_note" --></span>
+    <span data-name="range_all_words"><!--#echo var="range_all_words" --></span>
+    <span data-name="range_all_note"><!--#echo var="range_all_note" --></span>
+    <span data-name="reading_request"><!--#echo var="reading_request" --></span>
+    <span data-name="responding"><!--#echo var="responding" --></span>
+    <span data-name="sending_file"><!--#echo var="sending_file" --></span>
+    <span data-name="receiving_body"><!--#echo var="receiving_body" --></span>
+    <span data-name="connecting_upstream"><!--#echo var="connecting_upstream" --></span>
+    <span data-name="forwarding"><!--#echo var="forwarding" --></span>
+    <span data-name="websocket_tunnel"><!--#echo var="websocket_tunnel" --></span>
+    <span data-name="waiting_token"><!--#echo var="waiting_token" --></span>
+    <span data-name="token_rejected"><!--#echo var="token_rejected" --></span>
+    <span data-name="connection_lost"><!--#echo var="connection_lost" --></span>
+    <span data-name="paused"><!--#echo var="paused" --></span>
+    <span data-name="live_updated"><!--#echo var="live_updated" --></span>
+    <span data-name="connecting"><!--#echo var="connecting" --></span>
+    <span data-name="so_far"><!--#echo var="so_far" --></span>
+    <span data-name="range_between"><!--#echo var="range_between" --></span>
+    <span data-name="average_before"><!--#echo var="average_before" --></span>
+    <span data-name="peak_before"><!--#echo var="peak_before" --></span>
+    <span data-name="statistics_since"><!--#echo var="statistics_since" --></span>
+    <span data-name="measuring"><!--#echo var="measuring" --></span>
+    <span data-name="served_itself"><!--#echo var="served_itself" --></span>
+    <span data-name="nothing_sent"><!--#echo var="nothing_sent" --></span>
+    <span data-name="of"><!--#echo var="of" --></span>
+    <span data-name="disabled"><!--#echo var="disabled" --></span>
+    <span data-name="at_limit"><!--#echo var="at_limit" --></span>
+    <span data-name="approaching_limit"><!--#echo var="approaching_limit" --></span>
+    <span data-name="tls_open"><!--#echo var="tls_open" --></span>
+    <span data-name="saved_sessions"><!--#echo var="saved_sessions" --></span>
+    <span data-name="no_waits"><!--#echo var="no_waits" --></span>
+    <span data-name="active_downloads"><!--#echo var="active_downloads" --></span>
+    <span data-name="queued_downloads"><!--#echo var="queued_downloads" --></span>
+    <span data-name="throttle_capacity_label"><!--#echo var="throttle_capacity_label" --></span>
+    <span data-name="active"><!--#echo var="active" --></span>
+    <span data-name="queued"><!--#echo var="queued" --></span>
+    <span data-name="peak_active"><!--#echo var="peak_active" --></span>
+    <span data-name="peak_queued"><!--#echo var="peak_queued" --></span>
+    <span data-name="connections"><!--#echo var="connections" --></span>
+    <span data-name="peak_connections"><!--#echo var="peak_connections" --></span>
+    <span data-name="none_issued"><!--#echo var="none_issued" --></span>
+    <span data-name="no_responses"><!--#echo var="no_responses" --></span>
+    <span data-name="not_enough_data"><!--#echo var="not_enough_data" --></span>
+    <span data-name="no_data"><!--#echo var="no_data" --></span>
+    <span data-name="to_clients"><!--#echo var="to_clients" --></span>
+    <span data-name="to_clients_lower"><!--#echo var="to_clients_lower" --></span>
+    <span data-name="from_application"><!--#echo var="from_application" --></span>
+    <span data-name="from_application_lower"><!--#echo var="from_application_lower" --></span>
+    <span data-name="average_before_history"><!--#echo var="average_before_history" --></span>
+    <span data-name="throughput_label"><!--#echo var="throughput_label" --></span>
+    <span data-name="time"><!--#echo var="time" --></span>
+    <span data-name="peak_before_history"><!--#echo var="peak_before_history" --></span>
+    <span data-name="open_connections"><!--#echo var="open_connections" --></span>
+    <span data-name="peak_connections_period"><!--#echo var="peak_connections_period" --></span>
+    <span data-name="open"><!--#echo var="open" --></span>
+    <span data-name="peak"><!--#echo var="peak" --></span>
+    <span data-name="hour_starting"><!--#echo var="hour_starting" --></span>
+    <span data-name="bytes_to_clients"><!--#echo var="bytes_to_clients" --></span>
+    <span data-name="no_hourly_data"><!--#echo var="no_hourly_data" --></span>
+    <span data-name="heatmap_label"><!--#echo var="heatmap_label" --></span>
+    <span data-name="no_open_connections"><!--#echo var="no_open_connections" --></span>
+    <span data-name="more_connections"><!--#echo var="more_connections" --></span>
+    <span data-name="light_theme"><!--#echo var="light_theme" --></span>
+    <span data-name="dark_theme"><!--#echo var="dark_theme" --></span>
+    <span data-name="confirm_reset"><!--#echo var="confirm_reset" --></span>
+    <span data-name="reset_statistics"><!--#echo var="reset_statistics" --></span>
+    <span data-name="persistence_failed"><!--#echo var="persistence_failed" --></span>
+    <span data-name="token_invalid"><!--#echo var="token_invalid" --></span>
+    <span data-name="enter_token"><!--#echo var="enter_token" --></span>
+    <span data-name="enter_code"><!--#echo var="enter_code" --></span>
+    <span data-name="code_rejected"><!--#echo var="code_rejected" --></span>
+    <span data-name="too_many_codes"><!--#echo var="too_many_codes" --></span>
+    <span data-name="use_dashboard_token"><!--#echo var="use_dashboard_token" --></span>
+    <span data-name="use_authenticator_code"><!--#echo var="use_authenticator_code" --></span>
+  </div>
 </div>
 </body>
 </html>

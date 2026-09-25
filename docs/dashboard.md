@@ -1,12 +1,14 @@
 # Operator dashboard
 
-Ankah can collect traffic statistics and serve them on a separate listener.
-The feature is off by default. Without `--dashboard-listen` Ankah opens no
-extra socket, starts no timer, and keeps no counters.
+Ankah can collect traffic statistics and serve them on a private listener or
+under an explicit route on its public listener. The feature is off by default.
+Without a dashboard listener or public route Ankah starts no timer and keeps no
+counters.
 
 ## Enabling it
 
-Both options are required together:
+The dashboard token file is required with either listener option. The private
+listener remains the most isolated deployment:
 
 ```sh
 python3 -c 'import secrets; print(secrets.token_hex(32))' > dashboard.token
@@ -22,8 +24,25 @@ hexadecimal characters with an optional trailing newline. Ankah refuses to
 start when the token equals the gateway secret, because the token travels in
 request headers and the secret must not.
 
-Every `/stats/` request needs `Authorization: Bearer <token>`. Ankah compares
-the token in constant time and answers `401` otherwise.
+Every `/stats/` request and `GET /metrics` needs
+`Authorization: Bearer <token>`. Ankah compares
+the token in constant time and answers `401` otherwise. Dashboard sessions
+issued after authenticator sign-in also work as bearer credentials.
+
+For a simple same-host setup, mount the dashboard under a distinct public
+prefix instead of creating a second listener:
+
+```sh
+./ankah --listen 0.0.0.0:8000 --public-origin https://example.test \
+  --secret-file ankah.secret \
+  --dashboard-public-route=/ankah-admin/ --dashboard-token-file dashboard.token \
+  -- python3 -m uvicorn app:app --port 8001
+```
+
+The route must be a non-root path with leading and trailing slashes. Ankah
+reserves it and rejects startup if it conflicts with a configured health route
+or packaged static namespace. The private listener and public route may be
+enabled together.
 
 ## Where to bind it
 
@@ -67,35 +86,92 @@ Do not expose the dashboard port through a Service; use
 
 ## The page
 
-Open the listener's root in a browser. Put the token in the address after a
+Open the listener's root in a browser. The page first asks for a six-digit
+authenticator code. To set that up, choose **Use dashboard token**, enter the
+token once, then choose **Set up authenticator** and scan the QR code with a
+TOTP app. Future visits can use the app's code. Keep the dashboard token as a
+recovery credential. Rotating that token also changes the authenticator setup,
+so scan the new QR code after rotation.
+
+You can put the token in the address after a
 `#`, as in `http://127.0.0.1:9000/#token=<token>`, or paste it into the form
 the page shows. The page moves the token into session storage and removes it
 from the address bar, so it does not stay in history. Fragments are never sent
 to the server.
 
+With `--dashboard-public-route=/ankah-admin/`, open
+`https://example.test/ankah-admin/`. The entry page and its assets live under
+that prefix, including `/ankah-admin/dashboard/dashboard.js`. They use normal
+public Host checks, rate limits, proof-of-work, and traffic accounting. The
+page's API calls stay under the prefix, such as
+`/ankah-admin/stats/live` and `/ankah-admin/metrics`, require the bearer token,
+bypass proof-of-work, and are excluded from the statistics they display.
+`/ankah-admin` redirects to the slash-terminated entry URL.
+
+The page keeps the bearer token or temporary session in session storage for
+its origin until the browser tab closes. Authenticator sessions expire after
+12 hours, are revoked on sign-out, and are lost when Ankah restarts. Each code
+can open one session;
+there are at most five unsuccessful code attempts per minute for the process.
+Authenticator sign-in is an alternative to entering the bearer token, not an
+additional factor. Use HTTPS for a public dashboard route and do not serve
+untrusted same-origin scripts, because they can access session storage.
+
 The page polls `/stats/live` once a second while its tab is visible. It shows
-throughput now, the three bounded resources against their limits, a summary
-and charts for the chosen range, bytes sent per hour as a day by hour grid,
-and the busiest open connections. Every chart has a table view. Addresses can
-be masked on screen. A reset asks for a second click before it clears the
-statistics.
+throughput now, bounded resources against their limits, a summary and charts
+for the chosen range, static download throttle activity, bytes sent per hour
+as a day by hour grid, and the busiest open connections. Every chart has a
+table view. The green spreadsheet button downloads the complete retained
+metrics history as CSV. Addresses can be masked on screen. A reset asks for a
+second click before it clears the statistics.
 
 The page files load from the `dashboard` directory inside `--assets-dir` when
 the dashboard is enabled, and Ankah refuses to start if they are missing. The
-public listener never serves them. The page is served with a policy that
-allows only its own scripts, styles and requests.
+public listener does not serve them unless a dashboard public route is
+configured, and that route serves only its own prefixed copies. The page is
+served with a policy that allows only its own scripts, styles and requests.
+
+Dashboard text follows the request's `Accept-Language` preference and the page
+response includes `Content-Language` and `Vary: Accept-Language`. The source
+catalog supports English (`en`), Japanese (`ja`), and Spanish (`es`).
+Dates and numbers follow the selected language. The source
+HTML uses a restricted SSI form, `<!--#echo var="name" -->`, for localized
+text. Ankah resolves only names in its compiled language catalog. Any `<!--#`
+directive that does not match this form, including includes, commands,
+environment variables, and unknown names, makes startup fail. Runtime messages
+in `dashboard.js` read the catalog rendered into the page.
 
 ## Endpoints
 
-All responses are JSON with `Cache-Control: no-store`. Statistics records are
-arrays of 32 numbers in the order given by `/stats/schema`.
+Responses under `/stats/` are JSON except for the CSV export. The metrics
+response uses Prometheus text format. On a public route, prepend the configured
+prefix to every endpoint below. Every response uses
+`Cache-Control: no-store`. Statistics records are arrays of 40 numbers in the
+order given by `/stats/schema`. The JSON schema version is 3.
 
 | Request | Returns |
 | --- | --- |
 | `GET /stats/schema` | field names, `sum` or `max` kinds, ring sizes, limits |
 | `GET /stats/live` | gauges, cumulative and current bucket records, recent buckets, busiest connections |
 | `GET /stats/history?hours=H&days=D` | up to `H` completed hours and `D` completed days, oldest first |
+| `GET /stats/export.csv` | complete retained metrics as a non-overlapping CSV timeline |
 | `POST /stats/reset` | clears every counter and moves the statistics epoch to now |
+| `GET /metrics` | cumulative counters, current and peak gauges, limits, latency, and the epoch in Prometheus text format |
+| `GET /auth/qr` | authenticator setup QR code; requires the dashboard token |
+| `POST /auth/login` | exchange a six-digit `X-Ankah-Code` header for a temporary bearer session |
+| `POST /auth/logout` | revoke a temporary bearer session |
+
+The metrics response excludes history, request paths, and connection
+addresses. Dashboard and metrics requests are not included in the public
+traffic statistics. See [external health monitoring](monitoring.md) for a
+Prometheus scrape configuration and external monitor deployment.
+
+The CSV starts with any aggregate for days older than the retained daily ring,
+continues with daily rows, then switches to hourly rows at a UTC midnight. The
+last row is the current partial hour. Its stable columns identify the record
+type, UTC period, partial status and bucket count, followed by every raw field
+from `/stats/schema`. Exporting reads the current in-memory history without
+resetting counters or forcing a snapshot write.
 
 `/stats/live` takes no parameters, so one rendering serves every viewer that
 polls within 250 milliseconds. It carries the last two completed hours and the
@@ -117,9 +193,15 @@ rest. Request paths are never included.
 | `upstream_bytes_in`, `upstream_bytes_out` | bytes read from and written to the application |
 | `accepted`, `refused`, `peak_connections` | client connections, including those refused at the limit |
 | `requests`, `responses_2xx` to `responses_5xx`, `rate_limited` | request header blocks received, and responses by class |
+| `rate_limited_anonymous`, `rate_limited_protected` | request rate rejections in each admission class |
+| `anonymous_connection_rejected`, `pending_connection_refused`, `challenge_session_rejected` | admission capacity rejections |
 | `challenges_issued`, `challenges_solved`, `challenges_failed`, `passes_issued`, `qr_scans` | proof of work outcomes |
 | `posts_saved`, `posts_replayed` | POST bodies held for continuation, and replays |
 | `static_requests`, `static_bytes`, `cache_hits`, `cache_misses` | packaged static serving |
+| `throttled_static_requests`, `throttled_static_bytes` | packaged static responses admitted through the download throttle |
+| `throttle_queue_responses`, `throttle_queued_requests` | 429 queue pages and downloads admitted after waiting |
+| `throttle_wait_ms_total`, `throttle_wait_ms_peak` | total and peak wait before throttle admission |
+| `peak_throttle_connections`, `peak_throttle_queue` | peak active throttled transfers and queue entries |
 | `upstream_requests`, `upstream_failures`, `upstream_responses` | application connections and their outcomes |
 | `upstream_latency_ms_total`, `upstream_latency_peak_ms` | time to the first response byte; the mean is the total over `upstream_responses` |
 | `peak_sessions`, `peak_pending_bytes` | challenge sessions and saved POST memory |
@@ -153,8 +235,8 @@ Ankah keeps 720 hourly records (30 days) and 4096 daily records (about 11
 years). Hours older than the hourly ring are dropped because the daily records
 still cover them. Days older than the daily ring are merged into a single
 `evicted` record, by sum or by maximum per field, and `evicted_days` counts
-them, so the average before the ring stays exact. Each record is 256 bytes, so
-the whole store is about 1.2 MiB and never grows.
+them, so the average before the ring stays exact. Each record is 320 bytes, so
+the whole store is about 1.5 MiB and never grows.
 
 Counters are 64 bit and are never reset automatically. `POST /stats/reset`
 starts a new epoch.
@@ -169,9 +251,12 @@ options are valid only when the dashboard is enabled.
 
 Ankah keeps two generations named with `.0` and `.1` suffixes and uses a
 `.tmp` file while replacing one. At most three snapshots exist, for a maximum
-of about 3.7 MiB. A crash can lose up to 15 minutes of recent counts. A normal
-restart restores the newest valid generation and retains its epoch and
-history.
+of about 5 MiB. A crash can lose up to 15 minutes of recent counts. Version
+1 snapshots with 32 fields are migrated in memory, preserving their existing
+history and starting the eight throttle fields at zero. Version 2 snapshots
+with 40 fields also migrate in memory, starting the five admission fields at
+zero. A normal restart restores the newest valid generation and retains its
+epoch and history.
 
 Missing, unreadable, incompatible, or corrupt snapshots do not prevent Ankah
 from starting. It falls back to an older valid generation or an empty store

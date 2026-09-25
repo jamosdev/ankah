@@ -1,0 +1,43 @@
+# Explicit Anubis policy for the dots-benchmark demo. Nothing is imported
+# from the built-in policy, so behaviour does not depend on upstream
+# defaults. The first matching rule wins.
+bots:
+  # Readiness checks reach the backend health route only.
+  - name: health
+    path_regex: ^/healthz$
+    action: ALLOW
+  # The legitimate probe is let through, as a known good client would be.
+  - name: dots-demo-legit
+    user_agent_regex: ^dots-demo-legit
+    action: ALLOW
+  # The load generator always gets the proof-of-work challenge page.
+  - name: dots-demo-attacker
+    user_agent_regex: ^dots-demo-attacker
+    action: CHALLENGE
+    challenge:
+      algorithm: fast
+      difficulty: 4
+  # Everything else is challenged too.
+  - name: everyone-else
+    path_regex: .*
+    action: CHALLENGE
+    challenge:
+      algorithm: fast
+      difficulty: 4
+
+dnsbl: false
+
+# 428 matches what Ankah returns to an unsolved client, so both protection
+# layers report a challenge with the same status code.
+status_codes:
+  CHALLENGE: 428
+  DENY: 403
+
+store:
+  backend: memory
+  parameters: {}
+
+thresholds:
+  - name: no-weighting
+    expression: "true"
+    action: ALLOW

@@ -13,6 +13,9 @@ cmake -S . -B build-windows -G Ninja \
 cmake --build build-windows
 ```
 
+The Python test runner also needs `Brotli==1.2.0` and `hpack==4.2.0`, or
+the distribution's `python3-brotli` and `python3-hpack` packages.
+
 Clang and LLD build the browser WebAssembly solver on the build host. Set
 `-DANKAH_WASM_SOLVER=OFF` when those tools are unavailable.
 
@@ -56,5 +59,9 @@ ankah.exe --listen 127.0.0.1:8000 --upstream 127.0.0.1:8001 ^
 ```
 
 The secret format and all other command line options are the same as on Linux.
-The continuous integration Windows job retains this package as a zip file for
-seven days.
+`--config path` reads the same `key=value` format described in the main README.
+Relative paths in that file are resolved from the configuration file's
+directory and normalized to absolute Windows paths.
+The latest versioned package is available from the
+[GitHub releases page](https://github.com/jamosdev/ankah/releases/latest).
+The release pipeline also retains a temporary job artifact for 30 days.

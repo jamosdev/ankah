@@ -1,3 +1,5 @@
+// SPDX-License-Identifier: LGPL-3.0-only
+
 "use strict";
 
 (function () {
@@ -5,16 +7,28 @@
   const DAY = 86400;
   const POLL_MS = 1000;
   const LIVE_SAMPLES = 300;
+  const locale = document.documentElement.lang || "en";
+  const languageText = new Map([...document.querySelectorAll("#language-text [data-name]")]
+    .map((node) => [node.dataset.name, node.textContent]));
+  const text = (name, ...values) => {
+    const result = languageText.get(name);
+    if (!result) throw new Error(`missing dashboard text: ${name}`);
+    return result.replace(/\{(\d+)\}/g, (placeholder, rawIndex) => {
+      const index = Number(rawIndex);
+      if (index >= values.length) throw new Error(`missing value for ${name}: ${placeholder}`);
+      return String(values[index]);
+    });
+  };
   const RANGES = {
-    live: { words: "over the last few minutes", note: "Rates between polls, last five minutes." },
-    "24h": { unit: HOUR, count: 24, words: "over the last 24 hours",
-             note: "Hourly averages, last 24 hours." },
-    "7d": { unit: HOUR, count: 168, words: "over the last 7 days",
-            note: "Hourly averages, last 7 days." },
-    "30d": { unit: DAY, count: 30, words: "over the last 30 days",
-             note: "Daily averages, last 30 days." },
-    all: { unit: DAY, count: Infinity, words: "since the statistics epoch",
-           note: "Daily averages since the statistics epoch." },
+    live: { words: text("range_live_words"), note: text("range_live_note") },
+    "24h": { unit: HOUR, count: 24, words: text("range_24h_words"),
+             note: text("range_24h_note") },
+    "7d": { unit: HOUR, count: 168, words: text("range_7d_words"),
+            note: text("range_7d_note") },
+    "30d": { unit: DAY, count: 30, words: text("range_30d_words"),
+             note: text("range_30d_note") },
+    all: { unit: DAY, count: Infinity, words: text("range_all_words"),
+           note: text("range_all_note") },
   };
   const HEAT_DAYS = { live: 2, "24h": 2, "7d": 7, "30d": 30, all: 30 };
   const RAMPS = {
@@ -24,13 +38,13 @@
             "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"],
   };
   const STATES = {
-    reading: "Reading request",
-    responding: "Responding",
-    sending: "Sending file",
-    uploading: "Receiving body",
-    connecting: "Connecting upstream",
-    forwarding: "Forwarding",
-    tunnel: "WebSocket tunnel",
+    reading: text("reading_request"),
+    responding: text("responding"),
+    sending: text("sending_file"),
+    uploading: text("receiving_body"),
+    connecting: text("connecting_upstream"),
+    forwarding: text("forwarding"),
+    tunnel: text("websocket_tunnel"),
   };
 
   const $ = (id) => document.getElementById(id);
@@ -52,16 +66,27 @@
     }
   }
 
-  const si = d3.format(".3~s");
-  const grouped = d3.format(",");
-  const percent = d3.format(".1%");
-  const clockFormat = d3.timeFormat("%H:%M:%S");
-  const hourFormat = d3.timeFormat("%a %-d %b, %H:%M");
-  const dayFormat = d3.timeFormat("%a %-d %b");
-  const utcDayFormat = d3.utcFormat("%a %-d %b UTC");
-  const dateFormat = d3.timeFormat("%-d %b %Y, %H:%M");
-  const tickFormats = [d3.timeFormat("%H:%M:%S"), d3.timeFormat("%H:%M"), d3.timeFormat("%a %-d"),
-                       d3.timeFormat("%b"), d3.timeFormat("%Y")];
+  const compact = new Intl.NumberFormat(locale,
+    {notation: "compact", maximumSignificantDigits: 3}).format;
+  const grouped = new Intl.NumberFormat(locale, {maximumFractionDigits: 0}).format;
+  const decimalTwo = new Intl.NumberFormat(locale, {maximumFractionDigits: 2}).format;
+  const decimalOne = new Intl.NumberFormat(locale, {maximumFractionDigits: 1}).format;
+  const significantTwo = new Intl.NumberFormat(locale, {maximumSignificantDigits: 2}).format;
+  const percent = new Intl.NumberFormat(locale,
+    {style: "percent", minimumFractionDigits: 1, maximumFractionDigits: 1}).format;
+  const date = (options) => new Intl.DateTimeFormat(locale, options).format;
+  const clockFormat = date({hour: "2-digit", minute: "2-digit", second: "2-digit", hourCycle: "h23"});
+  const hourFormat = date({weekday: "short", day: "numeric", month: "short",
+                           hour: "2-digit", minute: "2-digit", hourCycle: "h23"});
+  const dayFormat = date({weekday: "short", day: "numeric", month: "short"});
+  const utcDay = date({weekday: "short", day: "numeric", month: "short", timeZone: "UTC"});
+  const utcDayFormat = (value) => utcDay(value) + " UTC";
+  const dateFormat = date({day: "numeric", month: "short", year: "numeric",
+                           hour: "2-digit", minute: "2-digit", hourCycle: "h23"});
+  const tickFormats = [clockFormat,
+    date({hour: "2-digit", minute: "2-digit", hourCycle: "h23"}),
+    date({weekday: "short", day: "numeric"}),
+    date({month: "short"}), date({year: "numeric"})];
 
   /* Axis ticks in 24 hour time, naming the coarsest unit that changed. */
   function timeTick(date) {
@@ -72,9 +97,9 @@
   }
 
   function bytes(value) {
-    if (value >= 1000) return `${si(value)}B`;
-    if (value > 0 && value < 10) return `${d3.format(".2~f")(value)} B`;
-    return `${Math.round(value)} B`;
+    if (value >= 1000) return `${compact(value)} B`;
+    if (value > 0 && value < 10) return `${decimalTwo(value)} B`;
+    return `${grouped(Math.round(value))} B`;
   }
 
   function perSecond(value) {
@@ -82,30 +107,32 @@
   }
 
   function count(value) {
-    return value < 10000 ? grouped(Math.round(value)) : si(value);
+    return value < 10000 ? grouped(Math.round(value)) : compact(value);
   }
 
   function rate(value) {
     if (value === 0) return "0";
-    return value < 10 ? d3.format(".2~r")(value) : count(value);
+    return value < 10 ? significantTwo(value) : count(value);
   }
 
   function milliseconds(value) {
-    return value < 10 ? `${d3.format(".1~f")(value)} ms` : `${grouped(Math.round(value))} ms`;
+    return value < 10 ? `${decimalOne(value)} ms` : `${grouped(Math.round(value))} ms`;
   }
 
   function age(ms) {
     const seconds = Math.max(0, Math.floor(ms / 1000));
-    if (seconds < 60) return `${seconds}s`;
+    if (seconds < 60) return text("age_seconds", grouped(seconds));
     const minutes = Math.floor(seconds / 60);
-    if (minutes < 60) return `${minutes}m ${seconds % 60}s`;
+    if (minutes < 60) return text("age_minutes", grouped(minutes), grouped(seconds % 60));
     const hours = Math.floor(minutes / 60);
-    if (hours < 48) return `${hours}h ${minutes % 60}m`;
-    return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+    if (hours < 48) return text("age_hours", grouped(hours), grouped(minutes % 60));
+    return text("age_days", grouped(Math.floor(hours / 24)), grouped(hours % 24));
   }
 
   const state = {
     token: null,
+    bearer: false,
+    setupPending: false,
     schema: null,
     field: {},
     live: null,
@@ -148,6 +175,7 @@
     const match = /(?:^|&)token=([0-9a-f]{64})(?:&|$)/.exec(location.hash.slice(1));
     if (match) {
       store("sessionStorage", "ankah-token", match[1]);
+      store("sessionStorage", "ankah-bearer", "1");
       history.replaceState(null, "", location.pathname + location.search);
       return match[1];
     }
@@ -156,26 +184,41 @@
 
   function showLogin(message) {
     state.token = null;
+    state.bearer = false;
+    state.setupPending = false;
     store("sessionStorage", "ankah-token", null);
+    store("sessionStorage", "ankah-bearer", null);
     clearTimeout(state.timer);
+    $("export").hidden = true;
+    $("setup").hidden = true;
+    $("signout").hidden = true;
     $("main").hidden = true;
     $("login").hidden = false;
+    $("token-login").hidden = true;
+    $("login-mode").hidden = false;
+    $("login-mode").textContent = text("use_dashboard_token");
+    $("token-login").querySelector("p").textContent = text("enter_token");
     $("login-message").textContent = message;
-    setStatus("Waiting for a token", false);
-    $("token").focus();
+    setStatus(text("waiting_token"), false);
+    $("code").focus();
   }
 
   function handleError(error) {
     if (error instanceof Unauthorized) {
-      showLogin("The token was not accepted. Check the dashboard token file.");
+      const bearer = state.bearer;
+      showLogin(text("enter_code"));
+      if (bearer) {
+        $("login-mode").click();
+        $("token-login").querySelector("p").textContent = text("token_rejected");
+      }
       return;
     }
-    setStatus("Connection lost, retrying", true);
+    setStatus(text("connection_lost"), true);
   }
 
   async function loadSchema() {
-    const schema = await api("/stats/schema");
-    if (schema.v !== 1) throw new Error("unsupported statistics version");
+    const schema = await api("stats/schema");
+    if (schema.v !== 3) throw new Error("unsupported statistics version");
     state.schema = schema;
     state.field = {};
     schema.fields.forEach((name, index) => {
@@ -185,7 +228,7 @@
 
   async function loadHistory(full) {
     const days = full ? state.schema.day_capacity : 32;
-    const history = await api(`/stats/history?hours=${state.schema.hour_capacity}&days=${days}`);
+    const history = await api(`stats/history?hours=${state.schema.hour_capacity}&days=${days}`);
     state.hours = new Map();
     state.days = new Map();
     history.hours.rows.forEach((row, i) => state.hours.set(history.hours.first + i, row));
@@ -225,7 +268,7 @@
   }
 
   function ingest(live) {
-    if (live.v !== 1) throw new Error("unsupported statistics version");
+    if (live.v !== 3) throw new Error("unsupported statistics version");
     const previous = state.samples[state.samples.length - 1];
     const countersWentBack = previous && live.cumulative.some((value, field) =>
       state.schema.kinds[field] === "sum" && value < previous.c[field]);
@@ -259,21 +302,21 @@
     clearTimeout(state.timer);
     if (!state.token || state.polling) return;
     if (document.hidden) {
-      setStatus("Paused while this tab is hidden", false);
+      setStatus(text("paused"), false);
       return;
     }
     state.polling = true;
     try {
-      ingest(await api("/stats/live"));
+      ingest(await api("stats/live"));
       render();
-      setStatus(`Live, updated ${clockFormat(new Date())}`, false);
+      setStatus(text("live_updated", clockFormat(new Date())), false);
     } catch (error) {
       state.polling = false;
       if (error instanceof Unauthorized) {
         handleError(error);
         return;
       }
-      setStatus("Connection lost, retrying", true);
+      setStatus(text("connection_lost"), true);
     }
     state.polling = false;
     state.timer = setTimeout(poll, POLL_MS);
@@ -281,12 +324,21 @@
 
   async function start() {
     $("login").hidden = true;
-    setStatus("Connecting", false);
+    $("token-login").hidden = true;
+    $("login-mode").hidden = true;
+    setStatus(text("connecting"), false);
     try {
       await loadSchema();
       await loadHistory(state.range === "all");
+      $("export").hidden = false;
+      $("setup").hidden = !state.bearer;
+      $("signout").hidden = false;
       $("main").hidden = false;
       poll();
+      if (state.setupPending) {
+        state.setupPending = false;
+        $("setup").click();
+      }
     } catch (error) {
       handleError(error);
       if (!(error instanceof Unauthorized)) state.timer = setTimeout(start, 2000);
@@ -305,7 +357,10 @@
         const seconds = (b.t - a.t) / 1000;
         if (seconds <= 0) continue;
         list.push({ time: new Date(b.at), seconds, amounts: b.c.map((value, f) => value - a.c[f]),
-                    connections: b.g.connections, label: clockFormat(new Date(b.at)) });
+                    connections: b.g.connections,
+                    throttleConnections: b.g.throttle_connections,
+                    throttleQueue: b.g.throttle_queue,
+                    label: clockFormat(new Date(b.at)) });
       }
       return list;
     }
@@ -328,9 +383,11 @@
       const begins = new Date(start * 1000);
       // Daily buckets are UTC days, so they are named as UTC dates.
       const label = (spec.unit === HOUR ? hourFormat(begins) : utcDayFormat(begins)) +
-                    (partial ? ", so far" : "");
+                    (partial ? text("so_far") : "");
       list.push({ time: new Date(((start + end) / 2) * 1000), seconds: end - start, amounts: row,
                   connections: row[F("peak_connections")], label, index, start, end, partial,
+                  throttleConnections: row[F("peak_throttle_connections")],
+                  throttleQueue: row[F("peak_throttle_queue")],
                   unit: spec.unit });
     }
     return list;
@@ -349,12 +406,16 @@
       const bin = bins[bins.length - 1];
       if (!bin || bin.key !== key) {
         bins.push({ key, first: point, last: point, seconds: point.seconds,
-                    amounts: point.amounts.slice(), connections: point.connections });
+                    amounts: point.amounts.slice(), connections: point.connections,
+                    throttleConnections: point.throttleConnections,
+                    throttleQueue: point.throttleQueue });
         continue;
       }
       bin.last = point;
       bin.seconds += point.seconds;
       bin.connections = Math.max(bin.connections, point.connections);
+      bin.throttleConnections = Math.max(bin.throttleConnections, point.throttleConnections);
+      bin.throttleQueue = Math.max(bin.throttleQueue, point.throttleQueue);
       point.amounts.forEach((value, f) => {
         bin.amounts[f] = kinds[f] === "max" ? Math.max(bin.amounts[f], value) : bin.amounts[f] + value;
       });
@@ -364,8 +425,11 @@
       const last = bin.last.index * bin.first.unit;
       return { time: new Date(((bin.first.start + bin.last.end) / 2) * 1000), seconds: bin.seconds,
                amounts: bin.amounts, connections: bin.connections,
-               label: `${name(bin.first.start)} to ${name(Math.max(bin.first.start, last))}` +
-                      (bin.last.partial ? ", so far" : "") };
+               throttleConnections: bin.throttleConnections,
+               throttleQueue: bin.throttleQueue,
+               label: text("range_between", name(bin.first.start),
+                           name(Math.max(bin.first.start, last))) +
+                      (bin.last.partial ? text("so_far") : "") };
     });
   }
 
@@ -377,7 +441,8 @@
     const end = state.ringFirstDay * DAY;
     if (end <= start) return null;
     return { start: new Date(start * 1000), end: new Date(end * 1000), seconds: end - start,
-             amounts: state.evicted, label: `Average before ${utcDayFormat(new Date(end * 1000))}` };
+             amounts: state.evicted,
+             label: text("average_before", utcDayFormat(new Date(end * 1000))) };
   }
 
   function totals(list, band) {
@@ -413,18 +478,19 @@
     renderTiles(shown, sum);
     renderThroughput(shown, band);
     renderConnections(shown, band);
+    renderThrottle(shown, band);
     renderHeatmap();
     renderOpenConnections();
     const live = state.live;
-    $("epoch-note").textContent = `Statistics since ${dateFormat(new Date(live.epoch * 1000))}, ` +
-                                  `${age((live.now - live.epoch) * 1000)} ago.`;
+    $("epoch-note").textContent = text("statistics_since",
+      dateFormat(new Date(live.epoch * 1000)), age((live.now - live.epoch) * 1000));
   }
 
   function renderHero(sum) {
     const recent = state.samples.slice(-6);
     const value = $("hero-value");
     if (recent.length < 2) {
-      value.textContent = "Measuring";
+      value.textContent = text("measuring");
     } else {
       const a = recent[0];
       const b = recent[recent.length - 1];
@@ -435,30 +501,34 @@
     const upstream = sum.sums[F("upstream_bytes_in")];
     const words = RANGES[state.range].words;
     $("hero-note").textContent = out > 0 ?
-      `${percent(Math.max(0, Math.min(1, (out - upstream) / out)))} served by Ankah itself ${words}` :
-      `Nothing sent to clients ${words}`;
+      text("served_itself", percent(Math.max(0, Math.min(1, (out - upstream) / out))), words) :
+      text("nothing_sent", words);
   }
 
   function meter(id, value, limit, format, extra) {
     const root = $(id);
     const share = limit > 0 ? Math.min(1, value / limit) : 0;
     root.querySelector(".meter-value").textContent =
-      limit > 0 ? `${format(value)} of ${format(limit)}` : "Disabled";
+      limit > 0 ? text("of", format(value), format(limit)) : text("disabled");
     root.querySelector(".fill").style.width = `${(share * 100).toFixed(1)}%`;
     root.classList.toggle("is-warning", share >= 0.7 && share < 0.9);
     root.classList.toggle("is-critical", share >= 0.9);
     root.querySelector(".meter-note").textContent =
-      share >= 0.9 ? "At or near the limit" : share >= 0.7 ? "Approaching the limit" : extra || "";
+      share >= 0.9 ? text("at_limit") : share >= 0.7 ? text("approaching_limit") : extra || "";
   }
 
   function renderMeters() {
     const gauges = state.live.gauges;
     const limits = state.schema.limits;
     meter("meter-connections", gauges.connections, limits.connections, count,
-          limits.tls_connections ? `${count(gauges.tls_connections)} TLS sockets open` : "");
+          limits.tls_connections ? text("tls_open", count(gauges.tls_connections)) : "");
     meter("meter-pending", gauges.pending_bytes, limits.pending_bytes, bytes,
-          `${count(gauges.saved_posts)} saved, ${count(gauges.sessions)} challenge sessions`);
+          text("saved_sessions", count(gauges.saved_posts), count(gauges.sessions)));
     meter("meter-cache", gauges.cache_bytes, limits.cache_bytes, bytes, "");
+    meter("meter-throttle-connections", gauges.throttle_connections,
+          limits.throttle_connections, count, "");
+    meter("meter-throttle-queue", gauges.throttle_queue,
+          limits.throttle_queue, count, "");
   }
 
   function spark(svgNode, values) {
@@ -492,22 +562,32 @@
       const below = point.amounts[F(bottom)];
       return below ? top(point) / below : null;
     };
-    tile("tile-connections", live ? "Connections" : "Peak connections",
+    tile("tile-connections", live ? text("connections") : text("peak_connections"),
          count(live ? state.live.gauges.connections : sum.peak), list.map((p) => p.connections));
     tile("tile-requests", null, sum.seconds > 0 ? rate(sum.sums[F("requests")] / sum.seconds) : "0",
          list.map((p) => p.amounts[F("requests")] / p.seconds));
     const issued = sum.sums[F("challenges_issued")];
     const passed = (amounts) => amounts[F("challenges_solved")] + amounts[F("passes_issued")];
-    tile("tile-challenges", null, issued ? percent(Math.min(1, passed(sum.sums) / issued)) : "None issued",
+    tile("tile-challenges", null,
+         issued ? percent(Math.min(1, passed(sum.sums) / issued)) : text("none_issued"),
          list.map((p) => {
            const value = ratio(p, (point) => passed(point.amounts), "challenges_issued");
            return value === null ? null : Math.min(1, value);
          }));
     const responses = sum.sums[F("upstream_responses")];
     tile("tile-latency", null,
-         responses ? milliseconds(sum.sums[F("upstream_latency_ms_total")] / responses) : "No responses",
+         responses ? milliseconds(sum.sums[F("upstream_latency_ms_total")] / responses) :
+                     text("no_responses"),
          list.map((p) => ratio(p, (point) => point.amounts[F("upstream_latency_ms_total")],
                                "upstream_responses")));
+    tile("tile-throttle", null,
+         sum.seconds > 0 ? perSecond(sum.sums[F("throttled_static_bytes")] / sum.seconds) : "0",
+         list.map((p) => p.amounts[F("throttled_static_bytes")] / p.seconds));
+    const queued = sum.sums[F("throttle_queued_requests")];
+    tile("tile-queue-wait", null,
+         queued ? milliseconds(sum.sums[F("throttle_wait_ms_total")] / queued) : text("no_waits"),
+         list.map((p) => ratio(p, (point) => point.amounts[F("throttle_wait_ms_total")],
+                               "throttle_queued_requests")));
   }
 
   /* Chart plumbing shared by the line charts and the heatmap. */
@@ -642,7 +722,7 @@
   function lineChart(view, spec) {
     const { svg, svgNode } = view;
     if (spec.times.length < 2 && !spec.band) {
-      showEmpty(view, "Not enough data yet. Points appear as polls and buckets complete.");
+      showEmpty(view, text("not_enough_data"));
       return;
     }
     view.empty.hidden = true;
@@ -736,7 +816,7 @@
       fillTip(view, spec.when(i), spec.series.map((series) => ({
         key: spec.series.length > 1 ? series.key : null,
         name: series.name,
-        value: series.values[i] === null ? "No data" : spec.format(series.values[i]),
+        value: series.values[i] === null ? text("no_data") : spec.format(series.values[i]),
       })), cx);
     }
 
@@ -765,13 +845,14 @@
     const view = chart("chart-throughput");
     const out = list.map((p) => p.amounts[F("client_bytes_out")] / p.seconds);
     const upstream = list.map((p) => p.amounts[F("upstream_bytes_in")] / p.seconds);
-    const items = [{ key: "series-1", name: "To clients" }, { key: "series-2", name: "From the application" }];
-    legend(view, band ? items.concat({ key: "band", name: "Average before daily history" }) : items);
+    const items = [{ key: "series-1", name: text("to_clients") },
+                   { key: "series-2", name: text("from_application") }];
+    legend(view, band ? items.concat({ key: "band", name: text("average_before_history") }) : items);
     lineChart(view, {
-      label: "Throughput to clients and from the application",
+      label: text("throughput_label"),
       times: list.map((p) => p.time),
-      series: [{ key: "series-1", name: "to clients", values: out },
-               { key: "series-2", name: "from the application", values: upstream }],
+      series: [{ key: "series-1", name: text("to_clients_lower"), values: out },
+               { key: "series-2", name: text("from_application_lower"), values: upstream }],
       band: band && { start: band.start, end: band.end, label: band.label,
                       values: [band.amounts[F("client_bytes_out")] / band.seconds,
                                band.amounts[F("upstream_bytes_in")] / band.seconds] },
@@ -784,28 +865,57 @@
       rows.unshift([band.label, perSecond(band.amounts[F("client_bytes_out")] / band.seconds),
                     perSecond(band.amounts[F("upstream_bytes_in")] / band.seconds)]);
     }
-    fillTable(view, ["Time", "To clients", "From the application"], rows);
+    fillTable(view, [text("time"), text("to_clients"), text("from_application")], rows);
   }
 
   function renderConnections(list, band) {
     const view = chart("chart-connections");
     const live = state.range === "live";
-    $("connections-title").textContent = live ? "Connections" : "Peak connections";
-    legend(view, band ? [{ key: "series-1", name: "Peak connections" },
-                         { key: "band", name: "Peak before daily history" }] : []);
+    $("connections-title").textContent = live ? text("connections") : text("peak_connections");
+    legend(view, band ? [{ key: "series-1", name: text("peak_connections") },
+                         { key: "band", name: text("peak_before_history") }] : []);
     const values = list.map((p) => p.connections);
     lineChart(view, {
-      label: live ? "Open connections" : "Peak connections per period",
+      label: live ? text("open_connections") : text("peak_connections_period"),
       times: list.map((p) => p.time),
-      series: [{ key: "series-1", name: live ? "open" : "peak", values }],
-      band: band && { start: band.start, end: band.end, label: band.label.replace("Average", "Peak"),
+      series: [{ key: "series-1", name: live ? text("open") : text("peak"), values }],
+      band: band && { start: band.start, end: band.end,
+                      label: text("peak_before", utcDayFormat(band.end)),
                       values: [band.amounts[F("peak_connections")]] },
       format: count,
       tick: (v) => count(v),
       integer: true,
       when: (i) => list[i].label,
     });
-    fillTable(view, ["Time", live ? "Open" : "Peak"], list.map((p) => [p.label, count(p.connections)]));
+    fillTable(view, [text("time"), live ? text("open") : text("peak")],
+              list.map((p) => [p.label, count(p.connections)]));
+  }
+
+  function renderThrottle(list, band) {
+    const view = chart("chart-throttle");
+    const live = state.range === "live";
+    const items = [{ key: "series-1", name: text("active_downloads") },
+                   { key: "series-2", name: text("queued_downloads") }];
+    legend(view, band ? items.concat({ key: "band", name: text("peak_before_history") }) : items);
+    lineChart(view, {
+      label: text("throttle_capacity_label"),
+      times: list.map((p) => p.time),
+      series: [{ key: "series-1", name: live ? text("active") : text("peak_active"),
+                 values: list.map((p) => p.throttleConnections) },
+               { key: "series-2", name: live ? text("queued") : text("peak_queued"),
+                 values: list.map((p) => p.throttleQueue) }],
+      band: band && { start: band.start, end: band.end,
+                      label: text("peak_before", utcDayFormat(band.end)),
+                      values: [band.amounts[F("peak_throttle_connections")],
+                               band.amounts[F("peak_throttle_queue")]] },
+      format: count,
+      tick: (v) => count(v),
+      integer: true,
+      when: (i) => list[i].label,
+    });
+    fillTable(view, [text("time"), live ? text("active") : text("peak_active"),
+                     live ? text("queued") : text("peak_queued")],
+              list.map((p) => [p.label, count(p.throttleConnections), count(p.throttleQueue)]));
   }
 
   function theme() {
@@ -846,21 +956,22 @@
     add(live.hour_index, live.current_hour, true);
 
     const list = [...cells.values()].sort((a, b) => a.begins - b.begins);
-    const describe = (cell) => `${hourFormat(cell.begins)}${cell.partial ? ", so far" : ""}`;
-    fillTable(view, ["Hour starting", "Bytes to clients"], list.map((cell) => [describe(cell), bytes(cell.value)]));
+    const describe = (cell) => `${hourFormat(cell.begins)}${cell.partial ? text("so_far") : ""}`;
+    fillTable(view, [text("hour_starting"), text("bytes_to_clients")],
+              list.map((cell) => [describe(cell), bytes(cell.value)]));
     if (!list.length) {
-      showEmpty(view, "No hourly data yet.");
+      showEmpty(view, text("no_hourly_data"));
       view.card.querySelector(".scale").replaceChildren();
       return;
     }
     const { svg, svgNode } = view;
     view.empty.hidden = true;
     svgNode.style.display = "";
-    svgNode.setAttribute("aria-label", "Bytes sent to clients in each hour, by day");
+    svgNode.setAttribute("aria-label", text("heatmap_label"));
     svg.selectAll("*").remove();
     const width = Math.max(view.plot.clientWidth, 280);
     const narrow = width < 520;
-    const rowLabel = narrow ? d3.timeFormat("%a %-d") : dayFormat;
+    const rowLabel = narrow ? date({weekday: "short", day: "numeric"}) : dayFormat;
     const margin = { top: 4, right: 4, bottom: 24, left: narrow ? 52 : 92 };
     const cellWidth = (width - margin.left - margin.right) / 24;
     const rowHeight = Math.max(12, Math.min(26, cellWidth * 0.75));
@@ -906,7 +1017,7 @@
       const begins = new Date(days[r]);
       begins.setHours(c);
       fillTip(view, cell ? describe(cell) : hourFormat(begins), [{
-        key: null, name: "to clients", value: cell ? bytes(cell.value) : "No data",
+        key: null, name: text("to_clients_lower"), value: cell ? bytes(cell.value) : text("no_data"),
       }], cx(c) + cellWidth);
     }
     view.clear = () => {
@@ -973,7 +1084,7 @@
       const cell = body.insertRow().insertCell();
       cell.colSpan = 5;
       cell.className = "note";
-      cell.textContent = "No open connections";
+      cell.textContent = text("no_open_connections");
     }
     for (const item of top) {
       const row = body.insertRow();
@@ -987,7 +1098,7 @@
     }
     const other = state.live.top_other;
     $("connections-note").textContent = other.count ?
-      `${count(other.count)} more open connections moved ${bytes(other.in)} in and ${bytes(other.out)} out.` : "";
+      text("more_connections", count(other.count), bytes(other.in), bytes(other.out)) : "";
   }
 
   let particleConfig = null;
@@ -997,7 +1108,7 @@
         matchMedia("(prefers-reduced-motion: reduce)").matches) return;
     if (!particleConfig) {
       try {
-        const response = await fetch("/dashboard/particlejs.json");
+        const response = await fetch("dashboard/particlejs.json");
         particleConfig = await response.json();
       } catch (error) {
         return;
@@ -1023,7 +1134,7 @@
   function applyTheme(chosen) {
     if (chosen) document.documentElement.dataset.theme = chosen;
     else delete document.documentElement.dataset.theme;
-    $("theme").textContent = theme() === "dark" ? "Light theme" : "Dark theme";
+    $("theme").textContent = theme() === "dark" ? text("light_theme") : text("dark_theme");
     startParticles();
     render();
   }
@@ -1043,6 +1154,36 @@
     $("mask").setAttribute("aria-pressed", String(state.mask));
     store("localStorage", "ankah-mask", state.mask ? "1" : "0");
     render();
+  });
+
+  $("export").addEventListener("click", async () => {
+    const button = $("export");
+    button.disabled = true;
+    try {
+      const response = await fetch("stats/export.csv", {
+        headers: { Authorization: `Bearer ${state.token}` },
+        cache: "no-store",
+      });
+      if (response.status === 401) throw new Unauthorized("unauthorized");
+      if (!response.ok) throw new Error(`export answered ${response.status}`);
+      const disposition = response.headers.get("Content-Disposition") || "";
+      const match = /filename="([^"]+)"/.exec(disposition);
+      const fallback = `ankah-metrics-${new Date().toISOString().replace(/[-:]/g, "")
+        .replace(/\.\d{3}Z$/, "Z")}.csv`;
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = match ? match[1] : fallback;
+      link.hidden = true;
+      document.body.append(link);
+      link.click();
+      link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 0);
+    } catch (error) {
+      handleError(error);
+    } finally {
+      button.disabled = false;
+    }
   });
 
   for (const button of document.querySelectorAll("[data-range]")) {
@@ -1067,22 +1208,22 @@
     const button = $("reset");
     if (!button.classList.contains("is-armed")) {
       button.classList.add("is-armed");
-      button.textContent = "Confirm reset";
+      button.textContent = text("confirm_reset");
       resetTimer = setTimeout(() => {
         button.classList.remove("is-armed");
-        button.textContent = "Reset statistics";
+        button.textContent = text("reset_statistics");
       }, 4000);
       return;
     }
     clearTimeout(resetTimer);
     button.classList.remove("is-armed");
-    button.textContent = "Reset statistics";
+    button.textContent = text("reset_statistics");
     try {
-      const result = await api("/stats/reset", "POST");
+      const result = await api("stats/reset", "POST");
       const warning = $("persistence-warning");
       warning.hidden = result.persistence !== "failed";
       warning.textContent = result.persistence === "failed"
-        ? "Statistics were reset in memory, but the snapshot could not be updated. Older data may return after a restart."
+        ? text("persistence_failed")
         : "";
       state.samples = [];
       await loadHistory(state.fullHistory);
@@ -1092,17 +1233,93 @@
     }
   });
 
-  $("login").addEventListener("submit", (event) => {
+  $("login").addEventListener("submit", async (event) => {
+    event.preventDefault();
+    const code = $("code").value.trim();
+    $("code").value = "";
+    if (!/^[0-9]{6}$/.test(code)) return;
+    const button = $("login").querySelector("button[type=submit]");
+    button.disabled = true;
+    try {
+      const response = await fetch("auth/login", {
+        method: "POST", headers: {"X-Ankah-Code": code}, cache: "no-store",
+      });
+      if (response.status === 429) {
+        $("login-message").textContent = text("too_many_codes");
+        return;
+      }
+      if (response.status === 401) {
+        $("login-message").textContent = text("code_rejected");
+        return;
+      }
+      if (!response.ok) throw new Error(`auth/login answered ${response.status}`);
+      const result = await response.json();
+      if (!/^[0-9a-f]{64}$/.test(result.token)) throw new Error("invalid session");
+      state.token = result.token;
+      state.bearer = false;
+      store("sessionStorage", "ankah-token", state.token);
+      store("sessionStorage", "ankah-bearer", "0");
+      start();
+    } catch (error) {
+      setStatus(text("connection_lost"), true);
+    } finally {
+      button.disabled = false;
+    }
+  });
+
+  $("login-mode").addEventListener("click", () => {
+    const tokenMode = $("token-login").hidden;
+    $("token-login").hidden = !tokenMode;
+    $("login").hidden = tokenMode;
+    $("login-mode").textContent = tokenMode
+      ? text("use_authenticator_code") : text("use_dashboard_token");
+    $(tokenMode ? "token" : "code").focus();
+  });
+
+  $("token-login").addEventListener("submit", (event) => {
     event.preventDefault();
     const value = $("token").value.trim();
     $("token").value = "";
     if (!/^[0-9a-f]{64}$/.test(value)) {
-      $("login-message").textContent = "The token is 64 lowercase hexadecimal characters.";
+      setStatus(text("token_invalid"), true);
       return;
     }
     state.token = value;
+    state.bearer = true;
+    state.setupPending = true;
     store("sessionStorage", "ankah-token", value);
+    store("sessionStorage", "ankah-bearer", "1");
     start();
+  });
+
+  $("setup").addEventListener("click", async () => {
+    try {
+      const response = await fetch("auth/qr", {
+        headers: {Authorization: `Bearer ${state.token}`}, cache: "no-store",
+      });
+      if (response.status === 401) throw new Unauthorized("unauthorized");
+      if (!response.ok) throw new Error(`auth/qr answered ${response.status}`);
+      const url = URL.createObjectURL(await response.blob());
+      const qr = $("setup-qr");
+      if (qr.dataset.url) URL.revokeObjectURL(qr.dataset.url);
+      qr.dataset.url = url;
+      qr.src = url;
+      $("setup-dialog").showModal();
+    } catch (error) {
+      handleError(error);
+    }
+  });
+  $("setup-close").addEventListener("click", () => $("setup-dialog").close());
+  $("signout").addEventListener("click", async () => {
+    const token = state.token;
+    showLogin(text("enter_code"));
+    try {
+      await fetch("auth/logout", {
+        method: "POST", headers: {Authorization: `Bearer ${token}`}, cache: "no-store",
+      });
+    } catch (error) {
+      // The local credential has already been removed.
+    }
   });
 
   document.addEventListener("visibilitychange", () => {
@@ -1117,6 +1334,7 @@
   $("range-note").textContent = RANGES[state.range].note;
   applyTheme(stored("localStorage", "ankah-theme"));
   state.token = readToken();
+  state.bearer = Boolean(state.token) && stored("sessionStorage", "ankah-bearer") !== "0";
   if (state.token) start();
-  else showLogin("Enter the token from the dashboard token file.");
+  else showLogin(text("enter_code"));
 })();

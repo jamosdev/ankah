@@ -4,9 +4,9 @@ self.onmessage = async ({data}) => {
   try {
     const {nonce, bits, wasm} = data;
     if (!/^[0-9a-f]{32}$/.test(nonce) || !Number.isInteger(bits) ||
-        bits < 8 || bits > 24) throw new Error("Invalid challenge");
+        bits < 8 || bits > 24) throw new Error("challenge_invalid");
     const response = await fetch(wasm, {cache: "force-cache"});
-    if (!response.ok) throw new Error("Solver unavailable");
+    if (!response.ok) throw new Error("challenge_solver_unavailable");
     let loaded;
     if (WebAssembly.instantiateStreaming) {
       try {
@@ -18,9 +18,9 @@ self.onmessage = async ({data}) => {
       loaded = await WebAssembly.instantiate(await response.arrayBuffer());
     }
     const {memory, nonce_buffer, search_batch} = loaded.instance.exports;
-    if (!memory || !nonce_buffer || !search_batch) throw new Error("Invalid solver");
+    if (!memory || !nonce_buffer || !search_batch) throw new Error("challenge_invalid_solver");
     const offset = nonce_buffer();
-    if (offset + 32 > memory.buffer.byteLength) throw new Error("Invalid solver memory");
+    if (offset + 32 > memory.buffer.byteLength) throw new Error("challenge_invalid_solver_memory");
     const input = new Uint8Array(memory.buffer, offset, 32);
     for (let i = 0; i < 32; i++) input[i] = nonce.charCodeAt(i);
     self.postMessage({type: "ready"});
@@ -40,8 +40,8 @@ self.onmessage = async ({data}) => {
         await new Promise((resolve) => setTimeout(resolve, 0));
       }
     }
-    throw new Error("Solver range exhausted");
+    throw new Error("challenge_solver_range_exhausted");
   } catch (error) {
-    self.postMessage({type: "error", message: error.message});
+    self.postMessage({type: "error", code: error.message});
   }
 };

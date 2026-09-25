@@ -5,6 +5,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 
 /* Fails to compile when the field list outgrows the record. */
 typedef char ankah_stat_fields_fit[ANKAH_STAT_COUNT <= ANKAH_STAT_SLOTS ? 1 : -1];
@@ -174,7 +175,9 @@ void ankah_stats_roll(uint64_t wall) {
 
 #define SNAPSHOT_HEADER_SIZE 80U
 #define SNAPSHOT_DIGEST_SIZE 32U
-#define SNAPSHOT_VERSION 1U
+#define SNAPSHOT_VERSION 3U
+#define SNAPSHOT_V1_FIELDS 32U
+#define SNAPSHOT_V2_FIELDS 40U
 #define SNAPSHOT_RECORD_SIZE (ANKAH_STAT_COUNT * 8U)
 #define SNAPSHOT_MAX_SIZE \
     (SNAPSHOT_HEADER_SIZE + \
@@ -223,9 +226,10 @@ static void put_record(unsigned char **cursor, const ankah_stat_record *record) 
         put_u64(cursor, record->v[field]);
 }
 
-static void get_record(const unsigned char **cursor, ankah_stat_record *record) {
+static void get_record(const unsigned char **cursor, ankah_stat_record *record,
+                       unsigned int field_count) {
     unsigned int field;
-    for (field = 0; field < ANKAH_STAT_COUNT; ++field)
+    for (field = 0; field < field_count; ++field)
         record->v[field] = get_u64(cursor);
 }
 
@@ -274,13 +278,16 @@ static decoded_snapshot *decode_snapshot(const unsigned char *data, size_t size)
     unsigned char digest[SNAPSHOT_DIGEST_SIZE];
     const unsigned char *cursor = data;
     decoded_snapshot *snapshot;
-    uint32_t hour_count, day_count;
+    uint32_t version, field_count, hour_count, day_count;
     size_t expected, row;
     if (size < SNAPSHOT_HEADER_SIZE + SNAPSHOT_DIGEST_SIZE ||
         memcmp(cursor, magic, sizeof(magic)) != 0) return NULL;
     cursor += sizeof(magic);
-    if (get_u32(&cursor) != SNAPSHOT_VERSION ||
-        get_u32(&cursor) != ANKAH_STAT_COUNT ||
+    version = get_u32(&cursor);
+    field_count = get_u32(&cursor);
+    if (!((version == 1 && field_count == SNAPSHOT_V1_FIELDS) ||
+          (version == 2 && field_count == SNAPSHOT_V2_FIELDS) ||
+          (version == SNAPSHOT_VERSION && field_count == ANKAH_STAT_COUNT)) ||
         get_u32(&cursor) != ANKAH_STAT_HOURS ||
         get_u32(&cursor) != ANKAH_STAT_DAYS) return NULL;
     snapshot = (decoded_snapshot *)calloc(1, sizeof(*snapshot));
@@ -296,21 +303,21 @@ static decoded_snapshot *decode_snapshot(const unsigned char *data, size_t size)
     if (!snapshot->generation || hour_count > ANKAH_STAT_HOURS ||
         day_count > ANKAH_STAT_DAYS) { free(snapshot); return NULL; }
     expected = SNAPSHOT_HEADER_SIZE +
-               (4U + (size_t)hour_count + (size_t)day_count) * SNAPSHOT_RECORD_SIZE +
+               (4U + (size_t)hour_count + (size_t)day_count) * field_count * 8U +
                SNAPSHOT_DIGEST_SIZE;
     if (size != expected || ankah_sha256(data, size - SNAPSHOT_DIGEST_SIZE, digest) != 0 ||
         memcmp(digest, data + size - SNAPSHOT_DIGEST_SIZE, SNAPSHOT_DIGEST_SIZE) != 0) {
         free(snapshot);
         return NULL;
     }
-    get_record(&cursor, &snapshot->state.cumulative);
-    get_record(&cursor, &snapshot->state.hour);
-    get_record(&cursor, &snapshot->state.day);
-    get_record(&cursor, &snapshot->state.evicted);
+    get_record(&cursor, &snapshot->state.cumulative, field_count);
+    get_record(&cursor, &snapshot->state.hour, field_count);
+    get_record(&cursor, &snapshot->state.day, field_count);
+    get_record(&cursor, &snapshot->state.evicted, field_count);
     for (row = 0; row < hour_count; ++row)
-        get_record(&cursor, &snapshot->state.hour_rows[row]);
+        get_record(&cursor, &snapshot->state.hour_rows[row], field_count);
     for (row = 0; row < day_count; ++row)
-        get_record(&cursor, &snapshot->state.day_rows[row]);
+        get_record(&cursor, &snapshot->state.day_rows[row], field_count);
     snapshot->hour_count = hour_count;
     snapshot->day_count = day_count;
     snapshot->state.enabled = 1;
@@ -526,4 +533,80 @@ void ankah_stats_write_history(ankah_text *out, size_t hour_rows, size_t day_row
     write_row(out, &stats.evicted);
     ankah_text_string(out, ",");
     write_member(out, "evicted_days", stats.evicted_days);
+}
+
+static void csv_time(ankah_text *out, uint64_t seconds) {
+    char value[32];
+    time_t stamp = (time_t)seconds;
+    struct tm *utc;
+    if (stamp < 0 || (uint64_t)stamp != seconds || !(utc = gmtime(&stamp)) ||
+        !strftime(value, sizeof(value), "%Y-%m-%dT%H:%M:%SZ", utc)) {
+        out->failed = 1;
+        return;
+    }
+    ankah_text_string(out, value);
+}
+
+static void csv_row(ankah_text *out, const char *type, uint64_t start,
+                    uint64_t end, int partial, uint64_t buckets,
+                    const ankah_stat_record *record) {
+    unsigned int field;
+    ankah_text_string(out, type);
+    ankah_text_string(out, ",");
+    csv_time(out, start);
+    ankah_text_string(out, ",");
+    csv_time(out, end);
+    ankah_text_string(out, partial ? ",1," : ",0,");
+    ankah_text_u64(out, buckets);
+    for (field = 0; field < ANKAH_STAT_COUNT; ++field) {
+        ankah_text_string(out, ",");
+        ankah_text_u64(out, record->v[field]);
+    }
+    ankah_text_string(out, "\r\n");
+}
+
+void ankah_stats_write_csv(ankah_text *out, uint64_t wall) {
+    uint64_t first_day, first_hour, hour_cutoff, index, start;
+    unsigned int field;
+    ankah_stats_roll(wall);
+    ankah_text_append(out, "\xef\xbb\xbf", 3);
+    ankah_text_string(out,
+        "record_type,period_start_utc,period_end_utc,partial,bucket_count");
+    for (field = 0; field < ANKAH_STAT_COUNT; ++field) {
+        ankah_text_string(out, ",");
+        ankah_text_string(out, names[field]);
+    }
+    ankah_text_string(out, "\r\n");
+
+    first_day = stats.day_index - days.count;
+    if (stats.evicted_days)
+        csv_row(out, "aggregate_days", stats.epoch, first_day * UINT64_C(86400),
+                0, stats.evicted_days, &stats.evicted);
+
+    first_hour = stats.hour_index - hours.count;
+    hour_cutoff = first_hour;
+    if (first_hour % 24 && first_hour / 24 >= first_day &&
+        first_hour / 24 < stats.day_index)
+        hour_cutoff = (first_hour / 24 + 1) * 24;
+
+    for (index = first_day; index < stats.day_index; ++index) {
+        uint64_t end = (index + 1) * UINT64_C(86400);
+        size_t age;
+        if (end > hour_cutoff * UINT64_C(3600)) break;
+        age = (size_t)(stats.day_index - 1 - index);
+        start = index * UINT64_C(86400);
+        if (start < stats.epoch) start = stats.epoch;
+        csv_row(out, "day", start, end, 0, 1, ring_age(&days, age));
+    }
+    for (index = hour_cutoff; index < stats.hour_index; ++index) {
+        size_t age = (size_t)(stats.hour_index - 1 - index);
+        start = index * UINT64_C(3600);
+        if (start < stats.epoch) start = stats.epoch;
+        csv_row(out, "hour", start, (index + 1) * UINT64_C(3600),
+                0, 1, ring_age(&hours, age));
+    }
+    start = stats.hour_index * UINT64_C(3600);
+    if (start < stats.epoch) start = stats.epoch;
+    csv_row(out, "current_hour", start, wall < start ? start : wall,
+            1, 1, &stats.hour);
 }

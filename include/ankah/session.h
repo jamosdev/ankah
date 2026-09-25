@@ -23,6 +23,7 @@ typedef struct {
     size_t received;
     int active;
     int is_post;
+    int issued_with_proof;
 } ankah_session;
 
 typedef struct {
@@ -33,6 +34,10 @@ typedef struct {
 ankah_session *ankah_session_new(const unsigned char secret[ANKAH_SECRET_SIZE],
                                  const char *host, uint64_t now,
                                  const ankah_request *request, const char *peer_ip);
+ankah_session *ankah_session_new_with_proof(const unsigned char secret[ANKAH_SECRET_SIZE],
+                                            const char *host, uint64_t now,
+                                            const ankah_request *request,
+                                            const char *peer_ip, int proved);
 ankah_session *ankah_session_find(const char *id, uint64_t now);
 void ankah_session_discard(ankah_session *session);
 int ankah_session_append(ankah_session *session, const void *data, size_t size);

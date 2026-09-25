@@ -1,0 +1,23 @@
+{
+	admin off
+	persist_config off
+	servers :443 {
+		protocols h1 h2 h3
+	}
+}
+
+:443 {
+	tls /run/ankah-protocol/leaf.pem /run/ankah-protocol/leaf-key.pem
+
+	@connect method CONNECT
+	respond @connect 405
+
+	reverse_proxy https://native.ankah.test:8443 {
+		header_up Host native.ankah.test:8443
+		transport http {
+			versions 1.1 2
+			tls_trust_pool file /run/ankah-protocol/ca.pem
+			tls_server_name native.ankah.test
+		}
+	}
+}

@@ -1,4 +1,5 @@
 #include "ankah/stats.h"
+#include "ankah/sha256.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -47,6 +48,16 @@ static int contains(const ankah_text *text, const char *needle) {
     for (i = 0; i + length <= text->size; ++i)
         if (memcmp(text->data + i, needle, length) == 0) return 1;
     return 0;
+}
+
+static size_t line_count(const ankah_text *text, const char *prefix) {
+    size_t length = strlen(prefix), offset = 0, count = 0;
+    while (offset + length <= text->size) {
+        if ((offset == 0 || text->data[offset - 1] == '\n') &&
+            memcmp(text->data + offset, prefix, length) == 0) ++count;
+        while (offset < text->size && text->data[offset++] != '\n') {}
+    }
+    return count;
 }
 
 static int text_test(void) {
@@ -101,7 +112,8 @@ static int roll_test(void) {
                               "client_bytes_in") == 0 &&
                        ankah_stat_name(ANKAH_STAT_COUNT) == NULL, "field names");
     failures += expect(ANKAH_STAT_COUNT <= ANKAH_STAT_SLOTS &&
-                       sizeof(ankah_stat_record) == 256, "record size");
+                       sizeof(ankah_stat_record) == ANKAH_STAT_SLOTS * sizeof(uint64_t),
+                       "record size");
 
     ankah_stats_roll(start + 60);
     failures += expect(ankah_stats_hour_count() == 0 &&
@@ -152,6 +164,7 @@ static int eviction_test(void) {
     int failures = 0;
     const uint64_t start = 20000 * DAY;
     uint64_t day;
+    ankah_text text;
     ankah_stats_init(start);
     ankah_stats_add(ANKAH_STAT_client_bytes_in, 100);
     ankah_stats_max(ANKAH_STAT_peak_sessions, 40);
@@ -175,6 +188,11 @@ static int eviction_test(void) {
     failures += expect(ankah_stats_evicted()->v[ANKAH_STAT_client_bytes_out] == 9,
                        "long jump keeps the last live day");
     failures += expect(sums_balance(), "balance after long jump");
+    ankah_text_init(&text);
+    ankah_stats_write_csv(&text, start + (3 * ANKAH_STAT_DAYS + 5) * DAY + 60);
+    failures += expect(line_count(&text, "aggregate_days,") == 1,
+                       "CSV includes evicted day aggregate");
+    ankah_text_free(&text);
     return failures;
 }
 
@@ -216,7 +234,7 @@ static int writer_test(void) {
     ankah_text_init(&text);
     ankah_stats_write_schema(&text);
     failures += expect(contains(&text, "\"fields\":[\"client_bytes_in\",") &&
-                       contains(&text, "\"peak_pending_bytes\"],\"kinds\":[\"sum\",") &&
+                       contains(&text, "\"challenge_session_rejected\"],\"kinds\":[\"sum\",") &&
                        contains(&text, "\"day_capacity\":4096"), "schema members");
     ankah_text_free(&text);
 
@@ -229,6 +247,39 @@ static int writer_test(void) {
     ankah_stats_write_history(&text, 100, 100);
     failures += expect(contains(&text, "\"hours\":{\"first\":480000,\"rows\":[[") &&
                        contains(&text, "\"evicted_days\":0"), "history members");
+    ankah_text_free(&text);
+
+    ankah_stats_write_csv(&text, start + 3 * HOUR + 60);
+    failures += expect(text.size > 3 &&
+                       memcmp(text.data, "\xef\xbb\xbf", 3) == 0 &&
+                       contains(&text, "record_type,period_start_utc,period_end_utc,") &&
+                       line_count(&text, "hour,") == 3 &&
+                       line_count(&text, "current_hour,") == 1 &&
+                       contains(&text, "current_hour,2024-") &&
+                       text.data[text.size - 2] == '\r' && text.data[text.size - 1] == '\n',
+                       "CSV writer emits hourly timeline");
+    ankah_text_free(&text);
+
+    ankah_stats_init(start + 14 * HOUR);
+    for (size_t hour = 0; hour < ANKAH_STAT_HOURS + 24; ++hour) {
+        ankah_stats_add(ANKAH_STAT_requests, 1);
+        ankah_stats_roll(start + 14 * HOUR + (hour + 1) * HOUR);
+    }
+    ankah_stats_write_csv(&text, start + 14 * HOUR +
+                          (ANKAH_STAT_HOURS + 24) * HOUR + 60);
+    failures += expect(line_count(&text, "day,") == 2 &&
+                       line_count(&text, "hour,") == ANKAH_STAT_HOURS - 10 &&
+                       line_count(&text, "current_hour,") == 1,
+                       "CSV switches from days to hours without overlap");
+    ankah_text_free(&text);
+
+    ankah_stats_init(start);
+    for (size_t hour = 0; hour < ANKAH_STAT_HOURS + 24; ++hour)
+        ankah_stats_roll(start + (hour + 1) * HOUR);
+    ankah_stats_write_csv(&text, start + (ANKAH_STAT_HOURS + 24) * HOUR + 60);
+    failures += expect(line_count(&text, "day,") == 1 &&
+                       line_count(&text, "hour,") == ANKAH_STAT_HOURS,
+                       "CSV preserves hours at a midnight boundary");
     ankah_text_free(&text);
 
     ankah_stats_init(start + 7);
@@ -255,11 +306,66 @@ static int damage_file(const char *path) {
     return result;
 }
 
+static unsigned int little_u32(const unsigned char *p) {
+    return (unsigned int)p[0] | (unsigned int)p[1] << 8 |
+           (unsigned int)p[2] << 16 | (unsigned int)p[3] << 24;
+}
+
+static int make_older_snapshot(const char *source_path, const char *target_path,
+                               unsigned int version, unsigned int fields) {
+    FILE *source = NULL, *target = NULL;
+    unsigned char *input = NULL, *output = NULL;
+    unsigned char digest[32];
+    long input_size;
+    size_t records, output_size, row;
+    int result = -1;
+    source = fopen(source_path, "rb");
+    if (!source || fseek(source, 0, SEEK_END) != 0 ||
+        (input_size = ftell(source)) < 112 || fseek(source, 0, SEEK_SET) != 0) goto done;
+    input = malloc((size_t)input_size);
+    if (!input || fread(input, 1, (size_t)input_size, source) != (size_t)input_size ||
+        little_u32(input + 8) != 3 ||
+        little_u32(input + 12) != ANKAH_STAT_COUNT) goto done;
+    records = 4U + little_u32(input + 72) + little_u32(input + 76);
+    if ((size_t)input_size != 80U + records * ANKAH_STAT_COUNT * 8U + 32U) goto done;
+    output_size = 80U + records * fields * 8U + 32U;
+    output = calloc(1, output_size);
+    if (!output) goto done;
+    memcpy(output, input, 80);
+    output[8] = (unsigned char)version;
+    output[9] = output[10] = output[11] = 0;
+    output[12] = (unsigned char)fields;
+    output[13] = output[14] = output[15] = 0;
+    for (row = 0; row < records; ++row)
+        memcpy(output + 80U + row * fields * 8U,
+               input + 80U + row * ANKAH_STAT_COUNT * 8U, fields * 8U);
+    if (ankah_sha256(output, output_size - 32U, digest) != 0) goto done;
+    memcpy(output + output_size - 32U, digest, 32U);
+    target = fopen(target_path, "wb");
+    if (!target || fwrite(output, 1, output_size, target) != output_size ||
+        fclose(target) != 0) {
+        target = NULL;
+        goto done;
+    }
+    target = NULL;
+    result = 0;
+done:
+    if (source) fclose(source);
+    if (target) fclose(target);
+    free(input);
+    free(output);
+    return result;
+}
+
 static int persistence_test(void) {
     static const char base[] = "ankah-stats-test-state";
+    static const char v1_base[] = "ankah-stats-test-v1";
+    static const char v2_base[] = "ankah-stats-test-v2";
     const uint64_t start = 30000 * DAY + 5 * HOUR;
     int failures = 0, restored;
     remove_snapshots(base);
+    remove_snapshots(v1_base);
+    remove_snapshots(v2_base);
 
     restored = ankah_stats_restore(base, start);
     failures += expect(restored == 0 && ankah_stats_epoch() == start,
@@ -269,6 +375,29 @@ static int persistence_test(void) {
     ankah_stats_add(ANKAH_STAT_requests, 3);
     failures += expect(ankah_stats_save(base, start + HOUR) == 0,
                        "first snapshot saves");
+    failures += expect(make_older_snapshot("ankah-stats-test-state.1",
+                                          "ankah-stats-test-v1.1", 1, 32) == 0,
+                       "version 1 snapshot fixture converts");
+    failures += expect(make_older_snapshot("ankah-stats-test-state.1",
+                                          "ankah-stats-test-v2.1", 2, 40) == 0,
+                       "version 2 snapshot fixture converts");
+    ankah_stats_init(start + 10);
+    restored = ankah_stats_restore(v1_base, start + HOUR);
+    failures += expect((restored & ANKAH_STATS_RESTORED) &&
+                       !(restored & ANKAH_STATS_DEGRADED) &&
+                       ankah_stats_cumulative()->v[ANKAH_STAT_requests] == 15 &&
+                       ankah_stats_cumulative()->v[ANKAH_STAT_throttled_static_requests] == 0,
+                       "version 1 snapshot migrates with new fields zeroed");
+    restored = ankah_stats_restore(v2_base, start + HOUR);
+    failures += expect((restored & ANKAH_STATS_RESTORED) &&
+                       !(restored & ANKAH_STATS_DEGRADED) &&
+                       ankah_stats_cumulative()->v[ANKAH_STAT_requests] == 15 &&
+                       ankah_stats_cumulative()->v[ANKAH_STAT_rate_limited_anonymous] == 0,
+                       "version 2 snapshot migrates with new fields zeroed");
+    restored = ankah_stats_restore(base, start + HOUR);
+    failures += expect((restored & ANKAH_STATS_RESTORED) &&
+                       !(restored & ANKAH_STATS_DEGRADED),
+                       "current snapshot restores after migration test");
     ankah_stats_add(ANKAH_STAT_requests, 5);
     failures += expect(ankah_stats_save(base, start + HOUR) == 0,
                        "second snapshot saves");
@@ -301,6 +430,8 @@ static int persistence_test(void) {
     failures += expect(ankah_stats_save("missing-directory/ankah", start) != 0,
                        "write failure is reported");
     remove_snapshots(base);
+    remove_snapshots(v1_base);
+    remove_snapshots(v2_base);
     return failures;
 }
 

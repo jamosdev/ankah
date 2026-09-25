@@ -5,8 +5,10 @@ import shlex
 from pathlib import Path
 
 
-PATH_OPTIONS = {"--assets-dir", "--secret-file", "--static-bundle",
-                "--tls-cert", "--tls-key", "--dashboard-token-file", "--stats-file"}
+PATH_OPTIONS = {"--config", "--assets-dir", "--secret-file", "--static-bundle",
+                "--tls-cert", "--tls-key", "--dashboard-token-file", "--stats-file",
+                "--log-unknown-languages", "--dots-ca-file", "--dots-cert-file",
+                "--dots-key-file"}
 
 
 def windows_path(value):
@@ -20,7 +22,7 @@ def gateway_command(executable, arguments):
     converted = []
     path_next = False
     for argument in arguments:
-        if path_next and windows_paths:
+        if path_next and windows_paths and argument:
             converted.append(windows_path(argument))
         else:
             converted.append(str(argument))

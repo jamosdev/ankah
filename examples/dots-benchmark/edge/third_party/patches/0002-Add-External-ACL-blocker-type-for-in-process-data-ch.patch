@@ -1,0 +1,213 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: demo <demo@example.invalid>
+Date: Tue, 22 Sep 2026 15:40:36 +1000
+Subject: [PATCH 2/2] Add External-ACL blocker type for in-process data channel
+ ACL enforcement
+
+---
+ dots_server/models/external_acl_receiver.go | 159 ++++++++++++++++++++
+ dots_server/models/xorm_blocker_dao.go      |   2 +
+ dots_server/models/xorm_protection_dao.go   |   4 +
+ 3 files changed, 165 insertions(+)
+ create mode 100644 dots_server/models/external_acl_receiver.go
+
+diff --git a/dots_server/models/external_acl_receiver.go b/dots_server/models/external_acl_receiver.go
+new file mode 100644
+index 0000000..0b3d6e1
+--- /dev/null
++++ b/dots_server/models/external_acl_receiver.go
+@@ -0,0 +1,159 @@
++package models
++
++import (
++	"errors"
++	"sync"
++	"time"
++
++	types "github.com/nttdots/go-dots/dots_common/types/data"
++	log "github.com/sirupsen/logrus"
++)
++
++// External-ACL hands validated data channel ACLs to an enforcement point in
++// the same process instead of a router. It keeps the normal protection
++// bookkeeping (protection rows, blocker load) so the data channel controllers
++// behave exactly as they do for the other blocker types.
++
++const (
++	BLOCKER_TYPE_EXTERNAL_ACL = "External-ACL"
++	PROTECTION_TYPE_EXTERNAL  = "ExternalACL"
++)
++
++// ExternalACLHandler receives ACL activations and deactivations.
++// aclID is the data_acls row id, which stays stable while the ACL is updated.
++type ExternalACLHandler interface {
++	InstallACL(customerID int, aclID int64, acl *types.ACL) error
++	RemoveACL(customerID int, aclID int64, aclName string) error
++}
++
++var (
++	externalACLHandlerMu sync.RWMutex
++	externalACLHandler   ExternalACLHandler
++)
++
++func RegisterExternalACLHandler(h ExternalACLHandler) {
++	externalACLHandlerMu.Lock()
++	defer externalACLHandlerMu.Unlock()
++	externalACLHandler = h
++}
++
++func currentExternalACLHandler() ExternalACLHandler {
++	externalACLHandlerMu.RLock()
++	defer externalACLHandlerMu.RUnlock()
++	return externalACLHandler
++}
++
++// implements Protection
++type ExternalACL struct {
++	ProtectionBase
++	acl *types.ACL
++}
++
++func (p ExternalACL) Type() ProtectionType {
++	return PROTECTION_TYPE_EXTERNAL
++}
++
++// implements Blocker
++type ExternalACLReceiver struct {
++	BlockerBase
++}
++
++func NewExternalACLReceiver(base BlockerBase) *ExternalACLReceiver {
++	return &ExternalACLReceiver{base}
++}
++
++func (e *ExternalACLReceiver) Type() BlockerType {
++	return BLOCKER_TYPE_EXTERNAL_ACL
++}
++
++func (e *ExternalACLReceiver) Connect() error {
++	return nil
++}
++
++func (e *ExternalACLReceiver) GenerateProtectionCommand(m *MitigationScope) (string, error) {
++	return "", nil
++}
++
++func (e *ExternalACLReceiver) RegisterProtection(r *MitigationOrDataChannelACL, targetID int64, customerID int, targetType string) (Protection, error) {
++	if r.DataChannelACL == nil {
++		return nil, errors.New("External-ACL only supports data channel ACLs")
++	}
++	base := ProtectionBase{
++		0,
++		customerID,
++		targetID,
++		targetType,
++		r.DataChannelACL.Name,
++		"",
++		"",
++		e,
++		false,
++		time.Unix(0, 0),
++		time.Unix(0, 0),
++		time.Unix(0, 0),
++		NewProtectionStatus(0, 0, 0, 0, 0),
++	}
++	dbP, err := CreateProtection2(&ExternalACL{base, nil})
++	if err != nil {
++		return nil, err
++	}
++	p, err := GetProtectionById(dbP.Id)
++	if err != nil {
++		return nil, err
++	}
++	t, ok := p.(*ExternalACL)
++	if !ok {
++		return nil, errors.New("Protection type error")
++	}
++	acl := *r.DataChannelACL
++	t.acl = &acl
++	return t, nil
++}
++
++func (e *ExternalACLReceiver) ExecuteProtection(p Protection) error {
++	t, ok := p.(*ExternalACL)
++	if !ok || t.acl == nil {
++		log.Warnf("ExternalACLReceiver::ExecuteProtection protection type error. %T", p)
++		return errors.New("Protection type error")
++	}
++	h := currentExternalACLHandler()
++	if h == nil {
++		return errors.New("External-ACL handler is not registered")
++	}
++	if err := h.InstallACL(t.CustomerId(), t.TargetId(), t.acl); err != nil {
++		return err
++	}
++	if err := StartProtection(p, e); err != nil {
++		if rmErr := h.RemoveACL(t.CustomerId(), t.TargetId(), t.AclName()); rmErr != nil {
++			log.WithError(rmErr).Error("External-ACL rollback failed")
++		}
++		return err
++	}
++	return nil
++}
++
++func (e *ExternalACLReceiver) StopProtection(p Protection) error {
++	t, ok := p.(*ExternalACL)
++	if !ok {
++		log.Warnf("ExternalACLReceiver::StopProtection protection type error. %T", p)
++		return errors.New("Protection type error")
++	}
++	if !t.isEnabled {
++		return errors.New("Protection not started")
++	}
++	h := currentExternalACLHandler()
++	if h == nil {
++		return errors.New("External-ACL handler is not registered")
++	}
++	if err := h.RemoveACL(t.CustomerId(), t.TargetId(), t.AclName()); err != nil {
++		return err
++	}
++	return StopProtection(p, e)
++}
++
++func (e *ExternalACLReceiver) UnregisterProtection(p Protection) error {
++	if _, ok := p.(*ExternalACL); !ok {
++		return errors.New("Protection type error")
++	}
++	return DeleteProtectionById(p.Id())
++}
+diff --git a/dots_server/models/xorm_blocker_dao.go b/dots_server/models/xorm_blocker_dao.go
+index d138f90..5dc750f 100644
+--- a/dots_server/models/xorm_blocker_dao.go
++++ b/dots_server/models/xorm_blocker_dao.go
+@@ -357,6 +357,8 @@ func toBlocker(blocker db_models.Blocker, blockerConfig *db_models.BlockerConfig
+ 		b = NewGoBgpFlowSpecReceiver(base, paramMap, configParamMap)
+ 	case BLOCKER_TYPE_GO_ARISTA:
+ 		b = NewGoAristaReceiver(base, configParamMap)
++	case BLOCKER_TYPE_EXTERNAL_ACL:
++		b = NewExternalACLReceiver(base)
+ 	default:
+ 		err = errors.New(fmt.Sprintf("invalid blocker type: %s", blocker.BlockerType))
+ 		return nil, err
+diff --git a/dots_server/models/xorm_protection_dao.go b/dots_server/models/xorm_protection_dao.go
+index 49b88b2..e346d76 100644
+--- a/dots_server/models/xorm_protection_dao.go
++++ b/dots_server/models/xorm_protection_dao.go
+@@ -235,6 +235,8 @@ func CreateProtection2(protection Protection) (newProtection db_models.Protectio
+ 				"flow_spec_parameters": flowSpecParameters,
+ 			}).Debug("create new flow_spec_parameter")
+ 		}
++	} else if string(protection.Type()) == PROTECTION_TYPE_EXTERNAL {
++		// External-ACL keeps no blocker-specific parameters.
+ 	} else {
+ 		log.WithFields(log.Fields{
+ 			"type": protection.Type(),
+@@ -498,6 +500,8 @@ func toProtection(engine *xorm.Engine, dbp db_models.Protection) (p Protection,
+ 		    return nil, err
+ 	    }
+ 		p = NewAristaProtection(pb, aristaParams)
++	case PROTECTION_TYPE_EXTERNAL:
++		p = &ExternalACL{pb, nil}
+ 	default:
+ 		p = nil
+ 		err = errors.New(fmt.Sprintf("invalid protection type: %s", dbp.ProtectionType))

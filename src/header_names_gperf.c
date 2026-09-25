@@ -1,6 +1,6 @@
 /* ANSI-C code produced by gperf version 3.1 */
 /* Generated from src/header_names.gperf. */
-/* Computed positions: -k'2' */
+/* Computed positions: -k'2,8' */
 
 #if !((' ' == 32) && ('!' == 33) && ('"' == 34) && ('#' == 35) \
       && ('%' == 37) && ('&' == 38) && ('\'' == 39) && ('(' == 40) \
@@ -33,12 +33,12 @@
 
 #include "header_names.h"
 
-#define TOTAL_KEYWORDS 30
+#define TOTAL_KEYWORDS 31
 #define MIN_WORD_LENGTH 2
 #define MAX_WORD_LENGTH 21
 #define MIN_HASH_VALUE 4
-#define MAX_HASH_VALUE 40
-/* maximum key range = 37, duplicates = 0 */
+#define MAX_HASH_VALUE 55
+/* maximum key range = 52, duplicates = 0 */
 
 #ifndef GPERF_DOWNCASE
 #define GPERF_DOWNCASE 1
@@ -97,113 +97,139 @@ ankah_header_hash (register const char *str, register size_t len)
 {
   static const unsigned char asso_values[] =
     {
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 15, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 23, 41,  5, 41, 13,
-       5, 41, 41, 41, 41, 41, 41, 25, 41,  0,
-      20, 41,  0, 30, 15, 25, 41, 41,  5, 41,
-      41, 41, 41, 41, 41, 41, 41, 23, 41,  5,
-      41, 13,  5, 41, 41, 41, 41, 41, 41, 25,
-      41,  0, 20, 41,  0, 30, 15, 25, 41, 41,
-       5, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41, 41, 41, 41, 41,
-      41, 41, 41, 41, 41, 41
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56,  0, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56,  3, 56,  5, 56, 20,
+       5, 56, 56,  0, 56, 56, 25, 18, 56,  0,
+      30, 56,  0, 25,  0,  0, 56, 56,  5, 56,
+      10, 56, 56, 56, 56, 56, 56,  3, 56,  5,
+      56, 20,  5, 56, 56,  0, 56, 56, 25, 18,
+      56,  0, 30, 56,  0, 25,  0,  0, 56, 56,
+       5, 56, 10, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56, 56, 56, 56, 56,
+      56, 56, 56, 56, 56, 56
     };
-  return len + asso_values[(unsigned char)str[1]];
+  register unsigned int hval = len;
+
+  switch (hval)
+    {
+      default:
+        hval += asso_values[(unsigned char)str[7]];
+      /*FALLTHROUGH*/
+      case 7:
+      case 6:
+      case 5:
+      case 4:
+      case 3:
+      case 2:
+        hval += asso_values[(unsigned char)str[1]];
+        break;
+    }
+  return hval;
 }
 
 static const unsigned char lengthtable[] =
   {
-     0,  0,  0,  0,  4,  0,  6,  7,  0,  9, 10,  6, 12,  8,
-    14,  2, 16, 17, 13, 19, 15,  0, 17, 10,  9,  5,  0,  7,
-     5, 14, 15,  0,  7, 10,  0, 20, 21,  7, 13,  0, 10
+     0,  0,  0,  0,  4,  0,  6,  7,  5,  9, 10,  6, 12, 10,
+    14, 15, 16, 17, 13, 19, 20, 21,  2, 13,  0,  7,  0, 17,
+     0,  9, 10,  0,  7,  8, 14,  5,  0,  7,  0,  0, 15,  0,
+     0,  0,  0, 15,  0,  0,  0,  0,  0,  0,  0,  0,  0, 10
   };
 
 static const struct ankah_header_keyword ankah_header_words[] =
   {
     {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
     {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
-#line 30 "src/header_names.gperf"
+#line 31 "src/header_names.gperf"
     {"host", ANKAH_HEADER_HOST},
     {"", ANKAH_HEADER_OTHER},
-#line 27 "src/header_names.gperf"
-    {"cookie", ANKAH_HEADER_COOKIE},
-#line 40 "src/header_names.gperf"
-    {"trailer", ANKAH_HEADER_TRAILER},
-    {"", ANKAH_HEADER_OTHER},
-#line 29 "src/header_names.gperf"
-    {"forwarded", ANKAH_HEADER_FORWARDED},
-#line 24 "src/header_names.gperf"
-    {"connection", ANKAH_HEADER_CONNECTION},
 #line 28 "src/header_names.gperf"
-    {"expect", ANKAH_HEADER_EXPECT},
-#line 26 "src/header_names.gperf"
-    {"content-type", ANKAH_HEADER_CONTENT_TYPE},
-#line 34 "src/header_names.gperf"
-    {"if-range", ANKAH_HEADER_IF_RANGE},
-#line 25 "src/header_names.gperf"
-    {"content-length", ANKAH_HEADER_CONTENT_LENGTH},
-#line 39 "src/header_names.gperf"
-    {"te", ANKAH_HEADER_TE},
-#line 37 "src/header_names.gperf"
-    {"proxy-connection", ANKAH_HEADER_PROXY_CONNECTION},
+    {"cookie", ANKAH_HEADER_COOKIE},
 #line 41 "src/header_names.gperf"
-    {"transfer-encoding", ANKAH_HEADER_TRANSFER_ENCODING},
-#line 33 "src/header_names.gperf"
-    {"if-none-match", ANKAH_HEADER_IF_NONE_MATCH},
-#line 36 "src/header_names.gperf"
-    {"proxy-authorization", ANKAH_HEADER_PROXY_AUTHORIZATION},
-#line 22 "src/header_names.gperf"
-    {"accept-encoding", ANKAH_HEADER_ACCEPT_ENCODING},
-    {"", ANKAH_HEADER_OTHER},
-#line 32 "src/header_names.gperf"
-    {"if-modified-since", ANKAH_HEADER_IF_MODIFIED_SINCE},
-#line 35 "src/header_names.gperf"
-    {"keep-alive", ANKAH_HEADER_KEEP_ALIVE},
-#line 47 "src/header_names.gperf"
-    {"x-real-ip", ANKAH_HEADER_X_REAL_IP},
-#line 20 "src/header_names.gperf"
-    {":path", ANKAH_HEADER_PSEUDO_PATH},
-    {"", ANKAH_HEADER_OTHER},
-#line 42 "src/header_names.gperf"
-    {"upgrade", ANKAH_HEADER_UPGRADE},
-#line 38 "src/header_names.gperf"
+    {"trailer", ANKAH_HEADER_TRAILER},
+#line 39 "src/header_names.gperf"
     {"range", ANKAH_HEADER_RANGE},
-#line 31 "src/header_names.gperf"
-    {"http2-settings", ANKAH_HEADER_HTTP2_SETTINGS},
-#line 46 "src/header_names.gperf"
+#line 48 "src/header_names.gperf"
+    {"x-real-ip", ANKAH_HEADER_X_REAL_IP},
+#line 25 "src/header_names.gperf"
+    {"connection", ANKAH_HEADER_CONNECTION},
+#line 29 "src/header_names.gperf"
+    {"expect", ANKAH_HEADER_EXPECT},
+#line 27 "src/header_names.gperf"
+    {"content-type", ANKAH_HEADER_CONTENT_TYPE},
+#line 18 "src/header_names.gperf"
+    {":authority", ANKAH_HEADER_PSEUDO_AUTHORITY},
+#line 26 "src/header_names.gperf"
+    {"content-length", ANKAH_HEADER_CONTENT_LENGTH},
+#line 47 "src/header_names.gperf"
     {"x-forwarded-for", ANKAH_HEADER_X_FORWARDED_FOR},
+#line 38 "src/header_names.gperf"
+    {"proxy-connection", ANKAH_HEADER_PROXY_CONNECTION},
+#line 42 "src/header_names.gperf"
+    {"transfer-encoding", ANKAH_HEADER_TRANSFER_ENCODING},
+#line 34 "src/header_names.gperf"
+    {"if-none-match", ANKAH_HEADER_IF_NONE_MATCH},
+#line 37 "src/header_names.gperf"
+    {"proxy-authorization", ANKAH_HEADER_PROXY_AUTHORIZATION},
+#line 45 "src/header_names.gperf"
+    {"x-ankah-internal-key", ANKAH_HEADER_X_ANKAH_INTERNAL_KEY},
+#line 46 "src/header_names.gperf"
+    {"x-ankah-internal-peer", ANKAH_HEADER_X_ANKAH_INTERNAL_PEER},
+#line 40 "src/header_names.gperf"
+    {"te", ANKAH_HEADER_TE},
+#line 24 "src/header_names.gperf"
+    {"authorization", ANKAH_HEADER_AUTHORIZATION},
     {"", ANKAH_HEADER_OTHER},
 #line 19 "src/header_names.gperf"
     {":method", ANKAH_HEADER_PSEUDO_METHOD},
-#line 18 "src/header_names.gperf"
-    {":authority", ANKAH_HEADER_PSEUDO_AUTHORITY},
     {"", ANKAH_HEADER_OTHER},
-#line 44 "src/header_names.gperf"
-    {"x-ankah-internal-key", ANKAH_HEADER_X_ANKAH_INTERNAL_KEY},
-#line 45 "src/header_names.gperf"
-    {"x-ankah-internal-peer", ANKAH_HEADER_X_ANKAH_INTERNAL_PEER},
+#line 33 "src/header_names.gperf"
+    {"if-modified-since", ANKAH_HEADER_IF_MODIFIED_SINCE},
+    {"", ANKAH_HEADER_OTHER},
+#line 30 "src/header_names.gperf"
+    {"forwarded", ANKAH_HEADER_FORWARDED},
+#line 36 "src/header_names.gperf"
+    {"keep-alive", ANKAH_HEADER_KEEP_ALIVE},
+    {"", ANKAH_HEADER_OTHER},
 #line 21 "src/header_names.gperf"
     {":scheme", ANKAH_HEADER_PSEUDO_SCHEME},
-#line 23 "src/header_names.gperf"
-    {"authorization", ANKAH_HEADER_AUTHORIZATION},
+#line 35 "src/header_names.gperf"
+    {"if-range", ANKAH_HEADER_IF_RANGE},
+#line 32 "src/header_names.gperf"
+    {"http2-settings", ANKAH_HEADER_HTTP2_SETTINGS},
+#line 20 "src/header_names.gperf"
+    {":path", ANKAH_HEADER_PSEUDO_PATH},
     {"", ANKAH_HEADER_OTHER},
 #line 43 "src/header_names.gperf"
+    {"upgrade", ANKAH_HEADER_UPGRADE},
+    {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
+#line 22 "src/header_names.gperf"
+    {"accept-encoding", ANKAH_HEADER_ACCEPT_ENCODING},
+    {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
+    {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
+#line 23 "src/header_names.gperf"
+    {"accept-language", ANKAH_HEADER_ACCEPT_LANGUAGE},
+    {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
+    {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
+    {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
+    {"", ANKAH_HEADER_OTHER}, {"", ANKAH_HEADER_OTHER},
+    {"", ANKAH_HEADER_OTHER},
+#line 44 "src/header_names.gperf"
     {"user-agent", ANKAH_HEADER_USER_AGENT}
   };
 
@@ -225,5 +251,5 @@ ankah_header_lookup (register const char *str, register size_t len)
     }
   return 0;
 }
-#line 48 "src/header_names.gperf"
+#line 49 "src/header_names.gperf"
 

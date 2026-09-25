@@ -11,6 +11,7 @@ from urllib.parse import quote
 
 
 VERSION = "ANKAH_STATIC_V2"
+SPA_VERSION = "ANKAH_STATIC_V3"
 HASHED_NAME = re.compile(r"(?:^|[.-])[0-9a-fA-F]{8,}(?:[.-]|$)")
 SKIP_PARTS = {".git", ".venv", "venv", "node_modules", "__pycache__"}
 COMPRESSIBLE = {"application/javascript", "application/json", "application/xml",
@@ -54,7 +55,28 @@ def validate_prefix(prefix):
         raise ValueError("URL prefix contains an unsupported character")
 
 
-def package(source, output, prefix):
+def fallback_url(source, prefix, value):
+    if not value or "\\" in value:
+        raise ValueError("SPA fallback must be a source-relative HTML path")
+    relative = Path(value)
+    if relative.is_absolute() or not relative.parts or any(
+            part in ("", ".", "..") or part.startswith(".") or part in SKIP_PARTS
+            for part in relative.parts):
+        raise ValueError("SPA fallback must be a packaged source-relative path")
+    path = source / relative
+    current = source
+    linked = False
+    for part in relative.parts:
+        current /= part
+        linked = linked or current.is_symlink()
+    if linked or not path.is_file():
+        raise ValueError("SPA fallback must name a packaged regular file")
+    if mime_type(path).split(";", 1)[0] != "text/html":
+        raise ValueError("SPA fallback must be an HTML file")
+    return prefix + "/".join(quote(part, safe="-._~") for part in relative.parts)
+
+
+def package(source, output, prefix, spa_fallback=None):
     try:
         import brotli
     except ImportError as error:
@@ -66,9 +88,11 @@ def package(source, output, prefix):
     if output.exists() and any(output.iterdir()):
         raise ValueError("output directory must be empty")
     validate_prefix(prefix)
+    spa_url = fallback_url(source, prefix, spa_fallback) if spa_fallback else None
     files_dir = output / "files"
     files_dir.mkdir(parents=True, exist_ok=True)
-    lines = [f"{VERSION}\t{prefix}\n"]
+    lines = [f"{SPA_VERSION}\t{prefix}\t{spa_url}\n" if spa_url else
+             f"{VERSION}\t{prefix}\n"]
     count = 0
     for path in sorted(source.rglob("*")):
         relative = path.relative_to(source)
@@ -127,6 +151,8 @@ def main():
     parser.add_argument("--source", type=Path, help="static directory, relative to project root")
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--url-prefix", help="public URL prefix; defaults to /static/ or /assets/")
+    parser.add_argument("--spa-fallback", metavar="HTML",
+                        help="source-relative HTML shell for opt-in SPA navigation fallback")
     args = parser.parse_args()
     try:
         root = args.project_root.resolve(strict=True)
@@ -136,7 +162,7 @@ def main():
         else:
             source, prefix = detect(root)
         prefix = args.url_prefix or prefix
-        count = package(source, args.output, prefix)
+        count = package(source, args.output, prefix, args.spa_fallback)
     except (OSError, ValueError) as error:
         parser.error(str(error))
     print(f"Packaged {count} static file(s) from {source} at {prefix} into {args.output}")

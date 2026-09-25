@@ -4,6 +4,8 @@
 #include <string.h>
 
 #define MAX_SESSIONS 4096
+#define MAX_ANONYMOUS_UNSOLVED 3072
+#define MAX_ANONYMOUS_UNSOLVED_PER_IP 64
 #define MAX_PENDING_BYTES (64U * 1024U * 1024U)
 
 static ankah_session sessions[MAX_SESSIONS];
@@ -61,11 +63,13 @@ ankah_session *ankah_session_find(const char *id, uint64_t now) {
     return NULL;
 }
 
-ankah_session *ankah_session_new(const unsigned char secret[ANKAH_SECRET_SIZE],
-                                 const char *host, uint64_t now,
-                                 const ankah_request *request, const char *peer_ip) {
+ankah_session *ankah_session_new_with_proof(const unsigned char secret[ANKAH_SECRET_SIZE],
+                                            const char *host, uint64_t now,
+                                            const ankah_request *request,
+                                            const char *peer_ip, int proved) {
     ankah_session *session = NULL;
     size_t i, body_size = 0;
+    size_t anonymous_unsolved = 0, anonymous_for_ip = 0;
     int is_post;
     if (!request || !host || !peer_ip) return NULL;
     is_post = strcmp(request->method, "POST") == 0;
@@ -77,9 +81,20 @@ ankah_session *ankah_session_new(const unsigned char secret[ANKAH_SECRET_SIZE],
     }
     for (i = 0; i < MAX_SESSIONS; ++i) {
         expire(&sessions[i], now);
-        if (!sessions[i].active) { session = &sessions[i]; break; }
+        if (!sessions[i].active && !session) session = &sessions[i];
     }
     if (!session) return NULL;
+    if (!proved) {
+        for (i = 0; i < MAX_SESSIONS; ++i) {
+            ankah_session *candidate = &sessions[i];
+            if (!candidate->active || candidate->issued_with_proof ||
+                candidate->solved_until) continue;
+            ++anonymous_unsolved;
+            if (strcmp(candidate->peer_ip, peer_ip) == 0) ++anonymous_for_ip;
+        }
+        if (anonymous_unsolved >= MAX_ANONYMOUS_UNSOLVED ||
+            anonymous_for_ip >= MAX_ANONYMOUS_UNSOLVED_PER_IP) return NULL;
+    }
     memset(session, 0, sizeof(*session));
     random_hex(session->id);
     random_hex(session->token);
@@ -88,6 +103,7 @@ ankah_session *ankah_session_new(const unsigned char secret[ANKAH_SECRET_SIZE],
     strcpy(session->target, request->target);
     strcpy(session->peer_ip, peer_ip);
     session->issued = now;
+    session->issued_with_proof = proved != 0;
     session->is_post = is_post;
     if (is_post) {
         session->saved_request = malloc(sizeof(*session->saved_request));
@@ -104,6 +120,12 @@ ankah_session *ankah_session_new(const unsigned char secret[ANKAH_SECRET_SIZE],
     }
     session->active = 1;
     return session;
+}
+
+ankah_session *ankah_session_new(const unsigned char secret[ANKAH_SECRET_SIZE],
+                                 const char *host, uint64_t now,
+                                 const ankah_request *request, const char *peer_ip) {
+    return ankah_session_new_with_proof(secret, host, now, request, peer_ip, 0);
 }
 
 int ankah_session_append(ankah_session *session, const void *data, size_t size) {

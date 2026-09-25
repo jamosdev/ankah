@@ -60,6 +60,7 @@
 }
 
 * { box-sizing: border-box; }
+[hidden] { display: none !important; }
 
 html, body {
   margin: 0;
@@ -134,12 +135,30 @@ button[aria-pressed="true"] {
 .status.is-error { color: var(--ink); }
 .status.is-error::before { content: "\26A0\FE0E  "; color: var(--critical); }
 .actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.export-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 36px;
+  height: 36px;
+  padding: 5px;
+  border-color: #0b6334;
+  background: #107c41;
+}
+.export-button:hover { background: #0b6334; }
+.export-button:disabled { cursor: wait; opacity: 0.6; }
+.export-button svg { width: 24px; height: 24px; }
+.export-sheet { fill: #e8f3ed; }
+.export-grid { fill: none; stroke: #107c41; stroke-width: 1.2; }
+.export-badge { fill: #0b6334; }
+.export-x { fill: none; stroke: white; stroke-width: 1.8; stroke-linecap: round; }
 
 .label { color: var(--ink-2); font-size: 0.875rem; }
 .note { color: var(--muted); font-size: 0.8125rem; }
 .persistence-warning { color: var(--critical); font-size: 0.8125rem; }
 
 .login { max-width: 460px; display: grid; gap: 12px; }
+.login-mode { display: block; margin-top: 12px; }
 .login input {
   width: 100%;
   padding: 8px 10px;
@@ -148,6 +167,18 @@ button[aria-pressed="true"] {
   background: var(--page);
   font-family: ui-monospace, monospace;
 }
+
+#setup-dialog {
+  width: min(360px, calc(100vw - 32px));
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface);
+  color: var(--ink);
+  padding: 20px;
+}
+#setup-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+#setup-dialog h2, #setup-dialog p { margin-bottom: 12px; }
+#setup-qr { display: block; max-width: 100%; height: auto; margin: 0 auto 16px; }
 
 .now {
   display: grid;

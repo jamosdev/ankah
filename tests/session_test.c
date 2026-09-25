@@ -1,5 +1,9 @@
 #include "ankah/session.h"
+#ifdef NDEBUG
+#undef NDEBUG
+#endif
 #include <assert.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -68,5 +72,33 @@ int main(void) {
 
     request.content_length = ANKAH_POST_REPLAY_MAX + 1;
     assert(!ankah_session_new(secret, "localhost", now, &request, "127.0.0.1"));
+
+    {
+        const uint64_t issued = now + 3000;
+        ankah_session *first = NULL, *second = NULL;
+        char peer[64];
+        unsigned int i;
+        strcpy(request.method, "GET");
+        strcpy(request.target, "/private");
+        request.content_length = 0;
+        for (i = 0; i < 64; ++i) {
+            session = ankah_session_new(secret, "localhost", issued, &request, "client-a");
+            assert(session);
+            if (!first) first = session;
+            else if (!second) second = session;
+        }
+        assert(!ankah_session_new(secret, "localhost", issued, &request, "client-a"));
+        assert(ankah_session_solve(first, issued + 1) == 0);
+        assert(ankah_session_new(secret, "localhost", issued, &request, "client-a"));
+        for (i = 64; i < 3072; ++i) {
+            snprintf(peer, sizeof(peer), "client-%u", i);
+            assert(ankah_session_new(secret, "localhost", issued, &request, peer));
+        }
+        assert(!ankah_session_new(secret, "localhost", issued, &request, "extra"));
+        assert(ankah_session_new_with_proof(secret, "localhost", issued,
+                                            &request, "proved", 1));
+        assert(ankah_session_solve(second, issued + 1) == 0);
+        assert(ankah_session_new(secret, "localhost", issued, &request, "extra"));
+    }
     return 0;
 }

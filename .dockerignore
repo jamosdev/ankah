@@ -1,0 +1,15 @@
+.git
+build
+ci-build
+ci-windows
+build-release-*
+.venv-release
+ci-package
+dist
+.cache
+.venv
+protocol-matrix-artifacts
+protocol-matrix-ca.pem
+__pycache__
+*.pyc
+examples/dots-benchmark/edge/third_party/go-dots

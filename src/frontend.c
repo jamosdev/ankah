@@ -1,8 +1,14 @@
 #include "ankah/frontend.h"
+#include "ankah/h3_frontend.h"
 #include "ankah/files.h"
+#include "ankah/language.h"
+#include "language_internal.h"
 #include "header_names.h"
 #include "ankah/http.h"
 #include "ankah/stats.h"
+#include "h2_flow_policy.h"
+#include "timeout_policy.h"
+#include "crawler.h"
 
 #include <llhttp.h>
 #include <mbedtls/ctr_drbg.h>
@@ -13,6 +19,7 @@
 #include <mbedtls/x509_crt.h>
 #include <nghttp2/nghttp2.h>
 
+#include <inttypes.h>
 #include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -20,10 +27,13 @@
 #include <string.h>
 
 #define FRONT_MAX_CONNECTIONS ANKAH_FRONTEND_MAX_CONNECTIONS
+#define FRONT_ANONYMOUS_CONNECTIONS 192
+#define FRONT_PENDING_CONNECTIONS 32
 #define FRONT_MAX_CIPHER_INPUT (256U * 1024U)
+#define FRONT_READ_SIZE 16384U
 #define FRONT_MAX_PLAIN_OUTPUT (2U * 1024U * 1024U)
 #define FRONT_MAX_H1_HEADER ANKAH_HEADER_LIMIT
-#define H2_MAX_STREAMS 32
+#define H2_MAX_STREAMS ANKAH_H2_MAX_STREAMS
 #define H2_MAX_BODY (16U * 1024U * 1024U)
 #define H2_MAX_BODY_TOTAL (64U * 1024U * 1024U)
 #define H2_MAX_RESPONSE_QUEUE (2U * 1024U * 1024U)
@@ -60,6 +70,14 @@ typedef struct {
     front_connection *front;
 } bridge_write;
 
+typedef struct {
+    uv_write_t request;
+    uv_buf_t buffer;
+    h2_stream *stream;
+    buffer_chunk *chunk;
+    int header;
+} h2_request_write;
+
 struct h2_stream {
     h2_stream *next;
     front_connection *front;
@@ -73,7 +91,26 @@ struct h2_stream {
     int regular_headers;
     int invalid;
     int dispatched;
+    int admitted;
+    int anonymous_admitted;
+    int proved;
     int closed_by_h2;
+    int drain_tracked;
+    int has_content_length;
+    int request_finished;
+    int request_stopped;
+    int request_write_pending;
+    int long_timeout;
+    int crawler_slot;
+    int bing_claim;
+    uint64_t crawler_slot_id;
+    size_t declared_length;
+    size_t request_received;
+    char *request_head;
+    size_t request_head_size;
+    buffer_chunk *request_first;
+    buffer_chunk *request_last;
+    size_t request_queued;
     unsigned char *body;
     size_t body_size;
     size_t body_capacity;
@@ -99,6 +136,7 @@ struct h2_stream {
 };
 
 struct front_connection {
+    front_connection *previous, *next;
     uv_tcp_t client;
     uv_tcp_t bridge;
     uv_connect_t bridge_connect;
@@ -113,11 +151,13 @@ struct front_connection {
     int timer_initialized;
     int handshake_complete;
     int protocol_h2;
+    int listed;
     int closing;
     int close_notify_started;
     int close_notify_sent;
     int driving;
     int drive_again;
+    int client_paused;
     char peer_ip[64];
     unsigned char *cipher_input;
     size_t cipher_size;
@@ -128,9 +168,21 @@ struct front_connection {
     unsigned char h1_header[FRONT_MAX_H1_HEADER];
     size_t h1_header_size;
     int h1_header_sent;
+    unsigned char h1_response_header[FRONT_MAX_H1_HEADER];
+    size_t h1_response_size;
+    int h1_response_sent;
+    int h1_rejected;
+    int admission_state;
+    int crawler_slot;
+    uint64_t crawler_slot_id;
+    uint64_t admission_deadline_ns;
+    int drain_tracked;
     nghttp2_session *h2;
     h2_stream *streams;
     size_t h2_body_total;
+    unsigned int h2_long_streams;
+    unsigned int h2_anonymous_streams;
+    int h2_latest_class;
 };
 
 typedef struct {
@@ -139,6 +191,15 @@ typedef struct {
     mbedtls_ctr_drbg_context random;
     tls_credentials *active;
     unsigned int connections;
+    unsigned int pending_connections;
+    unsigned int anonymous_connections;
+    uint64_t next_crawler_slot_id;
+    unsigned int active_work;
+    size_t h2_request_queued;
+    int draining;
+    int drained_notified;
+    int shutdown;
+    front_connection *first;
 #ifndef _WIN32
     uv_signal_t reload_signal;
     int reload_signal_initialized;
@@ -154,12 +215,57 @@ typedef struct {
 
 static frontend_configuration frontend;
 
+static uint64_t next_crawler_slot_id(void) {
+    if (++frontend.next_crawler_slot_id == 0) ++frontend.next_crawler_slot_id;
+    return frontend.next_crawler_slot_id;
+}
+
+void ankah_frontend_release_crawler_slot(uint64_t slot_id) {
+    front_connection *front;
+    if (!slot_id) return;
+    for (front = frontend.first; front; front = front->next) {
+        h2_stream *stream;
+        if (front->crawler_slot_id == slot_id && front->crawler_slot) {
+            front->crawler_slot = 0;
+            front->crawler_slot_id = 0;
+            ankah_crawler_release();
+            return;
+        }
+        for (stream = front->streams; stream; stream = stream->next) {
+            if (stream->crawler_slot_id == slot_id && stream->crawler_slot) {
+                stream->crawler_slot = 0;
+                stream->crawler_slot_id = 0;
+                ankah_crawler_release();
+                return;
+            }
+        }
+    }
+    (void)ankah_h3_release_crawler_slot(slot_id);
+}
+
 static void drive_tls(front_connection *front);
 static void close_front(front_connection *front);
 static void h2_flush(front_connection *front);
 static void h2_dispatch(h2_stream *stream);
+static void h2_discard_request(h2_stream *stream);
 static void on_timeout(uv_timer_t *timer);
 static void on_h2_core_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *buffer);
+static void h2_write_request(h2_stream *stream);
+static void h2_request_failure(h2_stream *stream, int status, const char *body);
+
+static void notify_drained(void) {
+    if (!frontend.draining || frontend.active_work || frontend.drained_notified) return;
+    frontend.drained_notified = 1;
+    if (frontend.options.drained)
+        frontend.options.drained(frontend.options.drained_data);
+}
+
+static void release_stream_work(h2_stream *stream) {
+    if (!stream->drain_tracked) return;
+    stream->drain_tracked = 0;
+    if (frontend.active_work) --frontend.active_work;
+    notify_drained();
+}
 
 static int same_ascii_part(const char *left, size_t left_size,
                            const char *right, size_t right_size) {
@@ -267,6 +373,11 @@ static int reload_credentials(void) {
         fprintf(stderr, "Ankah kept the current TLS credentials\n");
         return -1;
     }
+    if (ankah_h3_reload_credentials() != 0) {
+        credentials_free(replacement);
+        fprintf(stderr, "Ankah kept the current TLS credentials\n");
+        return -1;
+    }
     previous = frontend.active;
     frontend.active = replacement;
     if (previous) {
@@ -350,10 +461,25 @@ static void free_chunks(buffer_chunk *chunk) {
 
 static void front_unref(front_connection *front) {
     if (--front->handles) return;
+    if (front->listed) {
+        if (front->previous) front->previous->next = front->next;
+        else frontend.first = front->next;
+        if (front->next) front->next->previous = front->previous;
+        front->listed = 0;
+    }
+    if (front->drain_tracked) {
+        front->drain_tracked = 0;
+        if (frontend.active_work) --frontend.active_work;
+    }
     if (front->h2) nghttp2_session_del(front->h2);
+    if (front->crawler_slot) ankah_crawler_release();
     while (front->streams) {
         h2_stream *next = front->streams->next;
+        release_stream_work(front->streams);
+        if (front->streams->crawler_slot) ankah_crawler_release();
         free(front->streams->body);
+        free(front->streams->request_head);
+        h2_discard_request(front->streams);
         free_chunks(front->streams->response_first);
         free(front->streams);
         front->streams = next;
@@ -363,7 +489,10 @@ static void front_unref(front_connection *front) {
     mbedtls_ssl_free(&front->ssl);
     credentials_release(front->credentials);
     --frontend.connections;
+    if (front->admission_state == 0) --frontend.pending_connections;
+    else if (front->admission_state == 1) --frontend.anonymous_connections;
     free(front);
+    notify_drained();
 }
 
 static void stream_maybe_free(h2_stream *stream) {
@@ -373,7 +502,11 @@ static void stream_maybe_free(h2_stream *stream) {
     for (item = &front->streams; *item; item = &(*item)->next) {
         if (*item == stream) {
             *item = stream->next;
+            release_stream_work(stream);
+            if (stream->crawler_slot) ankah_crawler_release();
             free(stream->body);
+            free(stream->request_head);
+            h2_discard_request(stream);
             free_chunks(stream->response_first);
             free(stream);
             return;
@@ -417,17 +550,42 @@ static void close_front(front_connection *front) {
         uv_close((uv_handle_t *)&front->timer, on_front_handle_closed);
 }
 
+/* The core owns deadlines for large HTTP/2 uploads and their first replies.
+ * While it holds an HTTP/1.1 bridge open, its timers allow up to five minutes
+ * for a large upload reply or an idle WebSocket. */
 static void refresh_timeout(front_connection *front) {
-    uv_timer_start(&front->timer, on_timeout,
-                   front->handshake_complete && front->protocol_h2 ? 120000 :
-                   front->handshake_complete ? 30000 : 10000, 0);
+    uint64_t timeout = ankah_front_timeout_ms(
+        front->handshake_complete, front->protocol_h2, front->h2_long_streams,
+        front->bridge_connected, front->close_notify_started);
+    if (front->admission_state == 0) {
+        uint64_t now = uv_hrtime();
+        uint64_t remaining;
+        if (now >= front->admission_deadline_ns) {
+            close_front(front);
+            return;
+        }
+        remaining = (front->admission_deadline_ns - now + 999999) / 1000000;
+        if (!timeout || remaining < timeout) timeout = remaining;
+    }
+    if (!timeout) {
+        uv_timer_stop(&front->timer);
+        return;
+    }
+    uv_timer_start(&front->timer, on_timeout, timeout, 0);
+}
+
+static void h2_end_long_wait(h2_stream *stream) {
+    if (!stream->long_timeout) return;
+    stream->long_timeout = 0;
+    if (stream->front->h2_long_streams) --stream->front->h2_long_streams;
+    if (!stream->front->closing) refresh_timeout(stream->front);
 }
 
 static void allocate_read(uv_handle_t *handle, size_t suggested, uv_buf_t *buffer) {
     (void)handle;
     (void)suggested;
-    buffer->base = malloc(16384);
-    buffer->len = buffer->base ? 16384 : 0;
+    buffer->base = malloc(FRONT_READ_SIZE);
+    buffer->len = buffer->base ? FRONT_READ_SIZE : 0;
 }
 
 static int tls_receive(void *context, unsigned char *out, size_t size) {
@@ -535,17 +693,97 @@ static int write_bridge(front_connection *front, const void *data, size_t size) 
     return 0;
 }
 
+static int h1_local_response(front_connection *front, int status,
+                             const ankah_request *request) {
+    char response[512];
+    ankah_language language = ankah_language_select(request);
+    const char *reason = status == 503 ? "Service Unavailable" :
+                         status == 429 ? "Too Many Requests" :
+                         status == 421 ? "Misdirected Request" : "Bad Request";
+    const char *body = status == 503 ? "Anonymous connection capacity reached\n" :
+                       status == 429 ? "Rate limit exceeded\n" :
+                       status == 421 ? "Unexpected Host\n" : "Invalid HTTP request\n";
+    body = ankah_language_message(language, body);
+    char alternative[64] = "";
+    int length;
+    if (ankah_h3_active())
+        snprintf(alternative, sizeof(alternative),
+                 "Alt-Svc: h3=\":%d\"; ma=86400\r\n", frontend.options.http3_port);
+    length = snprintf(response, sizeof(response),
+        "HTTP/1.1 %d %s\r\nContent-Type: text/plain; charset=utf-8\r\n"
+        "Content-Length: %zu\r\nContent-Language: %s\r\nVary: Accept-Language\r\n"
+        "Connection: close\r\n%s%s\r\n%s", status, reason, strlen(body),
+        ankah_language_tag(language),
+        status == 429 || status == 503 ? "Retry-After: 1\r\n" : "",
+        alternative, body);
+    if (length < 0 || (size_t)length >= sizeof(response) ||
+        queue_plain(front, response, (size_t)length) != 0) return -1;
+    front->h1_rejected = 1;
+    front->h1_header_sent = 1;
+    front->close_notify_started = 1;
+    front->drive_again = 1;
+    front->h1_header_size = 0;
+    return 1;
+}
+
 static int send_h1_header(front_connection *front) {
     size_t end = find_header_end(front->h1_header, front->h1_header_size);
-    char metadata[320];
+    char metadata[384];
+    char slot_header[80];
+    const char *admission;
     unsigned char *request;
     size_t metadata_size, output_size;
+    ankah_request parsed;
+    int rate_class = 0, proved = 0, crawler = 0, bing_claim = 0, status;
     int length;
     if (!end) return front->h1_header_size == sizeof(front->h1_header) ? -1 : 0;
+    if (ankah_parse_request((const char *)front->h1_header, end, &parsed) != 0) {
+        ankah_stats_add(ANKAH_STAT_requests, 1);
+        ankah_stats_add(ANKAH_STAT_responses_4xx, 1);
+        return h1_local_response(front, 400, NULL);
+    }
+    status = frontend.options.admit(&parsed, ankah_header_value(&parsed, "Host"),
+                                    front->peer_ip, &rate_class, &proved, &crawler,
+                                    &bing_claim);
+    if (status) return h1_local_response(front, status, &parsed);
+    if ((crawler || bing_claim) && ankah_crawler_acquire() != 0)
+        return h1_local_response(front, 429, &parsed);
+    if (crawler || bing_claim) front->crawler_slot = 1;
+    if (bing_claim) front->crawler_slot_id = next_crawler_slot_id();
+    if (front->admission_state == 0) {
+        if (!rate_class &&
+            frontend.anonymous_connections >= FRONT_ANONYMOUS_CONNECTIONS) {
+            ankah_stats_add(ANKAH_STAT_requests, 1);
+            ankah_stats_add(ANKAH_STAT_responses_5xx, 1);
+            ankah_stats_add(ANKAH_STAT_anonymous_connection_rejected, 1);
+            return h1_local_response(front, 503, &parsed);
+        }
+        --frontend.pending_connections;
+        front->admission_state = rate_class ? 2 : 1;
+        if (!rate_class) ++frontend.anonymous_connections;
+        refresh_timeout(front);
+    }
+    if (!frontend.draining && !front->drain_tracked) {
+        front->drain_tracked = 1;
+        ++frontend.active_work;
+    }
+    if (bing_claim) {
+        length = snprintf(slot_header, sizeof(slot_header),
+                          "X-Ankah-Internal-Crawler-Slot: %" PRIu64 "\r\n",
+                          front->crawler_slot_id);
+        if (length < 0 || (size_t)length >= sizeof(slot_header)) return -1;
+        admission = slot_header;
+    } else admission = proved ?
+        "X-Ankah-Internal-Rate-Checked: 1\r\nX-Ankah-Internal-Proved: 1\r\n" :
+        "X-Ankah-Internal-Rate-Checked: 1\r\nX-Ankah-Internal-Proved: 0\r\n";
     length = snprintf(metadata, sizeof(metadata),
-                      "X-Ankah-Internal-Key: %s\r\nX-Ankah-Internal-Peer: %s\r\n",
+                      "X-Ankah-Internal-Key: %s\r\nX-Ankah-Internal-Peer: %s\r\n"
+                      "X-Ankah-Internal-Language-Logged: 0\r\n"
+                      "%s%s",
                       frontend.options.internal_key,
-                      front->peer_ip);
+                      front->peer_ip,
+                      admission,
+                      front->drain_tracked ? "X-Ankah-Internal-Drain: 1\r\n" : "");
     if (length < 0 || (size_t)length >= sizeof(metadata)) return -1;
     metadata_size = (size_t)length;
     output_size = front->h1_header_size + metadata_size;
@@ -567,6 +805,7 @@ static int send_h1_header(front_connection *front) {
 
 static int forward_h1_plain(front_connection *front,
                             const unsigned char *data, size_t size) {
+    if (front->h1_rejected) return 0;
     if (front->h1_header_sent) return write_bridge(front, data, size);
     if (size > sizeof(front->h1_header) - front->h1_header_size) return -1;
     memcpy(front->h1_header + front->h1_header_size, data, size);
@@ -574,11 +813,51 @@ static int forward_h1_plain(front_connection *front,
     return send_h1_header(front) < 0 ? -1 : 0;
 }
 
+static int queue_h1_response(front_connection *front, const char *data, size_t size) {
+    size_t end;
+    char alternative[64];
+    int length;
+    if (front->h1_response_sent || !ankah_h3_active())
+        return queue_plain(front, data, size);
+    if (size > sizeof(front->h1_response_header) - front->h1_response_size)
+        return -1;
+    memcpy(front->h1_response_header + front->h1_response_size, data, size);
+    front->h1_response_size += size;
+    for (;;) {
+        end = find_header_end(front->h1_response_header, front->h1_response_size);
+        if (!end) return 0;
+        if (end >= 12 &&
+            memcmp(front->h1_response_header, "HTTP/1.1 1", 10) == 0 &&
+            front->h1_response_header[10] >= '0' &&
+            front->h1_response_header[10] <= '9' &&
+            front->h1_response_header[11] >= '0' &&
+            front->h1_response_header[11] <= '9') {
+            if (queue_plain(front, front->h1_response_header, end) != 0) return -1;
+            memmove(front->h1_response_header, front->h1_response_header + end,
+                    front->h1_response_size - end);
+            front->h1_response_size -= end;
+            continue;
+        }
+        break;
+    }
+    length = snprintf(alternative, sizeof(alternative),
+                      "Alt-Svc: h3=\":%d\"; ma=86400\r\n",
+                      frontend.options.http3_port);
+    if (length < 0 || (size_t)length >= sizeof(alternative)) return -1;
+    if (queue_plain(front, front->h1_response_header, end - 2) != 0 ||
+        queue_plain(front, alternative, (size_t)length) != 0 ||
+        queue_plain(front, front->h1_response_header + end - 2,
+                    front->h1_response_size - end + 2) != 0) return -1;
+    front->h1_response_sent = 1;
+    front->h1_response_size = 0;
+    return 0;
+}
+
 static void on_bridge_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *buffer) {
     front_connection *front = handle->data;
     if (count > 0 && !front->closing) {
         refresh_timeout(front);
-        if (queue_plain(front, buffer->base, (size_t)count) != 0) close_front(front);
+        if (queue_h1_response(front, buffer->base, (size_t)count) != 0) close_front(front);
         else {
             if (front->plain_queued >= FRONT_MAX_PLAIN_OUTPUT - 16384U)
                 uv_read_stop(handle);
@@ -586,6 +865,7 @@ static void on_bridge_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *b
         }
     } else if (count < 0 && !front->closing) {
         front->close_notify_started = 1;
+        refresh_timeout(front);
         drive_tls(front);
     }
     free(buffer->base);
@@ -638,6 +918,10 @@ static int h2_on_begin_headers(nghttp2_session *session,
     if (!stream) return NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE;
     stream->front = front;
     stream->id = frame->hd.stream_id;
+    if (!frontend.draining) {
+        stream->drain_tracked = 1;
+        ++frontend.active_work;
+    }
     stream->next = front->streams;
     front->streams = stream;
     nghttp2_session_set_stream_user_data(front->h2, stream->id, stream);
@@ -699,6 +983,21 @@ static int h2_on_header(nghttp2_session *session, const nghttp2_frame *frame,
     }
     memcpy(header->value, value, value_size);
     header->value[value_size] = 0;
+    if (kind == ANKAH_HEADER_CONTENT_LENGTH) {
+        size_t parsed = 0, i;
+        if (stream->has_content_length || !value_size) stream->invalid = 1;
+        else {
+            for (i = 0; i < value_size; ++i) {
+                unsigned int digit;
+                if (value[i] < '0' || value[i] > '9') { stream->invalid = 1; break; }
+                digit = (unsigned int)(value[i] - '0');
+                if (parsed > (SIZE_MAX - digit) / 10) { stream->invalid = 1; break; }
+                parsed = parsed * 10 + digit;
+            }
+            stream->has_content_length = 1;
+            stream->declared_length = parsed;
+        }
+    }
     return 0;
 }
 
@@ -809,9 +1108,10 @@ static int submit_h2_trailers(h2_stream *stream) {
 }
 
 static int submit_h2_headers(h2_stream *stream) {
-    nghttp2_nv values[ANKAH_MAX_HEADERS + 1];
+    nghttp2_nv values[ANKAH_MAX_HEADERS + 2];
     nghttp2_data_provider provider;
     char status[4];
+    char alternative[48];
     size_t count = 0;
     unsigned int i;
     int result;
@@ -827,6 +1127,17 @@ static int submit_h2_headers(h2_stream *stream) {
         values[count].namelen = strlen(header->name);
         values[count].value = (uint8_t *)header->value;
         values[count].valuelen = strlen(header->value);
+        values[count].flags = NGHTTP2_NV_FLAG_NONE;
+        ++count;
+    }
+    if (ankah_h3_active()) {
+        static const char name[] = "alt-svc";
+        snprintf(alternative, sizeof(alternative), "h3=\":%d\"; ma=86400",
+                 frontend.options.http3_port);
+        values[count].name = (uint8_t *)name;
+        values[count].namelen = sizeof(name) - 1;
+        values[count].value = (uint8_t *)alternative;
+        values[count].valuelen = strlen(alternative);
         values[count].flags = NGHTTP2_NV_FLAG_NONE;
         ++count;
     }
@@ -892,8 +1203,11 @@ static int response_headers_complete(llhttp_t *parser) {
     if (stream->response_stage == 2) ++stream->response_count;
     if (stream->response_status < 200) return 0;
     stream->response_final = 1;
+    h2_end_long_wait(stream);
     stream->response_initial_count = stream->response_count;
     stream->response_stage = 0;
+    stream->request_stopped = 1;
+    h2_discard_request(stream);
     return submit_h2_headers(stream) == 0 ? 0 : HPE_USER;
 }
 
@@ -915,21 +1229,38 @@ static int response_message_complete(llhttp_t *parser) {
 
 static void h2_local_response(h2_stream *stream, int status, const char *body) {
     char status_text[4], length_text[32];
-    nghttp2_nv headers[4];
+    ankah_language selected = ankah_language_select(&stream->request);
+    const char *language = ankah_language_tag(selected);
+    nghttp2_nv headers[8];
     nghttp2_data_provider provider;
+    char alternative[48];
+    size_t header_count;
+    body = ankah_language_message(selected, body);
     snprintf(status_text, sizeof(status_text), "%d", status);
     snprintf(length_text, sizeof(length_text), "%zu", strlen(body));
 #define NV2(NAME, VALUE) {(uint8_t *)(NAME), (uint8_t *)(VALUE), strlen(NAME), strlen(VALUE), NGHTTP2_NV_FLAG_NONE}
     headers[0] = (nghttp2_nv)NV2(":status", status_text);
-    headers[1] = (nghttp2_nv)NV2("content-type", "text/plain");
+    headers[1] = (nghttp2_nv)NV2("content-type", "text/plain; charset=utf-8");
     headers[2] = (nghttp2_nv)NV2("content-length", length_text);
     headers[3] = (nghttp2_nv)NV2("cache-control", "no-store");
+    headers[4] = (nghttp2_nv)NV2("content-language", language);
+    headers[5] = (nghttp2_nv)NV2("vary", "Accept-Language");
+    if (status == 429 || status == 503)
+        headers[6] = (nghttp2_nv)NV2("retry-after", "1");
+    header_count = status == 429 || status == 503 ? 7 : 6;
+    if (ankah_h3_active()) {
+        snprintf(alternative, sizeof(alternative), "h3=\":%d\"; ma=86400",
+                 frontend.options.http3_port);
+        headers[header_count++] = (nghttp2_nv)NV2("alt-svc", alternative);
+    }
 #undef NV2
     stream->response_status = status;
     stream->response_final = 1;
+    h2_end_long_wait(stream);
     stream->response_complete = 1;
-    stream->response_has_body = 1;
-    if (h2_queue_response_body(stream, body, strlen(body)) != 0) {
+    stream->response_has_body = strcmp(stream->request.method, "HEAD") != 0;
+    if (stream->response_has_body &&
+        h2_queue_response_body(stream, body, strlen(body)) != 0) {
         nghttp2_submit_rst_stream(stream->front->h2, NGHTTP2_FLAG_NONE,
                                   stream->id, NGHTTP2_INTERNAL_ERROR);
         return;
@@ -938,7 +1269,11 @@ static void h2_local_response(h2_stream *stream, int status, const char *body) {
     provider.source.ptr = stream;
     provider.read_callback = h2_data_read;
     if (nghttp2_submit_response(stream->front->h2, stream->id,
-                                headers, 4, &provider) == 0) stream->data_submitted = 1;
+                                headers, header_count,
+                                stream->response_has_body ? &provider : NULL) == 0)
+        stream->data_submitted = 1;
+    else nghttp2_submit_rst_stream(stream->front->h2, NGHTTP2_FLAG_NONE,
+                                   stream->id, NGHTTP2_INTERNAL_ERROR);
 }
 
 static void on_h2_core_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *buffer) {
@@ -949,7 +1284,8 @@ static void on_h2_core_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *
         refresh_timeout(front);
         error = llhttp_execute(&stream->response_parser, buffer->base, (size_t)count);
         if (error != HPE_OK) {
-            if (!stream->response_final) h2_local_response(stream, 502, "Invalid upstream response\n");
+            if (!stream->response_final)
+                h2_request_failure(stream, 502, "Invalid upstream response\n");
             else nghttp2_submit_rst_stream(front->h2, NGHTTP2_FLAG_NONE,
                                            stream->id, NGHTTP2_INTERNAL_ERROR);
             close_stream_core(stream);
@@ -966,7 +1302,8 @@ static void on_h2_core_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *
     } else if (count < 0 && !front->closing && !stream->closed_by_h2) {
         llhttp_errno_t error = llhttp_finish(&stream->response_parser);
         if (error != HPE_OK || !stream->response_final) {
-            if (!stream->response_final) h2_local_response(stream, 502, "Incomplete upstream response\n");
+            if (!stream->response_final)
+                h2_request_failure(stream, 502, "Incomplete upstream response\n");
             else nghttp2_submit_rst_stream(front->h2, NGHTTP2_FLAG_NONE,
                                            stream->id, NGHTTP2_INTERNAL_ERROR);
         } else stream->response_complete = 1;
@@ -978,31 +1315,153 @@ static void on_h2_core_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *
     free(buffer->base);
 }
 
+static void h2_discard_request(h2_stream *stream) {
+    buffer_chunk *chunk = stream->request_first;
+    stream->request_first = stream->request_last = NULL;
+    while (chunk) {
+        buffer_chunk *next = chunk->next;
+        size_t credit = chunk->size - chunk->offset;
+        stream->request_queued -= credit;
+        if (stream->has_content_length)
+            ankah_h2_queue_release(&frontend.h2_request_queued, credit);
+        free(chunk);
+        chunk = next;
+    }
+}
+
+static void h2_release_body(h2_stream *stream) {
+    stream->front->h2_body_total -= stream->body_size;
+    free(stream->body);
+    stream->body = NULL;
+    stream->body_size = 0;
+    stream->body_capacity = 0;
+}
+
+static void h2_request_failure(h2_stream *stream, int status, const char *body) {
+    front_connection *front = stream->front;
+    if ((stream->request_stopped && stream->response_final) ||
+        stream->closed_by_h2 || front->closing) return;
+    stream->request_stopped = 1;
+    h2_discard_request(stream);
+    h2_release_body(stream);
+    if (!stream->response_final) h2_local_response(stream, status, body);
+    else nghttp2_submit_rst_stream(front->h2, NGHTTP2_FLAG_NONE,
+                                   stream->id, NGHTTP2_INTERNAL_ERROR);
+    close_stream_core(stream);
+    h2_flush(front);
+    drive_tls(front);
+}
+
+static void on_h2_request_write(uv_write_t *request, int status) {
+    h2_request_write *write = request->data;
+    h2_stream *stream = write->stream;
+    front_connection *front = stream->front;
+    size_t credit = write->header ? 0 : write->chunk->size;
+    if (front->bridge_pending) --front->bridge_pending;
+    stream->request_write_pending = 0;
+    if (write->header) free(write->buffer.base);
+    else {
+        if (stream->request_queued >= credit) stream->request_queued -= credit;
+        if (stream->has_content_length)
+            ankah_h2_queue_release(&frontend.h2_request_queued, credit);
+        if (status >= 0 && stream->has_content_length && !stream->request_stopped &&
+            !stream->closed_by_h2)
+            nghttp2_session_consume_stream(front->h2, stream->id, credit);
+        free(write->chunk);
+    }
+    free(write);
+    if (status < 0 && !front->closing && !stream->request_stopped &&
+        !stream->closed_by_h2) {
+        /* The application may close its request side after sending an early
+         * response. Keep reading that response until it completes or EOF. */
+        stream->request_stopped = 1;
+        h2_discard_request(stream);
+    } else if (!front->closing && !stream->closed_by_h2) {
+        h2_write_request(stream);
+        h2_flush(front);
+        drive_tls(front);
+    }
+}
+
+static void h2_write_request(h2_stream *stream) {
+    h2_request_write *write;
+    buffer_chunk *chunk = NULL;
+    uv_buf_t buffers[1];
+    int result;
+    if (!stream->core_connected || stream->request_write_pending ||
+        stream->request_stopped) return;
+    if (stream->request_head) {
+        write = calloc(1, sizeof(*write));
+        if (!write) { h2_request_failure(stream, 502, "Upstream unavailable\n"); return; }
+        write->header = 1;
+        write->buffer.base = stream->request_head;
+        write->buffer.len = (unsigned int)stream->request_head_size;
+        stream->request_head = NULL;
+    } else {
+        chunk = stream->request_first;
+        if (!chunk) return;
+        stream->request_first = chunk->next;
+        if (!stream->request_first) stream->request_last = NULL;
+        chunk->next = NULL;
+        write = calloc(1, sizeof(*write));
+        if (!write) {
+            chunk->next = stream->request_first;
+            stream->request_first = chunk;
+            if (!stream->request_last) stream->request_last = chunk;
+            h2_request_failure(stream, 502, "Upstream unavailable\n");
+            return;
+        }
+        write->chunk = chunk;
+        write->buffer.base = (char *)chunk->data;
+        write->buffer.len = (unsigned int)chunk->size;
+    }
+    write->stream = stream;
+    write->request.data = write;
+    buffers[0] = write->buffer;
+    stream->request_write_pending = 1;
+    ++stream->front->bridge_pending;
+    result = uv_write(&write->request, (uv_stream_t *)&stream->core,
+                      buffers, 1, on_h2_request_write);
+    if (result != 0) {
+        --stream->front->bridge_pending;
+        stream->request_write_pending = 0;
+        if (write->header) free(write->buffer.base);
+        else {
+            if (stream->request_queued >= chunk->size)
+                stream->request_queued -= chunk->size;
+            if (stream->has_content_length)
+                ankah_h2_queue_release(&frontend.h2_request_queued, chunk->size);
+            free(chunk);
+        }
+        free(write);
+        h2_request_failure(stream, 502, "Upstream write failed\n");
+    }
+}
+
 static void on_h2_core_connected(uv_connect_t *request, int status) {
     h2_stream *stream = request->data;
     front_connection *front = stream->front;
     char *head;
+    char slot_header[80];
+    const char *admission;
     size_t capacity, used = 0;
     unsigned int i;
     int length;
-    uv_buf_t buffers[2];
-    bridge_write *write;
     if (status < 0 || front->closing || stream->closed_by_h2) {
-        if (!front->closing && !stream->closed_by_h2) {
-            h2_local_response(stream, 502, "Upstream unavailable\n");
-            h2_flush(front);
-            drive_tls(front);
-        }
+        if (!front->closing && !stream->closed_by_h2)
+            h2_request_failure(stream, 502, "Upstream unavailable\n");
         close_stream_core(stream);
         return;
     }
     stream->core_connected = 1;
     capacity = ANKAH_HEADER_LIMIT + 512;
     head = malloc(capacity);
-    if (!head) { close_front(front); return; }
+    if (!head) { h2_request_failure(stream, 502, "Upstream unavailable\n"); return; }
     length = snprintf(head, capacity, "%s %s HTTP/1.1\r\nHost: %s\r\n",
                       stream->request.method, stream->request.target, stream->authority);
-    if (length < 0 || (size_t)length >= capacity) { free(head); close_front(front); return; }
+    if (length < 0 || (size_t)length >= capacity) {
+        free(head); h2_request_failure(stream, 502, "Upstream unavailable\n"); return;
+    }
     used = (size_t)length;
     for (i = 0; i < stream->request.count; ++i) {
         ankah_header *header = &stream->request.headers[i];
@@ -1010,43 +1469,51 @@ static void on_h2_core_connected(uv_connect_t *request, int status) {
         if (kind == ANKAH_HEADER_HOST || kind == ANKAH_HEADER_CONTENT_LENGTH ||
             kind == ANKAH_HEADER_CONNECTION || kind == ANKAH_HEADER_TRANSFER_ENCODING ||
             kind == ANKAH_HEADER_EXPECT || kind == ANKAH_HEADER_X_ANKAH_INTERNAL_KEY ||
-            kind == ANKAH_HEADER_X_ANKAH_INTERNAL_PEER) continue;
+            kind == ANKAH_HEADER_X_ANKAH_INTERNAL_PEER ||
+            same_ascii_part(header->name, strlen(header->name),
+                            "x-ankah-internal-language-logged",
+                            strlen("x-ankah-internal-language-logged")) ||
+            same_ascii_part(header->name, strlen(header->name),
+                            "x-ankah-internal-rate-checked",
+                            strlen("x-ankah-internal-rate-checked")) ||
+            same_ascii_part(header->name, strlen(header->name),
+                            "x-ankah-internal-proved",
+                            strlen("x-ankah-internal-proved")) ||
+            same_ascii_part(header->name, strlen(header->name),
+                            "x-ankah-internal-crawler-slot",
+                            strlen("x-ankah-internal-crawler-slot"))) continue;
         length = snprintf(head + used, capacity - used, "%s: %s\r\n",
                           header->name, header->value);
         if (length < 0 || (size_t)length >= capacity - used) {
-            free(head); close_front(front); return;
+            free(head); h2_request_failure(stream, 502, "Upstream unavailable\n"); return;
         }
         used += (size_t)length;
     }
+    if (stream->bing_claim) {
+        length = snprintf(slot_header, sizeof(slot_header),
+                          "X-Ankah-Internal-Crawler-Slot: %" PRIu64 "\r\n",
+                          stream->crawler_slot_id);
+        if (length < 0 || (size_t)length >= sizeof(slot_header)) {
+            free(head); h2_request_failure(stream, 502, "Upstream unavailable\n"); return;
+        }
+        admission = slot_header;
+    } else admission = stream->proved ?
+        "X-Ankah-Internal-Rate-Checked: 1\r\nX-Ankah-Internal-Proved: 1\r\n" :
+        "X-Ankah-Internal-Rate-Checked: 1\r\nX-Ankah-Internal-Proved: 0\r\n";
     length = snprintf(head + used, capacity - used,
                       "Content-Length: %zu\r\nX-Ankah-Internal-Key: %s\r\n"
-                      "X-Ankah-Internal-Peer: %s\r\n\r\n",
-                      stream->body_size, frontend.options.internal_key,
-                      front->peer_ip);
+                      "X-Ankah-Internal-Peer: %s\r\n"
+                      "X-Ankah-Internal-Language-Logged: 1\r\n"
+                      "%s%s\r\n",
+                      stream->has_content_length ? stream->declared_length : stream->body_size,
+                      frontend.options.internal_key,
+                      front->peer_ip,
+                      admission,
+                      stream->drain_tracked ? "X-Ankah-Internal-Drain: 1\r\n" : "");
     if (length < 0 || (size_t)length >= capacity - used) {
-        free(head); close_front(front); return;
+        free(head); h2_request_failure(stream, 502, "Upstream unavailable\n"); return;
     }
     used += (size_t)length;
-    write = calloc(1, sizeof(*write));
-    if (!write) { free(head); close_front(front); return; }
-    write->buffer.base = malloc(used + stream->body_size);
-    if (!write->buffer.base) { free(write); free(head); close_front(front); return; }
-    memcpy(write->buffer.base, head, used);
-    if (stream->body_size) memcpy(write->buffer.base + used, stream->body, stream->body_size);
-    write->buffer.len = (unsigned int)(used + stream->body_size);
-    write->front = front;
-    write->request.data = write;
-    buffers[0] = write->buffer;
-    free(head);
-    if (uv_write(&write->request, (uv_stream_t *)&stream->core,
-                 buffers, 1, on_bridge_write) != 0) {
-        free(write->buffer.base);
-        free(write);
-        h2_local_response(stream, 502, "Upstream unavailable\n");
-        close_stream_core(stream);
-        return;
-    }
-    ++front->bridge_pending;
     llhttp_settings_init(&stream->response_settings);
     stream->response_settings.on_message_begin = response_message_begin;
     stream->response_settings.on_header_field = response_header_field;
@@ -1056,39 +1523,45 @@ static void on_h2_core_connected(uv_connect_t *request, int status) {
     stream->response_settings.on_message_complete = response_message_complete;
     llhttp_init(&stream->response_parser, HTTP_RESPONSE, &stream->response_settings);
     stream->response_parser.data = stream;
-    if (uv_read_start((uv_stream_t *)&stream->core, allocate_read, on_h2_core_read) != 0)
-        close_stream_core(stream);
-}
-
-static int valid_content_length(h2_stream *stream) {
-    const char *value = ankah_header_value(&stream->request, "content-length");
-    size_t parsed = 0, i;
-    if (!value) return 1;
-    if (!*value) return 0;
-    for (i = 0; value[i]; ++i) {
-        unsigned int digit;
-        if (value[i] < '0' || value[i] > '9') return 0;
-        digit = (unsigned int)(value[i] - '0');
-        if (parsed > (SIZE_MAX - digit) / 10) return 0;
-        parsed = parsed * 10 + digit;
+    if (uv_read_start((uv_stream_t *)&stream->core, allocate_read, on_h2_core_read) != 0) {
+        free(head);
+        h2_request_failure(stream, 502, "Upstream unavailable\n");
+        return;
     }
-    return parsed == stream->body_size;
+    stream->request_head = head;
+    stream->request_head_size = used;
+    if (!stream->has_content_length && stream->body_size) {
+        stream->request_first = stream->request_last = chunk_new(stream->body,
+                                                                 stream->body_size);
+        if (!stream->request_first) {
+            h2_request_failure(stream, 502, "Upstream unavailable\n");
+            return;
+        }
+        stream->request_queued = stream->body_size;
+    }
+    h2_write_request(stream);
 }
 
 static void h2_dispatch(h2_stream *stream) {
     struct sockaddr_in address;
     front_connection *front = stream->front;
-    if (stream->dispatched || stream->closed_by_h2) return;
+    if (stream->dispatched || stream->closed_by_h2 || stream->request_stopped) return;
     stream->dispatched = 1;
     if (stream->invalid || !stream->saw_method || !stream->saw_path ||
         !stream->saw_authority || stream->request.target[0] != '/' ||
-        strcmp(stream->scheme, "https") != 0 || !valid_content_length(stream)) {
-        h2_local_response(stream, 400, "Invalid HTTP/2 request\n");
+        strcmp(stream->scheme, "https") != 0) {
+        h2_request_failure(stream, 400, "Invalid HTTP/2 request\n");
         return;
+    }
+    ankah_language_log_request(&stream->request);
+    if (stream->has_content_length && stream->declared_length > H2_MAX_BODY) {
+        stream->long_timeout = 1;
+        ++front->h2_long_streams;
+        refresh_timeout(front);
     }
     if (uv_ip4_addr("127.0.0.1", frontend.options.internal_port, &address) != 0 ||
         uv_tcp_init(frontend.options.loop, &stream->core) != 0) {
-        h2_local_response(stream, 503, "Unavailable\n");
+        h2_request_failure(stream, 503, "Unavailable\n");
         return;
     }
     stream->core_initialized = 1;
@@ -1097,8 +1570,7 @@ static void h2_dispatch(h2_stream *stream) {
     stream->core_connect.data = stream;
     if (uv_tcp_connect(&stream->core_connect, &stream->core,
                        (const struct sockaddr *)&address, on_h2_core_connected) != 0) {
-        h2_local_response(stream, 502, "Upstream unavailable\n");
-        close_stream_core(stream);
+        h2_request_failure(stream, 502, "Upstream unavailable\n");
     }
 }
 
@@ -1106,9 +1578,76 @@ static int h2_on_frame_recv(nghttp2_session *session,
                             const nghttp2_frame *frame, void *user_data) {
     front_connection *front = user_data;
     h2_stream *stream = find_stream(front, frame->hd.stream_id);
+    int request_end;
     (void)session;
-    if (stream && (frame->hd.type == NGHTTP2_HEADERS || frame->hd.type == NGHTTP2_DATA) &&
-        (frame->hd.flags & NGHTTP2_FLAG_END_STREAM)) h2_dispatch(stream);
+    if (!stream) return 0;
+    request_end = (frame->hd.type == NGHTTP2_HEADERS ||
+                   frame->hd.type == NGHTTP2_DATA) &&
+                  (frame->hd.flags & NGHTTP2_FLAG_END_STREAM);
+    if (request_end) {
+        if (ankah_h2_end_stream_length_error(stream->has_content_length,
+                                              stream->request_stopped,
+                                              stream->request_received,
+                                              stream->declared_length)) {
+            h2_request_failure(stream, 400, "Invalid HTTP/2 request body length\n");
+            return 0;
+        }
+        stream->request_finished = 1;
+    }
+    if (frame->hd.type == NGHTTP2_HEADERS &&
+        frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+        if (!stream->invalid && stream->saw_method && stream->saw_path &&
+            stream->saw_authority && !stream->admitted) {
+            int rate_class = 0, proved = 0, crawler = 0, bing_claim = 0;
+            int status = frontend.options.admit(&stream->request,
+                stream->authority, front->peer_ip, &rate_class, &proved,
+                &crawler, &bing_claim);
+            if (status) {
+                h2_request_failure(stream, status,
+                    status == 429 ? "Rate limit exceeded\n" :
+                    status == 421 ? "Unexpected Host\n" : "Invalid forwarding information\n");
+                return 0;
+            }
+            if ((crawler || bing_claim) && ankah_crawler_acquire() != 0) {
+                h2_request_failure(stream, 429, "Crawler concurrency exceeded\n");
+                return 0;
+            }
+            if (crawler || bing_claim) stream->crawler_slot = 1;
+            stream->bing_claim = bing_claim;
+            if (bing_claim) stream->crawler_slot_id = next_crawler_slot_id();
+            if (front->admission_state != 1 && !rate_class &&
+                frontend.anonymous_connections >= FRONT_ANONYMOUS_CONNECTIONS) {
+                ankah_stats_add(ANKAH_STAT_requests, 1);
+                ankah_stats_add(ANKAH_STAT_responses_5xx, 1);
+                ankah_stats_add(ANKAH_STAT_anonymous_connection_rejected, 1);
+                h2_request_failure(stream, 503,
+                                   "Anonymous connection capacity reached\n");
+                return 0;
+            }
+            if (front->admission_state == 0) {
+                --frontend.pending_connections;
+                front->admission_state = rate_class ? 2 : 1;
+                if (!rate_class) ++frontend.anonymous_connections;
+                refresh_timeout(front);
+            } else if (!rate_class && front->admission_state == 2) {
+                front->admission_state = 1;
+                ++frontend.anonymous_connections;
+            } else if (rate_class && front->admission_state == 1 &&
+                       !front->h2_anonymous_streams) {
+                --frontend.anonymous_connections;
+                front->admission_state = 2;
+            }
+            front->h2_latest_class = rate_class ? 2 : 1;
+            if (!rate_class) {
+                ++front->h2_anonymous_streams;
+                stream->anonymous_admitted = 1;
+            }
+            stream->admitted = 1;
+            stream->proved = proved;
+        }
+        if (stream->invalid || stream->has_content_length ||
+            request_end) h2_dispatch(stream);
+    } else if (request_end && !stream->has_content_length) h2_dispatch(stream);
     return 0;
 }
 
@@ -1117,25 +1656,76 @@ static int h2_on_data(nghttp2_session *session, uint8_t flags, int32_t stream_id
     front_connection *front = user_data;
     h2_stream *stream = find_stream(front, stream_id);
     unsigned char *replacement;
+    buffer_chunk *chunk;
     (void)session;
     (void)flags;
-    if (!stream || stream->invalid || stream->dispatched) return 0;
-    if (size > H2_MAX_BODY - stream->body_size ||
-        size > H2_MAX_BODY_TOTAL - front->h2_body_total) {
-        stream->invalid = 1;
+    if (!stream) return 0;
+    if (stream->request_stopped || stream->invalid) {
+        nghttp2_session_consume_connection(front->h2, size);
+        return 0;
+    }
+    if (stream->has_content_length) {
+        if (stream->request_received > stream->declared_length ||
+            size > stream->declared_length - stream->request_received) {
+            nghttp2_session_consume_connection(front->h2, size);
+            h2_request_failure(stream, 400, "Invalid HTTP/2 request body length\n");
+            return 0;
+        }
+        /* Stream credit is returned only after an upstream write completes.
+         * This guard covers unexpected queue growth, not body framing. */
+        if (!ankah_h2_queue_reserve(&frontend.h2_request_queued,
+                                    stream->request_queued, size)) {
+            nghttp2_session_consume_connection(front->h2, size);
+            h2_request_failure(stream, 503, "Request body queue unavailable\n");
+            return 0;
+        }
+        chunk = chunk_new(data, size);
+        if (!chunk) {
+            ankah_h2_queue_release(&frontend.h2_request_queued, size);
+            nghttp2_session_consume_connection(front->h2, size);
+            h2_request_failure(stream, 502, "Upstream unavailable\n");
+            return 0;
+        }
+        if (stream->request_last) stream->request_last->next = chunk;
+        else stream->request_first = chunk;
+        stream->request_last = chunk;
+        stream->request_queued += size;
+        stream->request_received += size;
+        nghttp2_session_consume_connection(front->h2, size);
+        h2_write_request(stream);
+        return 0;
+    }
+    if (stream->dispatched) {
+        nghttp2_session_consume_connection(front->h2, size);
+        return 0;
+    }
+    if (size > H2_MAX_BODY - stream->body_size) {
+        nghttp2_session_consume_connection(front->h2, size);
+        h2_request_failure(stream, 413, "Request body too large\n");
+        return 0;
+    }
+    if (size > H2_MAX_BODY_TOTAL - front->h2_body_total) {
+        nghttp2_session_consume_connection(front->h2, size);
+        h2_request_failure(stream, 503, "Request body buffer unavailable\n");
         return 0;
     }
     if (stream->body_size + size > stream->body_capacity) {
         size_t capacity = stream->body_capacity ? stream->body_capacity * 2 : 8192;
         while (capacity < stream->body_size + size) capacity *= 2;
         replacement = realloc(stream->body, capacity);
-        if (!replacement) { stream->invalid = 1; return 0; }
+        if (!replacement) {
+            nghttp2_session_consume_connection(front->h2, size);
+            h2_request_failure(stream, 503, "Request body buffer unavailable\n");
+            return 0;
+        }
         stream->body = replacement;
         stream->body_capacity = capacity;
     }
     memcpy(stream->body + stream->body_size, data, size);
     stream->body_size += size;
     front->h2_body_total += size;
+    stream->request_received += size;
+    nghttp2_session_consume(front->h2, stream_id, size);
     return 0;
 }
 
@@ -1146,11 +1736,22 @@ static int h2_on_stream_close(nghttp2_session *session, int32_t stream_id,
     (void)session;
     (void)error_code;
     if (!stream) return 0;
+    if (stream->anonymous_admitted) {
+        stream->anonymous_admitted = 0;
+        --front->h2_anonymous_streams;
+        if (!front->h2_anonymous_streams && front->admission_state == 1 &&
+            front->h2_latest_class == 2) {
+            --frontend.anonymous_connections;
+            front->admission_state = 2;
+        }
+    }
     stream->closed_by_h2 = 1;
-    front->h2_body_total -= stream->body_size;
-    free(stream->body);
-    stream->body = NULL;
-    stream->body_size = 0;
+    stream->request_stopped = 1;
+    h2_discard_request(stream);
+    h2_end_long_wait(stream);
+    h2_release_body(stream);
+    free(stream->request_head);
+    stream->request_head = NULL;
     free_chunks(stream->response_first);
     stream->response_first = stream->response_last = NULL;
     stream->response_queued = 0;
@@ -1159,24 +1760,57 @@ static int h2_on_stream_close(nghttp2_session *session, int32_t stream_id,
     return 0;
 }
 
+static int h2_on_frame_send(nghttp2_session *session,
+                            const nghttp2_frame *frame, void *user_data) {
+    front_connection *front = user_data;
+    h2_stream *stream;
+    if (!(frame->hd.flags & NGHTTP2_FLAG_END_STREAM) ||
+        (frame->hd.type != NGHTTP2_HEADERS && frame->hd.type != NGHTTP2_DATA))
+        return 0;
+    stream = find_stream(front, frame->hd.stream_id);
+    if (!stream || stream->request_finished) return 0;
+    stream->request_stopped = 1;
+    h2_discard_request(stream);
+    /* A reset submitted before END_STREAM would cancel queued response frames. */
+    return nghttp2_submit_rst_stream(session, NGHTTP2_FLAG_NONE,
+                                     stream->id, NGHTTP2_NO_ERROR) == 0 ?
+        0 : NGHTTP2_ERR_CALLBACK_FAILURE;
+}
+
 static int init_h2(front_connection *front) {
     nghttp2_session_callbacks *callbacks = NULL;
+    nghttp2_option *option = NULL;
     nghttp2_settings_entry settings[] = {
         {NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS, H2_MAX_STREAMS},
-        {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, ANKAH_HEADER_LIMIT}
+        {NGHTTP2_SETTINGS_MAX_HEADER_LIST_SIZE, ANKAH_HEADER_LIMIT},
+        {NGHTTP2_SETTINGS_INITIAL_WINDOW_SIZE, ANKAH_H2_STREAM_WINDOW}
     };
     int result = nghttp2_session_callbacks_new(&callbacks);
     if (result != 0) return -1;
     nghttp2_session_callbacks_set_on_begin_headers_callback(callbacks, h2_on_begin_headers);
     nghttp2_session_callbacks_set_on_header_callback(callbacks, h2_on_header);
     nghttp2_session_callbacks_set_on_frame_recv_callback(callbacks, h2_on_frame_recv);
+    nghttp2_session_callbacks_set_on_frame_send_callback(callbacks, h2_on_frame_send);
     nghttp2_session_callbacks_set_on_data_chunk_recv_callback(callbacks, h2_on_data);
     nghttp2_session_callbacks_set_on_stream_close_callback(callbacks, h2_on_stream_close);
-    result = nghttp2_session_server_new(&front->h2, callbacks, front);
+    result = nghttp2_option_new(&option);
+    if (result == 0) {
+        nghttp2_option_set_no_auto_window_update(option, 1);
+        result = nghttp2_session_server_new2(&front->h2, callbacks, front, option);
+    }
+    nghttp2_option_del(option);
     nghttp2_session_callbacks_del(callbacks);
     if (result != 0) return -1;
-    return nghttp2_submit_settings(front->h2, NGHTTP2_FLAG_NONE,
-                                   settings, sizeof(settings) / sizeof(settings[0]));
+    result = nghttp2_submit_settings(front->h2, NGHTTP2_FLAG_NONE,
+                                     settings, sizeof(settings) / sizeof(settings[0]));
+    if (result != 0) return result;
+    result = nghttp2_session_set_local_window_size(front->h2, NGHTTP2_FLAG_NONE,
+                                                   0, ANKAH_H2_CONNECTION_WINDOW);
+    if (result != 0) return result;
+    if (frontend.draining)
+        return nghttp2_submit_goaway(front->h2, NGHTTP2_FLAG_NONE, 0,
+                                     NGHTTP2_NO_ERROR, NULL, 0);
+    return 0;
 }
 
 static void h2_flush(front_connection *front) {
@@ -1207,6 +1841,24 @@ static void consume_plain(front_connection *front, size_t size) {
         uv_read_start((uv_stream_t *)&front->bridge, allocate_read, on_bridge_read);
 }
 
+static void on_client_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *buffer);
+
+/* Stops reading from the client while encrypted input waits for the bridge,
+ * so a stalled application slows the client instead of overflowing the
+ * cipher buffer. */
+static void pace_client(front_connection *front) {
+    size_t backlog = front->cipher_size - front->cipher_offset;
+    if (front->closing) return;
+    if (!front->client_paused && backlog > FRONT_MAX_CIPHER_INPUT - FRONT_READ_SIZE) {
+        uv_read_stop((uv_stream_t *)&front->client);
+        front->client_paused = 1;
+    } else if (front->client_paused && backlog < FRONT_MAX_CIPHER_INPUT / 2) {
+        if (uv_read_start((uv_stream_t *)&front->client, allocate_read, on_client_read) != 0)
+            close_front(front);
+        else front->client_paused = 0;
+    }
+}
+
 static void drive_tls(front_connection *front) {
     unsigned char plain[16384];
     int result;
@@ -1220,6 +1872,7 @@ static void drive_tls(front_connection *front) {
             if (result == 0) {
                 const char *protocol = mbedtls_ssl_get_alpn_protocol(&front->ssl);
                 front->handshake_complete = 1;
+                front->admission_deadline_ns = uv_hrtime() + UINT64_C(5000000000);
                 front->protocol_h2 = protocol && strcmp(protocol, "h2") == 0;
                 refresh_timeout(front);
                 if (front->protocol_h2) {
@@ -1258,7 +1911,8 @@ static void drive_tls(front_connection *front) {
             continue;
         }
         if (!front->protocol_h2 && !front->bridge_connected) continue;
-        while (!front->closing && front->bridge_pending < 8) {
+        while (!front->closing &&
+               (front->protocol_h2 || front->bridge_pending < 8)) {
             result = mbedtls_ssl_read(&front->ssl, plain, sizeof(plain));
             if (result > 0) {
                 refresh_timeout(front);
@@ -1266,6 +1920,7 @@ static void drive_tls(front_connection *front) {
                     ssize_t used = nghttp2_session_mem_recv(front->h2, plain, (size_t)result);
                     if (used < 0 || used != result) { close_front(front); break; }
                     h2_flush(front);
+                    if (front->plain_first) front->drive_again = 1;
                 } else if (forward_h1_plain(front, plain, (size_t)result) != 0) {
                     close_front(front);
                     break;
@@ -1279,6 +1934,7 @@ static void drive_tls(front_connection *front) {
         }
     } while (front->drive_again && !front->closing);
     front->driving = 0;
+    pace_client(front);
 }
 
 static void on_client_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *buffer) {
@@ -1310,13 +1966,49 @@ unsigned int ankah_frontend_connections(void) {
     return frontend.connections;
 }
 
+int ankah_frontend_is_drained(void) {
+    return frontend.active_work == 0;
+}
+
+void ankah_frontend_begin_drain(void) {
+    front_connection *front;
+    if (frontend.draining) return;
+    frontend.draining = 1;
+    for (front = frontend.first; front; front = front->next) {
+        int result;
+        if (!front->h2 || front->closing) continue;
+        result = nghttp2_submit_goaway(
+            front->h2, NGHTTP2_FLAG_NONE,
+            nghttp2_session_get_last_proc_stream_id(front->h2),
+            NGHTTP2_NO_ERROR, NULL, 0);
+        if (result != 0) close_front(front);
+        else {
+            h2_flush(front);
+            drive_tls(front);
+        }
+    }
+    notify_drained();
+}
+
+void ankah_frontend_force_close(void) {
+    front_connection *front = frontend.first;
+    while (front) {
+        front_connection *next = front->next;
+        close_front(front);
+        front = next;
+    }
+}
+
 void ankah_frontend_accept(uv_stream_t *server, int status) {
     front_connection *front;
     int result;
     if (status < 0) return;
-    if (frontend.connections >= FRONT_MAX_CONNECTIONS) {
+    if (frontend.connections >= FRONT_MAX_CONNECTIONS ||
+        frontend.pending_connections >= FRONT_PENDING_CONNECTIONS) {
         uv_tcp_t *discard = malloc(sizeof(*discard));
         ankah_stats_add(ANKAH_STAT_refused, 1);
+        if (frontend.pending_connections >= FRONT_PENDING_CONNECTIONS)
+            ankah_stats_add(ANKAH_STAT_pending_connection_refused, 1);
         if (discard && uv_tcp_init(frontend.options.loop, discard) == 0) {
             uv_accept(server, (uv_stream_t *)discard);
             uv_close((uv_handle_t *)discard, on_discard_closed);
@@ -1332,11 +2024,18 @@ void ankah_frontend_accept(uv_stream_t *server, int status) {
     front->client.data = front;
     front->handles = 1;
     ++frontend.connections;
+    ++frontend.pending_connections;
+    front->admission_deadline_ns = uv_hrtime() + UINT64_C(10000000000);
     if (uv_accept(server, (uv_stream_t *)&front->client) != 0 ||
         peer_text(&front->client, front->peer_ip, sizeof(front->peer_ip)) != 0) {
         close_front(front);
         return;
     }
+    front->previous = NULL;
+    front->next = frontend.first;
+    if (front->next) front->next->previous = front;
+    frontend.first = front;
+    front->listed = 1;
     front->credentials = frontend.active;
     ++front->credentials->references;
     result = mbedtls_ssl_setup(&front->ssl, &front->credentials->config);
@@ -1398,6 +2097,8 @@ int ankah_frontend_init(const ankah_frontend_options *options) {
 }
 
 void ankah_frontend_shutdown(void) {
+    if (frontend.shutdown) return;
+    frontend.shutdown = 1;
 #ifndef _WIN32
     if (frontend.reload_signal_initialized &&
         !uv_is_closing((uv_handle_t *)&frontend.reload_signal))

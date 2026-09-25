@@ -56,9 +56,19 @@ async function main() {
   let submitted = false;
   let posted = "";
   const progress = {textContent: ""};
+  const challengeText = {
+    challenge_progress: "{0} guesses · {1}/s · {2}% chance of success by now",
+    challenge_passed_continuing: "Challenge passed. Continuing...",
+    challenge_passed_mobile: "Challenge passed. Click Finished on the original page.",
+  };
   const page = {
+    documentElement: {lang: "en"},
     body: {dataset: {challenge: `${nonce}.0.8.x`, session: "abc", worker: "/worker.js",
                      wasm: "/solver.wasm"}},
+    querySelectorAll() {
+      return Object.entries(challengeText).map(([name, textContent]) =>
+        ({dataset: {name}, textContent}));
+    },
     getElementById(id) {
       if (id === "progress") return progress;
       if (id === "finish") return {submit() { submitted = true; }};

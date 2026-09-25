@@ -1,0 +1,87 @@
+services:
+  native:
+    image: ankah-protocol-native:local
+    build:
+      context: ../..
+      dockerfile: tests/protocol_matrix/Dockerfile
+      target: native
+      args:
+        ANKAH_PROTOCOL_SOURCE_HASH: ${ANKAH_PROTOCOL_SOURCE_HASH:-unverified}
+    init: true
+    command:
+      - /opt/ankah/ankah
+      - --listen
+      - 0.0.0.0:8443
+      - --upstream
+      - 127.0.0.1:8001
+      - --secret-file
+      - /run/ankah-protocol/secret
+      - --assets-dir
+      - /opt/ankah/assets
+      - --static-bundle
+      - /opt/ankah/static
+      - --tls-cert
+      - /run/ankah-protocol/leaf.pem
+      - --tls-key
+      - /run/ankah-protocol/leaf-key.pem
+      - --allow-prefix
+      - /matrix
+      - --max-upload-mb
+      - "64"
+      - --
+      - python3
+      - /opt/ankah/fixture_server.py
+      - --port
+      - "8001"
+    environment:
+      ANKAH_PUBLIC_ORIGIN: https://native.ankah.test:8443
+    volumes:
+      - state:/run/ankah-protocol:ro
+    networks:
+      protocol:
+        aliases:
+          - native.ankah.test
+
+  edge:
+    image: ankah-protocol-edge:local
+    build:
+      context: ../..
+      dockerfile: tests/protocol_matrix/Dockerfile
+      target: edge
+      args:
+        ANKAH_PROTOCOL_SOURCE_HASH: ${ANKAH_PROTOCOL_SOURCE_HASH:-unverified}
+    init: true
+    depends_on:
+      - native
+    command: ["caddy", "run", "--config", "/etc/caddy/Caddyfile", "--adapter", "caddyfile"]
+    volumes:
+      - state:/run/ankah-protocol:ro
+    networks:
+      protocol:
+        aliases:
+          - edge.ankah.test
+
+  client:
+    image: ankah-protocol-client:local
+    build:
+      context: ../..
+      dockerfile: tests/protocol_matrix/Dockerfile
+      target: client
+      args:
+        ANKAH_PROTOCOL_SOURCE_HASH: ${ANKAH_PROTOCOL_SOURCE_HASH:-unverified}
+    depends_on:
+      - native
+      - edge
+    volumes:
+      - state:/run/ankah-protocol
+      - reports:/reports
+    networks:
+      - protocol
+
+networks:
+  protocol:
+    internal: true
+
+volumes:
+  state:
+  reports:

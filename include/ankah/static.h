@@ -19,6 +19,7 @@ typedef struct {
 
 typedef struct {
     char *prefix;
+    char *fallback_url;
     ankah_static_entry *entries;
     size_t *slots;
     size_t count;
@@ -28,6 +29,7 @@ typedef struct {
 int ankah_static_load(ankah_static_bundle *bundle, const char *directory);
 const ankah_static_entry *ankah_static_find(const ankah_static_bundle *bundle,
                                              const char *url);
+const ankah_static_entry *ankah_static_fallback(const ankah_static_bundle *bundle);
 int ankah_static_in_namespace(const ankah_static_bundle *bundle, const char *url);
 void ankah_static_free(ankah_static_bundle *bundle);
 
