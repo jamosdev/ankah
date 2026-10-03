@@ -12,6 +12,14 @@ static FILE *language_log;
 static size_t language_log_size;
 static int language_log_capped;
 static int language_log_failed;
+static int (*language_log_submit)(const char *, size_t, void *);
+static void *language_log_owner;
+
+void ankah_language_log_set_writer(int (*submit)(const char *, size_t, void *),
+                                   void *owner) {
+    language_log_submit = submit;
+    language_log_owner = owner;
+}
 
 typedef struct {
     const char *name;
@@ -42,6 +50,27 @@ static const localized_text dashboard_text[] = {
     {"setup_qr_alt", {"Authenticator setup QR code", "認証アプリ設定用QRコード", "Código QR para configurar la autenticación"}},
     {"sign_out", {"Sign out", "サインアウト", "Cerrar sesión"}},
     {"close", {"Close", "閉じる", "Cerrar"}},
+    {"cancel", {"Cancel", "キャンセル", "Cancelar"}},
+    {"disable_dashboard", {"Disable dashboard", "ダッシュボードを無効にする", "Desactivar el panel"}},
+    {"disable_prompt", {"Finished with setup? Disable dashboard access and statistics collection to reduce overhead until the next restart.", "設定が完了しましたか？ 次の再起動までダッシュボードへのアクセスと統計収集を停止し、負荷を減らせます。", "¿Has terminado la configuración? Desactiva el acceso al panel y la recopilación de estadísticas hasta el próximo reinicio para reducir la carga."}},
+    {"disable_title", {"Disable the dashboard?", "ダッシュボードを無効にしますか？", "¿Desactivar el panel?"}},
+    {"disable_explanation", {"This closes dashboard access and stops dashboard statistics for this run. Restarting Ankah turns it back on unless you launch it with --no-dashboard.", "この実行中はダッシュボードへのアクセスと統計収集が停止します。--no-dashboard を付けて起動しない限り、Ankah を再起動すると再び有効になります。", "Esto cierra el acceso al panel y detiene sus estadísticas durante esta ejecución. Al reiniciar Ankah volverá a activarse, salvo que lo inicies con --no-dashboard."}},
+    {"disable_complete", {"Dashboard disabled. Restart Ankah to restore access, or launch it with --no-dashboard to keep it off.", "ダッシュボードを無効にしました。アクセスを復元するには Ankah を再起動してください。無効のままにするには --no-dashboard を付けて起動してください。", "Panel desactivado. Reinicia Ankah para restaurar el acceso o inícialo con --no-dashboard para mantenerlo desactivado."}},
+    {"disable_failed", {"Could not disable the dashboard. Try again.", "ダッシュボードを無効にできませんでした。もう一度お試しください。", "No se pudo desactivar el panel. Inténtalo de nuevo."}},
+    {"mascot_title", {"Challenge page image", "チャレンジページの画像", "Imagen de la página de desafío"}},
+    {"mascot_help", {"Choose a PNG, JPEG, or WebP image. It appears above the challenge message.", "PNG、JPEG、WebP 画像を選択してください。チャレンジの説明の上に表示されます。", "Elige una imagen PNG, JPEG o WebP. Aparecerá sobre el mensaje de desafío."}},
+    {"mascot_preview_alt", {"Current challenge page image", "現在のチャレンジページの画像", "Imagen actual de la página de desafío"}},
+    {"mascot_choose", {"Choose image", "画像を選択", "Elegir imagen"}},
+    {"mascot_save", {"Save image", "画像を保存", "Guardar imagen"}},
+    {"mascot_restore", {"Restore default", "初期画像に戻す", "Restaurar original"}},
+    {"mascot_ready", {"Preview ready. Save to show it on the challenge page.", "プレビューを確認してください。保存するとチャレンジページに表示されます。", "Vista previa lista. Guarda para mostrarla en la página de desafío."}},
+    {"mascot_saved", {"Image saved. New challenge pages now show it.", "画像を保存しました。新しいチャレンジページに表示されます。", "Imagen guardada. Las nuevas páginas de desafío ya la muestran."}},
+    {"mascot_restored", {"Default image restored.", "初期画像に戻しました。", "Imagen original restaurada."}},
+    {"mascot_invalid", {"This image could not be opened. Choose a PNG, JPEG, or WebP file.", "画像を開けませんでした。PNG、JPEG、WebP ファイルを選んでください。", "No se pudo abrir la imagen. Elige un archivo PNG, JPEG o WebP."}},
+    {"mascot_too_large", {"The image is too large. Choose a file under 20 MB.", "画像が大きすぎます。20 MB 未満のファイルを選んでください。", "La imagen es demasiado grande. Elige un archivo de menos de 20 MB."}},
+    {"mascot_output_too_large", {"This image is still over 4 MB after resizing. Choose a smaller image.", "縮小後も画像が 4 MB を超えています。より小さい画像を選んでください。", "La imagen supera los 4 MB después de reducirla. Elige una imagen más pequeña."}},
+    {"mascot_save_failed", {"Could not save the image. Check that the mascot file location is writable.", "画像を保存できませんでした。画像ファイルの保存先に書き込めるか確認してください。", "No se pudo guardar la imagen. Comprueba que se puede escribir en la ubicación del archivo."}},
+    {"mascot_load_failed", {"Could not load the current image.", "現在の画像を読み込めませんでした。", "No se pudo cargar la imagen actual."}},
     {"now", {"Now", "現在", "Ahora"}},
     {"throughput_now", {"Throughput to clients now", "現在のクライアント向け転送量", "Tráfico actual hacia los clientes"}},
     {"measuring", {"Measuring", "計測中", "Midiendo"}},
@@ -198,6 +227,10 @@ static const translated_message message_text[] = {
     {"Invalid continuation\n", {"Invalid continuation\n", "続行情報が無効です\n", "La continuación no es válida\n"}},
     {"Continuation expired\n", {"Continuation expired\n", "続行情報の有効期限が切れました\n", "La continuación ha caducado\n"}},
     {"Dashboard requests carry no body\n", {"Dashboard requests carry no body\n", "ダッシュボードへのリクエストに本文は指定できません\n", "Las solicitudes al panel no pueden tener cuerpo\n"}},
+    {"Invalid mascot upload\n", {"Invalid mascot upload\n", "マスコット画像のアップロードが無効です\n", "La carga de la mascota no es válida\n"}},
+    {"Invalid PNG image\n", {"Invalid PNG image\n", "PNG 画像が無効です\n", "La imagen PNG no es válida\n"}},
+    {"Could not save mascot\n", {"Could not save mascot\n", "マスコット画像を保存できませんでした\n", "No se pudo guardar la mascota\n"}},
+    {"Could not restore mascot\n", {"Could not restore mascot\n", "マスコット画像を元に戻せませんでした\n", "No se pudo restaurar la mascota\n"}},
     {"Unknown dashboard path\n", {"Unknown dashboard path\n", "不明なダッシュボードのパスです\n", "Ruta del panel desconocida\n"}},
     {"Use GET\n", {"Use GET\n", "GET を使用してください\n", "Usa GET\n"}},
     {"Dashboard token required\n", {"Dashboard token required\n", "ダッシュボードのトークンが必要です\n", "Se requiere el token del panel\n"}},
@@ -232,6 +265,7 @@ static const translated_message message_text[] = {
     {"Unlock required", {"Unlock required", "ロック解除が必要です", "Se requiere desbloquear"}},
     {"Unlock", {"Unlock", "ロック解除", "Desbloquear"}},
     {"Checking your browser", {"Checking your browser", "ブラウザーを確認しています", "Comprobando el navegador"}},
+    {"Site mascot", {"Site mascot", "サイトのマスコット", "Mascota del sitio"}},
     {"Solving a short proof of work.", {"Solving a short proof of work.", "短い計算チャレンジを解いています。", "Resolviendo una breve prueba de trabajo."}},
     {"Starting challenge...", {"Starting challenge...", "チャレンジを開始しています...", "Iniciando el desafío..."}},
     {"Don't have JavaScript? Scan here.", {"Don't have JavaScript? Scan here.", "JavaScript を利用できない場合は、ここをスキャンしてください。", "¿No tienes JavaScript? Escanea aquí."}},
@@ -498,8 +532,21 @@ static void log_unknown(const language_range *range) {
         }
         return;
     }
-    if (fwrite(range->range, 1, range->length, language_log) != range->length ||
-        fputc('\n', language_log) == EOF) {
+    if (language_log_submit) {
+        char line[256];
+        if (amount > sizeof(line)) {
+            language_log_failed = 1;
+            return;
+        }
+        memcpy(line, range->range, range->length);
+        line[range->length] = '\n';
+        if (language_log_submit(line, amount, language_log_owner) != 0) {
+            fprintf(stderr, "Ankah unknown-language log queue failed\n");
+            language_log_failed = 1;
+            return;
+        }
+    } else if (fwrite(range->range, 1, range->length, language_log) != range->length ||
+               fputc('\n', language_log) == EOF) {
         fprintf(stderr, "Ankah unknown-language log write failed\n");
         language_log_failed = 1;
         return;
@@ -527,7 +574,8 @@ void ankah_language_log_request(const ankah_request *request) {
             p = *end ? end + 1 : end;
         } while (*end);
     }
-    if (wrote && !language_log_failed && fflush(language_log) != 0) {
+    if (wrote && !language_log_submit && !language_log_failed &&
+        fflush(language_log) != 0) {
         fprintf(stderr, "Ankah unknown-language log flush failed\n");
         language_log_failed = 1;
     }

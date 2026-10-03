@@ -94,6 +94,40 @@ int ankah_issue_challenge(const unsigned char secret[ANKAH_SECRET_SIZE],
     return length > 0 && length < ANKAH_CHALLENGE_TEXT_MAX ? 0 : -1;
 }
 
+int ankah_challenge_for_session(const unsigned char secret[ANKAH_SECRET_SIZE],
+                                const char *host, uint64_t now, const char id[33],
+                                char out[ANKAH_CHALLENGE_TEXT_MAX]) {
+    unsigned char digest[32];
+    char nonce_hex[ANKAH_NONCE_SIZE * 2 + 1], fields[80];
+    char signature[ANKAH_MAC_SIZE * 2 + 1], message[320];
+    const mbedtls_md_info_t *info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    uint64_t issued = 0;
+    size_t i;
+    int length;
+    if (!secret || !host || !id || strlen(id) != 32 || !info ||
+        strlen(host) > 253) return -1;
+    for (i = 0; i < 32; ++i) {
+        unsigned char c = (unsigned char)id[i];
+        unsigned int digit;
+        if (c >= '0' && c <= '9') digit = c - '0';
+        else if (c >= 'a' && c <= 'f') digit = c - 'a' + 10;
+        else return -1;
+        if (i < 8) issued = (issued << 4) | digit;
+    }
+    if (issued > now + 30 || now > issued + 300) return -1;
+    length = snprintf(message, sizeof(message), "session|%s|%s", host, id);
+    if (length < 0 || (size_t)length >= sizeof(message) ||
+        mbedtls_md_hmac(info, secret, ANKAH_SECRET_SIZE,
+                        (const unsigned char *)message, (size_t)length, digest) != 0)
+        return -1;
+    hex_encode(digest, ANKAH_NONCE_SIZE, nonce_hex);
+    length = snprintf(fields, sizeof(fields), "%s.%" PRIu64 ".18", nonce_hex, issued);
+    if (length < 0 || (size_t)length >= sizeof(fields) ||
+        mac(secret, "challenge", host, fields, signature) != 0) return -1;
+    length = snprintf(out, ANKAH_CHALLENGE_TEXT_MAX, "%s.%s", fields, signature);
+    return length > 0 && length < ANKAH_CHALLENGE_TEXT_MAX ? 0 : -1;
+}
+
 int ankah_check_answer(const unsigned char secret[ANKAH_SECRET_SIZE],
                        const char *host, uint64_t now, const char *challenge,
                        uint64_t counter) {

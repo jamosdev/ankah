@@ -134,6 +134,10 @@ void ankah_stats_init(uint64_t wall) {
     stats.day_index = wall / 86400;
 }
 
+void ankah_stats_disable(void) {
+    stats.enabled = 0;
+}
+
 void ankah_stats_add(unsigned int field, uint64_t amount) {
     if (!stats.enabled || field >= ANKAH_STAT_COUNT) return;
     stats.cumulative.v[field] += amount;
@@ -420,6 +424,16 @@ int ankah_stats_save(const char *path, uint64_t wall) {
     free(data);
     if (result == 0) snapshot_generation = generation;
     return result;
+}
+
+unsigned char *ankah_stats_snapshot(uint64_t wall, size_t *size, uint64_t *generation) {
+    unsigned char *data;
+    if (!stats.enabled || snapshot_generation == UINT64_MAX) return NULL;
+    ankah_stats_roll(wall);
+    *generation = snapshot_generation + 1;
+    data = encode_snapshot(*generation, wall, size);
+    if (data) snapshot_generation = *generation;
+    return data;
 }
 
 const char *ankah_stat_name(unsigned int field) {

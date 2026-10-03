@@ -28,6 +28,27 @@ def test_advertises_public_h3_port(client, endpoint):
     assert f'h3=":{expected}"' in response.headers.get("alt-svc", "")
 
 
+def test_native_h1_alt_svc_with_split_headers_and_large_body(client, endpoint):
+    if endpoint["profile"] != "native" or endpoint["protocol"] != "h1":
+        pytest.skip("native HTTP/1.1 Alt-Svc buffering test")
+    response = client.request("GET", "/matrix/_split_header_body")
+    assert response.status == 200
+    assert response.body == b"y" * (32 * 1024)
+    assert "h3=" in response.headers["alt-svc"]
+
+
+def test_native_h1_alt_svc_after_informational_response(endpoint):
+    if endpoint["profile"] != "native" or endpoint["protocol"] != "h1":
+        pytest.skip("native HTTP/1.1 informational response test")
+    split = urlsplit(endpoint["url"])
+    head = (f"GET /matrix/_informational HTTP/1.1\r\n"
+            f"Host: {split.netloc}\r\nConnection: close\r\n\r\n").encode()
+    response = raw_h1_request(endpoint["url"], endpoint["ca_file"], head)
+    assert response.status == 200
+    assert response.body == b"ok"
+    assert "h3=" in response.headers["alt-svc"]
+
+
 @pytest.mark.parametrize("method", [
     "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "TRACE",
 ])

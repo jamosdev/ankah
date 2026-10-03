@@ -34,25 +34,14 @@ int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **result) {
     static int (*original)(const char *, const char *, const struct addrinfo *,
                            struct addrinfo **);
-    struct addrinfo *answer;
-    struct sockaddr_in *address;
-    if (!node || strcmp(node, FIXTURE_HOST) != 0) {
-        if (!original) original = dlsym(RTLD_NEXT, "getaddrinfo");
+    struct addrinfo numeric_hints;
+    if (!original) original = dlsym(RTLD_NEXT, "getaddrinfo");
+    if (!node || strcmp(node, FIXTURE_HOST) != 0)
         return original(node, service, hints, result);
-    }
-    answer = calloc(1, sizeof(*answer));
-    address = calloc(1, sizeof(*address));
-    if (!answer || !address) {
-        free(answer);
-        free(address);
-        return EAI_MEMORY;
-    }
-    address->sin_family = AF_INET;
-    inet_pton(AF_INET, FIXTURE_IP, &address->sin_addr);
-    answer->ai_family = AF_INET;
-    answer->ai_socktype = hints ? hints->ai_socktype : SOCK_STREAM;
-    answer->ai_addrlen = sizeof(*address);
-    answer->ai_addr = (struct sockaddr *)address;
-    *result = answer;
-    return 0;
+    /* libc owns addrinfo allocation layout. In particular musl's
+     * freeaddrinfo cannot release a hand-built struct addrinfo. */
+    memset(&numeric_hints, 0, sizeof(numeric_hints));
+    if (hints) numeric_hints = *hints;
+    numeric_hints.ai_flags |= AI_NUMERICHOST;
+    return original(FIXTURE_IP, service, &numeric_hints, result);
 }

@@ -7,6 +7,7 @@ import http.server
 import csv
 import io
 import json
+import os
 import struct
 import pathlib
 import re
@@ -17,14 +18,14 @@ import tempfile
 import threading
 import time
 
-from process_support import gateway_command
+from process_support import gateway_command, start_gateway
 
 
 TOKEN = "b" * 64
 
 
-def dashboard_code(step):
-    secret = hmac.new(bytes.fromhex(TOKEN), b"ankah dashboard totp v1",
+def dashboard_code(step, token=TOKEN):
+    secret = hmac.new(bytes.fromhex(token), b"ankah dashboard totp v1",
                       hashlib.sha256).digest()[:20]
     digest = hmac.new(secret, struct.pack(">Q", step), hashlib.sha1).digest()
     offset = digest[-1] & 15
@@ -54,6 +55,8 @@ def request(port, path, method="GET", headers=None, body=None):
 
 def main():
     executable, root = sys.argv[1:]
+    executable = str(pathlib.Path(executable).resolve())
+    root = str(pathlib.Path(root).resolve())
     public, dashboard, app = free_port(), free_port(), free_port()
     authorized = {"Authorization": "Bearer " + TOKEN}
 
@@ -86,18 +89,18 @@ def main():
         token = pathlib.Path(temp) / "token"
         token.write_text(TOKEN + "\n")
         stats_file = pathlib.Path(temp) / "statistics"
+        mascot_file = pathlib.Path(temp) / "mascot.png"
         pathlib.Path(str(stats_file) + ".0").write_bytes(b"corrupt")
         public_route = "/ankah-admin/"
         base = ["--listen", f"127.0.0.1:{public}", "--upstream", f"127.0.0.1:{app}",
                 "--public-origin", f"http://localhost:{public}",
                 "--secret-file", str(secret), "--assets-dir", root,
+                "--mascot-file", str(mascot_file),
                 "--allow-prefix", "/app", "--allow-prefix", "/ankah-admin"]
         listen = ["--dashboard-listen", f"127.0.0.1:{dashboard}"]
         public_route_option = ["--dashboard-public-route=" + public_route]
 
-        for extra, reason in ((listen, "listen without a token"),
-                              (public_route_option, "public route without a token"),
-                              (["--dashboard-public-route", "/", "--dashboard-token-file",
+        for extra, reason in ((["--dashboard-public-route", "/", "--dashboard-token-file",
                                 str(token)], "root public dashboard route"),
                               (["--dashboard-public-route", "/without-slash",
                                 "--dashboard-token-file", str(token)],
@@ -106,11 +109,16 @@ def main():
                                 "--dashboard-token-file", str(token),
                                 "--ankah-healthz=/health/check"],
                                "public dashboard health route conflict"),
-                              (["--dashboard-token-file", str(token)], "token without a listener"),
                               (listen + ["--dashboard-token-file", str(secret)],
                                "token equal to the secret"),
-                              (["--stats-file", str(stats_file)], "statistics without a dashboard"),
-                              (["--no-stats-file"], "disabled statistics without a dashboard"),
+                              (["--no-dashboard", "--dashboard-listen",
+                                f"127.0.0.1:{dashboard}"], "disabled dashboard with listener"),
+                              (["--no-dashboard", "--dashboard-token-file", str(token)],
+                               "disabled dashboard with token"),
+                              (["--no-dashboard", "--stats-file", str(stats_file)],
+                               "disabled dashboard with statistics"),
+                              (["--mascot-file", str(pathlib.Path(root) / "ankah.png")],
+                               "mascot override replacing the bundled asset"),
                               (listen + ["--dashboard-token-file", str(token),
                                          "--stats-file", str(stats_file), "--no-stats-file"],
                                "conflicting statistics options")):
@@ -119,10 +127,165 @@ def main():
                                     timeout=30)
             check(result.returncode == 2, f"started with {reason}")
 
-        process = subprocess.Popen(
-            gateway_command(executable, base + listen + public_route_option +
+        generated = pathlib.Path(temp) / "ankah.dashboard.token"
+        default_args = base + ["--no-stats-file"]
+        for first in (True, False):
+            default_process = start_gateway(
+                executable, default_args, cwd=temp,
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                for _ in range(250):
+                    if default_process.poll() is not None:
+                        raise RuntimeError("default dashboard exited: " +
+                                           default_process.stderr.read().decode())
+                    try:
+                        if request(public, public_route + "stats/live")[0] == 401:
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(.02)
+                else:
+                    raise RuntimeError("default public dashboard did not start")
+                ephemeral = not generated.exists()
+                if ephemeral:
+                    check(os.environ.get("ANKAH_TEST_WINDOWS_PATHS") == "1",
+                          "native token file was created")
+                    line = default_process.stderr.readline().decode()
+                    match = re.search(r"temporary token for this run: ([0-9a-f]{64})", line)
+                    check(match is not None, "unsupported ACL uses temporary token")
+                    value = match.group(1)
+                else:
+                    value = generated.read_text().strip()
+                check(re.fullmatch(r"[0-9a-f]{64}", value) is not None,
+                      "generated token format")
+                if first:
+                    initial_token = value
+                    if ephemeral:
+                        pass  # No secret may be persisted with an unverifiable ACL.
+                    elif os.name == "nt" or os.environ.get("ANKAH_TEST_WINDOWS_PATHS") == "1":
+                        from process_support import windows_path
+                        checker = str(pathlib.Path(executable).with_name("ankah-private-file.exe"))
+                        path = windows_path(generated) if os.name != "nt" else str(generated)
+                        subprocess.run(gateway_command(checker, [path]), check=True)
+                    else:
+                        check(generated.stat().st_mode & 0o077 == 0,
+                              "generated token has private permissions")
+                else:
+                    if ephemeral:
+                        check(value != initial_token, "temporary token rotates on restart")
+                        check(request(public, public_route + "stats/live", headers={
+                            "Authorization": "Bearer " + initial_token})[0] == 401,
+                            "previous temporary token no longer authorizes")
+                        check(not generated.exists(), "unprotected token is never persisted")
+                    else:
+                        check(value == initial_token, "generated token survives restart")
+                check(request(public, public_route + "stats/live",
+                              headers={"Authorization": "Bearer " + value})[0] == 200,
+                      "generated token authorizes default dashboard")
+                if first:
+                    code = dashboard_code(int(time.time()) // 30, value)
+                    status, _, body = request(public, public_route + "auth/login", "POST",
+                                              {"X-Ankah-Code": code})
+                    check(status == 200, "generated token supports authenticator login")
+                    session = json.loads(body)["token"]
+                    check(request(public, public_route + "settings/disable", "POST",
+                                  {"Authorization": "Bearer " + session})[0] == 204,
+                          "authenticator session can disable default dashboard")
+                    check(request(public, public_route + "stats/live")[0] == 410,
+                          "disabled default dashboard API is gone")
+                    check(request(public, public_route)[0] == 410,
+                          "disabled default dashboard page is gone")
+                    check(request(public, "/app/after-disable")[0] == 200,
+                          "gateway stays available after live disable")
+            finally:
+                default_process.terminate()
+                default_process.wait(timeout=10)
+
+        generated.write_text("invalid")
+        result = subprocess.run(gateway_command(executable, default_args), cwd=temp,
+                                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                timeout=10)
+        check(result.returncode == 2, "malformed generated token is not replaced")
+
+        if sys.platform.startswith("linux") and pathlib.Path("/proc").is_dir():
+            temporary_process = start_gateway(
+                executable, default_args, cwd="/proc",
+                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                line = temporary_process.stderr.readline().decode()
+                match = re.search(r"temporary token for this run: ([0-9a-f]{64})", line)
+                check(match is not None, "read-only working directory emits a temporary token")
+                for _ in range(250):
+                    if temporary_process.poll() is not None:
+                        raise RuntimeError("temporary-token dashboard exited")
+                    try:
+                        if request(public, public_route + "stats/live", headers={
+                                "Authorization": "Bearer " + match.group(1)})[0] == 200:
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(.02)
+                else:
+                    raise RuntimeError("temporary token did not authorize the dashboard")
+            finally:
+                temporary_process.terminate()
+                temporary_process.wait(timeout=10)
+
+        no_dashboard_dir = pathlib.Path(temp) / "no-dashboard"
+        no_dashboard_dir.mkdir()
+        disabled_process = start_gateway(
+            executable, base + ["--no-dashboard"], cwd=no_dashboard_dir,
+            stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+        try:
+            for _ in range(250):
+                if disabled_process.poll() is not None:
+                    raise RuntimeError("disabled dashboard exited: " +
+                                       disabled_process.stderr.read().decode())
+                try:
+                    if request(public, public_route + "stats/live")[0] == 200:
+                        break
+                except OSError:
+                    pass
+                time.sleep(.02)
+            else:
+                raise RuntimeError("gateway did not serve with --no-dashboard")
+            check(not (no_dashboard_dir / "ankah.dashboard.token").exists(),
+                  "--no-dashboard skips token creation")
+        finally:
+            disabled_process.terminate()
+            disabled_process.wait(timeout=10)
+
+        no_dashboard_config = no_dashboard_dir / "disabled.conf"
+        no_dashboard_config.write_text("no-dashboard=true\n")
+        for options, environment, label in (
+                (["--config", str(no_dashboard_config)], os.environ.copy(), "config file"),
+                ([], {**os.environ, "ANKAH_NO_DASHBOARD": "true"}, "environment")):
+            disabled_process = start_gateway(
+                executable, base + options, cwd=no_dashboard_dir,
+                env=environment, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+            try:
+                for _ in range(250):
+                    if disabled_process.poll() is not None:
+                        raise RuntimeError(f"{label} disabled gateway exited: " +
+                                           disabled_process.stderr.read().decode())
+                    try:
+                        if request(public, public_route + "stats/live")[0] == 200:
+                            break
+                    except OSError:
+                        pass
+                    time.sleep(.02)
+                else:
+                    raise RuntimeError(f"{label} did not disable the dashboard")
+                check(not (no_dashboard_dir / "ankah.dashboard.token").exists(),
+                      f"{label} disable skips token creation")
+            finally:
+                disabled_process.terminate()
+                disabled_process.wait(timeout=10)
+
+        process = start_gateway(
+            executable, base + listen + public_route_option +
                             ["--dashboard-token-file", str(token),
-                            "--stats-file", str(stats_file)]),
+                            "--stats-file", str(stats_file)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             for _ in range(250):
@@ -274,12 +437,16 @@ def main():
             check(b"<!--#" not in page and b'<html lang="en">' in page and
                   b"Ankah dashboard" in page and
                   b'id="export"' in page and
+                  b'id="disable-dialog"' in page and
+                  b'Disable dashboard' in page and
+                  b'Restarting Ankah turns it back on' in page and
                   b"Rates between polls, last five minutes." in page,
                   "dashboard SSI is rendered")
             english_etag = headers["ETag"]
-            for preference, tag, title in (
-                ("ja-JP, es;q=0.5", "ja", "Ankah ダッシュボード"),
-                ("es-MX, ja;q=0.5", "es", "Panel de Ankah"),
+            for preference, tag, title, disable_text in (
+                ("ja-JP, es;q=0.5", "ja", "Ankah ダッシュボード", "統計収集が停止します"),
+                ("es-MX, ja;q=0.5", "es", "Panel de Ankah",
+                 "detiene sus estadísticas"),
             ):
                 localized_status, localized_headers, localized_page = request(
                     dashboard, "/", headers={"Accept-Language": preference})
@@ -289,6 +456,7 @@ def main():
                       localized_headers["ETag"] != english_etag and
                       f'<html lang="{tag}">'.encode() in localized_page and
                       title.encode() in localized_page and
+                      disable_text.encode() in localized_page and
                       b"<!--#" not in localized_page,
                       f"{tag} dashboard translation and metadata")
                 cached_status, cached_headers, _ = request(
@@ -339,6 +507,53 @@ def main():
                                                if name.startswith(("dashboard", "d3")) else name)
                 check(status == 200 and headers["Content-Type"].startswith(kind) and
                       body == source.read_bytes(), "public " + name + " is served")
+            default_mascot = (pathlib.Path(root) / "ankah.png").read_bytes()
+            replacement = (pathlib.Path(root) / "phone-scan.png").read_bytes()
+            status, headers, body = request(dashboard, "/settings/mascot", headers=authorized)
+            check(status == 200 and headers.get("X-Ankah-Mascot-Source") == "default" and
+                  body == default_mascot, "dashboard shows the default mascot")
+            check(request(dashboard, "/settings/mascot")[0] == 401,
+                  "mascot settings require a token")
+            upload_headers = {**authorized, "Content-Type": "image/png"}
+            check(request(dashboard, "/settings/mascot", "PUT", upload_headers,
+                          b"invalid")[0] == 400, "invalid PNG is refused")
+            check(request(dashboard, "/settings/mascot", "PUT",
+                          {**upload_headers, "Content-Length": str(4 * 1024 * 1024 + 1)},
+                          b"")[0] == 413,
+                  "oversized mascot is refused")
+            check(request(dashboard, "/settings/mascot", "POST", authorized)[0] == 405,
+                  "unsupported mascot method is refused")
+            with socket.create_connection(("127.0.0.1", public), timeout=10) as slow:
+                slow.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+                slow.sendall((f"GET /ankah/mascot.png HTTP/1.1\r\n"
+                              f"Host: localhost:{public}\r\nConnection: close\r\n\r\n").encode())
+                time.sleep(.05)
+                check(request(public, public_route + "settings/mascot", "PUT",
+                              upload_headers, replacement)[0] == 204,
+                      "public dashboard route accepts the image")
+                response = bytearray()
+                while True:
+                    part = slow.recv(65536)
+                    if not part:
+                        break
+                    response.extend(part)
+                check(response.split(b"\r\n\r\n", 1)[1] == default_mascot,
+                      "an image response in progress keeps its original bytes")
+            check(mascot_file.read_bytes() == replacement,
+                  "uploaded mascot is saved")
+            status, headers, body = request(dashboard, "/settings/mascot", headers=authorized)
+            check(status == 200 and headers.get("X-Ankah-Mascot-Source") == "custom" and
+                  body == replacement, "dashboard shows the uploaded mascot")
+            status, headers, body = request(public, "/ankah/mascot.png")
+            check(status == 200 and headers.get("Content-Type") == "image/png" and
+                  headers.get("Cache-Control") == "no-store" and body == replacement,
+                  "challenge mascot changes immediately")
+            check(request(public, public_route + "settings/mascot")[0] == 401,
+                  "public mascot settings require a token")
+            check(request(dashboard, "/settings/mascot", "DELETE", authorized)[0] == 204 and
+                  not mascot_file.exists(), "restore removes the override")
+            check(request(public, "/ankah/mascot.png")[2] == default_mascot,
+                  "restore changes the challenge image")
             before_public_api = stats("/stats/live")
             status, headers, _ = request(public, public_route + "stats/live")
             check(status == 401 and headers["WWW-Authenticate"].startswith("Bearer"),
@@ -384,7 +599,9 @@ def main():
             status, _, _ = request(public, "/app/missing")
             check(status == 404, "upstream 404 passes through")
             status, _, page = request(public, "/blocked")
-            check(status == 428 and b"phone-panel" in page, "browser challenge")
+            check(status == 428 and b"phone-panel" in page and
+                  b"<img id=mascot src='/ankah/mascot.png'" in page,
+                  "browser challenge displays the mascot")
             status, _, _ = request(public, "/blocked", headers={"User-Agent": "curl/8.0"})
             check(status == 302, "command line challenge")
             status, _, page = request(public, "/stats/live", headers=authorized)
@@ -480,7 +697,7 @@ def main():
             check(status == 200, "reset accepted")
             reset_reply = json.loads(body)
             epoch = reset_reply["epoch"]
-            check(reset_reply["persistence"] == "saved", "reset snapshot is saved")
+            check(reset_reply["persistence"] == "queued", "reset snapshot is queued")
             check(epoch >= history["epoch"], "reset moves the epoch forward")
             reset = stats("/stats/live")
             check(reset["epoch"] == epoch and reset["cumulative"][field["requests"]] == 0 and
@@ -489,13 +706,35 @@ def main():
             check(reset_metrics["ankah_stats_epoch_seconds"] == epoch and
                   reset_metrics["ankah_http_requests_total"] == 0,
                   "metrics reflect reset counters")
+            check(request(dashboard, "/settings/mascot", "PUT", upload_headers,
+                          replacement)[0] == 204, "mascot is saved before restart")
+            check(request(dashboard, "/settings/disable", "POST")[0] == 401,
+                  "dashboard disable requires authorization")
+            check(request(dashboard, "/settings/disable", "GET", authorized)[0] == 405,
+                  "dashboard disable only accepts POST")
+            check(request(dashboard, "/stats/live", headers=authorized)[0] == 200,
+                  "cancelled disable leaves dashboard active")
+            check(request(dashboard, "/settings/disable", "POST", authorized)[0] == 204,
+                  "dashboard token can disable dashboard")
+            check(request(public, public_route + "stats/live", headers=authorized)[0] == 410,
+                  "public dashboard API closes immediately")
+            check(request(public, public_route + "", headers=authorized)[0] == 410,
+                  "public dashboard page closes immediately")
+            check(request(public, "/app/after-disable")[0] == 200,
+                  "gateway keeps serving after dashboard disable")
+            try:
+                request(dashboard, "/stats/live", headers=authorized)
+            except OSError:
+                pass
+            else:
+                raise RuntimeError("private dashboard listener stayed open")
         finally:
             process.terminate()
             process.wait(timeout=10)
 
-        process = subprocess.Popen(
-            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token),
-                            "--stats-file", str(stats_file)]),
+        process = start_gateway(
+            executable, base + listen + ["--dashboard-token-file", str(token),
+                            "--stats-file", str(stats_file)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             for _ in range(250):
@@ -516,14 +755,19 @@ def main():
             check(restored_metrics["ankah_stats_epoch_seconds"] == epoch and
                   restored_metrics["ankah_http_requests_total"] == 0,
                   "metrics reflect restored counters")
+            check(request(public, public_route + "stats/live")[0] == 200,
+                  "private listener does not enable the default public route")
+            check(request(dashboard, "/settings/mascot", headers=authorized)[2] == replacement and
+                  request(public, "/ankah/mascot.png")[2] == replacement,
+                  "mascot survives restart")
         finally:
             process.terminate()
             process.wait(timeout=10)
 
         unavailable = pathlib.Path(temp) / "missing" / "statistics"
-        process = subprocess.Popen(
-            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token),
-                            "--stats-file", str(unavailable)]),
+        process = start_gateway(
+            executable, base + listen + ["--dashboard-token-file", str(token),
+                            "--stats-file", str(unavailable)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             for _ in range(250):
@@ -539,15 +783,17 @@ def main():
             else:
                 raise RuntimeError("degraded dashboard did not listen")
             status, _, body = request(dashboard, "/stats/reset", "POST", authorized, b"")
-            check(status == 200 and json.loads(body)["persistence"] == "failed",
+            check(status == 200 and json.loads(body)["persistence"] == "queued",
                   "snapshot write failure does not prevent reset")
         finally:
             process.terminate()
             process.wait(timeout=10)
+            check("statistics persistence unavailable" in process.stderr.read().decode(),
+                  "snapshot write failure is reported")
 
-        process = subprocess.Popen(
-            gateway_command(executable, base + listen + ["--dashboard-token-file", str(token),
-                            "--no-stats-file"]),
+        process = start_gateway(
+            executable, base + listen + ["--dashboard-token-file", str(token),
+                            "--no-stats-file"],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             for _ in range(250):

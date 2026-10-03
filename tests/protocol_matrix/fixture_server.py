@@ -7,6 +7,7 @@ import hashlib
 import http.server
 import json
 import threading
+import time
 import uuid
 import xml.etree.ElementTree as ET
 from urllib.parse import parse_qs, urlsplit
@@ -104,6 +105,35 @@ class Handler(http.server.BaseHTTPRequestHandler):
         path = split.path
         if path == "/matrix/_ready":
             self.send_bytes(200, b"ready\n", head=head)
+            return
+        if path == "/matrix/_large":
+            self.send_bytes(200, b"x" * (3 * 1024 * 1024), head=head)
+            return
+        if path == "/matrix/_delayed_body":
+            self.send_response(200)
+            self.send_header("Content-Length", "8")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.wfile.flush()
+            if not head:
+                time.sleep(2)
+                self.wfile.write(b"survivor")
+            return
+        if path == "/matrix/_split_header_body":
+            body = b"y" * (32 * 1024)
+            self.wfile.write(b"HTTP/1.1 200 OK\r\nX-Pad: " + b"a" * 8192)
+            self.wfile.flush()
+            time.sleep(0.1)
+            self.wfile.write(b"\r\nContent-Length: 32768\r\n"
+                             b"Connection: close\r\n\r\n" + body)
+            self.wfile.flush()
+            return
+        if path == "/matrix/_informational":
+            self.wfile.write(b"HTTP/1.1 103 Early Hints\r\n"
+                             b"Link: </matrix/_ready>; rel=preload\r\n\r\n"
+                             b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n"
+                             b"Connection: close\r\n\r\nok")
+            self.wfile.flush()
             return
         if path == "/matrix/_trailers":
             self.send_response(200)

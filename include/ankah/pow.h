@@ -17,6 +17,11 @@ int ankah_random(unsigned char *out, size_t size);
 int ankah_issue_challenge(const unsigned char secret[ANKAH_SECRET_SIZE],
                           const char *host, uint64_t now, unsigned int bits,
                           char out[ANKAH_CHALLENGE_TEXT_MAX]);
+/* The session ID contains its issue time. Any node sharing the secret can
+ * reconstruct this challenge without storing or exchanging the session. */
+int ankah_challenge_for_session(const unsigned char secret[ANKAH_SECRET_SIZE],
+                                const char *host, uint64_t now, const char id[33],
+                                char out[ANKAH_CHALLENGE_TEXT_MAX]);
 int ankah_check_answer(const unsigned char secret[ANKAH_SECRET_SIZE],
                        const char *host, uint64_t now, const char *challenge,
                        uint64_t counter);

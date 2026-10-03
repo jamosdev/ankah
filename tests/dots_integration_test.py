@@ -157,6 +157,7 @@ def start(binary, assets, tmp, dots_port, trusted, extra=()):
             "--proxy-abuse-profile=off", "--trusted-proxy", trusted,
             "--dashboard-listen", f"127.0.0.1:{dashboard}",
             "--dashboard-token-file", tmp / "token", "--no-stats-file",
+            "--no-session-state-file",
             "--dots-server", f"127.0.0.1:{dots_port}", "--dots-server-name", "dots.test",
             "--dots-ca-file", tmp / "ca.crt", "--dots-cert-file", tmp / "client.crt",
             "--dots-key-file", tmp / "client.key", "--dots-cuid", "ankah-test",

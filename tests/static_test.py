@@ -330,6 +330,8 @@ def main():
                 raise RuntimeError("root gateway did not listen")
             require(status == 200 and payload == shell,
                     "root index was not served")
+            require(request(root_port, "/ankah-admin/stats/live")[0] == 401,
+                    "default dashboard API is reserved inside a root static bundle")
             require(request(root_port, "/account/settings", headers=navigation)[0] == 428,
                     "root SPA fallback bypassed the challenge")
         finally:

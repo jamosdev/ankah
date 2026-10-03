@@ -91,6 +91,24 @@ h1, h2, p { margin: 0; }
 h1 { font-size: 1.5rem; font-weight: 650; letter-spacing: -0.01em; }
 h2 { font-size: 1rem; font-weight: 600; }
 
+.mascot-settings { display: flex; align-items: center; gap: 24px; margin-bottom: 18px; }
+.disable-banner { display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 18px; }
+.disable-banner p { max-width: 720px; }
+.disable-banner button { flex: 0 0 auto; }
+@media (max-width: 600px) {
+  .disable-banner { align-items: stretch; flex-direction: column; }
+}
+.mascot-preview { flex: 0 0 180px; height: 180px; display: grid; place-items: center; }
+.mascot-preview img { max-width: 100%; max-height: 100%; object-fit: contain; }
+.mascot-controls { flex: 1; min-width: 0; display: grid; gap: 10px; }
+.mascot-controls input[type="file"] { max-width: 100%; }
+.mascot-buttons { display: flex; flex-wrap: wrap; gap: 8px; }
+#mascot-status.is-error { color: var(--critical); }
+@media (max-width: 600px) {
+  .mascot-settings { flex-direction: column; align-items: stretch; }
+  .mascot-preview { flex-basis: auto; }
+}
+
 button, input { font: inherit; color: inherit; }
 
 button {
@@ -168,7 +186,7 @@ button[aria-pressed="true"] {
   font-family: ui-monospace, monospace;
 }
 
-#setup-dialog {
+#setup-dialog, #disable-dialog {
   width: min(360px, calc(100vw - 32px));
   border: 1px solid var(--border);
   border-radius: 8px;
@@ -176,8 +194,9 @@ button[aria-pressed="true"] {
   color: var(--ink);
   padding: 20px;
 }
-#setup-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
-#setup-dialog h2, #setup-dialog p { margin-bottom: 12px; }
+#setup-dialog::backdrop, #disable-dialog::backdrop { background: rgba(0, 0, 0, 0.7); }
+#setup-dialog h2, #setup-dialog p, #disable-dialog h2, #disable-dialog p { margin-bottom: 12px; }
+.dialog-actions { display: flex; justify-content: flex-end; gap: 8px; }
 #setup-qr { display: block; max-width: 100%; height: auto; margin: 0 auto 16px; }
 
 .now {

@@ -34,9 +34,17 @@ class MatrixClient:
         self.pacer.wait()
         return self.client.request(method, path, headers, content)
 
-    def concurrent(self, requests):
+    def concurrent(self, requests, **kwargs):
         self.pacer.wait(len(requests))
-        return self.client.concurrent(requests)
+        return self.client.concurrent(requests, **kwargs)
+
+    def sequential(self, requests, **kwargs):
+        self.pacer.wait(len(requests))
+        return self.client.sequential(requests, **kwargs)
+
+    def cancel_queued_responses(self):
+        self.pacer.wait(5)
+        return self.client.cancel_queued_responses()
 
 
 def pytest_addoption(parser):

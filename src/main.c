@@ -13,6 +13,7 @@
 #include "ankah/language.h"
 #include "ankah/files.h"
 #include "ankah/frontend.h"
+#include "ankah/host.h"
 #include "ankah/h3_frontend.h"
 #include "ankah/pow.h"
 #include "ankah/proxy.h"
@@ -27,11 +28,15 @@
 #include "abuse_policy.h"
 #include "dots.h"
 #include "crawler.h"
+#include "disk_writer.h"
+#include "link.h"
 #include <llhttp.h>
 #include <uv.h>
 #include <mbedtls/md.h>
 
 #include <inttypes.h>
+#include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
@@ -54,6 +59,9 @@
 #define DASHBOARD_SESSION_SECONDS (12U * 3600U)
 #define LIVE_CACHE_NS UINT64_C(250000000)
 #define STATS_SAVE_NS UINT64_C(900000000000)
+#define SESSION_SAVE_NS UINT64_C(30000000000)
+#define SESSION_REFRESH_NS UINT64_C(5000000000)
+#define GATEWAY_BLOCK_NS UINT64_C(600000000000)
 #define TOP_CONNECTIONS 16
 #define MAX_BODY (16U * 1024U * 1024U)
 #define DEFAULT_MAX_UPLOAD_MB 1024U
@@ -108,10 +116,13 @@ typedef struct {
     char *data;
     size_t size;
     unsigned int pins;
+    int borrowed;
 } shared_body;
 
 typedef struct connection connection;
 typedef struct throttle_client throttle_client;
+typedef struct remote_pending remote_pending;
+typedef struct consume_job consume_job;
 
 typedef enum {
     LIFECYCLE_RUNNING,
@@ -145,7 +156,11 @@ typedef struct {
 
 struct connection {
     uv_tcp_t client;
-    uv_tcp_t upstream;
+    union { uv_tcp_t tcp; uv_pipe_t pipe; } upstream;
+    ankah_host *host;
+    unsigned int route_id;
+    unsigned int bridge_port;
+    uint64_t connect_deadline_ns;
     uv_connect_t connect_request;
     uv_shutdown_t client_shutdown;
     uv_timer_t timer;
@@ -162,7 +177,15 @@ struct connection {
     size_t initial_size;
     size_t body_received;
     ankah_session *capture_session;
+    unsigned char *mascot_upload;
+    size_t mascot_received;
     unsigned char *replay_body;
+    ankah_post_payload *replay_payload;
+    int replay_raw;
+    int pass_after_replay;
+    unsigned char *response_head_buffer;
+    size_t response_head_size;
+    int response_head_done;
     size_t replay_size;
     size_t replay_offset;
     int replaying;
@@ -170,6 +193,10 @@ struct connection {
     char continue_body[256];
     size_t continue_received;
     size_t continue_expected;
+    char continue_session_id[33];
+    char continue_token[33];
+    int continuation_waiting;
+    uint64_t link_request_id;
     unsigned int pending;
     unsigned int pending_client;
     unsigned int pending_upstream;
@@ -229,6 +256,20 @@ struct connection {
     uint64_t bytes_in, tallied_bytes_in, bytes_out;
 };
 
+struct remote_pending {
+    remote_pending *next;
+    connection *client;
+    uint64_t request_id, deadline_ns;
+};
+
+struct consume_job {
+    int peer;
+    connection *client;
+    ankah_link_connection *link;
+    uint64_t request_id;
+    char id[33], token[33];
+};
+
 typedef struct {
     const char *name;
     const char *type;
@@ -244,6 +285,11 @@ typedef struct {
     int listen_port;
     int http3_enabled;
     int public_h3_port;
+    ankah_host hosts[ANKAH_MAX_HOSTS];
+    unsigned int host_count;
+    unsigned int max_connections, max_streams;
+    size_t upload_queue, request_queue, response_queue;
+    char upstream_unix[108];
     char upstream_ip[64];
     int upstream_port;
     char public_origin[256];
@@ -251,6 +297,7 @@ typedef struct {
     int public_https;
     char secret_path[512];
     char assets_dir[512];
+    char mascot_path[512];
     char static_dir[512];
     char unknown_languages_path[512];
     char health_paths[3][ANKAH_MAX_TARGET];
@@ -280,6 +327,22 @@ typedef struct {
     unsigned int trusted_proxy_count;
     ankah_abuse_policy *abuse_policy;
     unsigned char secret[ANKAH_SECRET_SIZE];
+    ankah_link_peer link_peers[ANKAH_LINK_MAX_PEERS];
+    unsigned int link_peer_count;
+    char link_listen_ip[64];
+    int link_listen_port, link_listen_explicit, link_started;
+    struct {
+        char ip[64];
+        uint64_t until_ns;
+    } gateway_blocks[4096];
+    char pending_blocks[ANKAH_LINK_BLOCK_BATCH_MAX][64];
+    unsigned int pending_block_count;
+    uv_timer_t block_timer;
+    int block_timer_initialized;
+    uv_timer_t link_rpc_timer;
+    int link_rpc_timer_initialized;
+    remote_pending *remote_first;
+    uint64_t next_link_request_id;
     uv_loop_t *loop;
     uv_tcp_t listener;
     uv_tcp_t internal_listener;
@@ -291,16 +354,16 @@ typedef struct {
     lifecycle_state lifecycle;
     int intentional_shutdown;
     unsigned int active_requests;
-#ifndef _WIN32
     uv_signal_t terminate_signal;
     uv_signal_t interrupt_signal;
     int terminate_signal_initialized;
     int interrupt_signal_initialized;
-#endif
     unsigned int connections;
     unsigned int pending_connections;
     unsigned int anonymous_connections;
     static_asset assets[ASSET_COUNT];
+    shared_body *mascot_default;
+    shared_body *mascot_current;
     static_asset dashboard_assets[DASHBOARD_ASSET_COUNT];
     static_asset dashboard_pages[ANKAH_LANGUAGE_COUNT];
     ankah_static_bundle static_bundle;
@@ -311,11 +374,29 @@ typedef struct {
     char dashboard_ip[64];
     int dashboard_port;
     int dashboard;
+    int no_dashboard;
+    int dashboard_token_explicit;
     char dashboard_public_route[ANKAH_MAX_TARGET];
     char dashboard_token_path[512];
     char stats_path[ANKAH_STATS_PATH_MAX];
+    char session_state_path[512];
+    int session_persistence_disabled;
+    uv_timer_t session_timer;
+    int session_timer_initialized;
+    uint64_t next_session_save_ns;
+    uint64_t session_snapshot_queued_ns;
+    uint64_t session_snapshot_generation;
+    int session_snapshot_lag_reported;
+    ankah_session_snapshot *session_snapshot;
+    int session_snapshot_inflight;
+    int shutdown_session_snapshot;
+    uint64_t next_journal_refresh_ns;
+    uint64_t next_journal_maintain_ns;
     int stats_persistence_disabled;
     int stats_persistence_failed;
+    int session_persistence_failed;
+    int journal_persistence_failed;
+    int writer_started;
     uint64_t next_stats_save_ns;
     unsigned char dashboard_token[ANKAH_SECRET_SIZE];
     struct {
@@ -338,6 +419,7 @@ typedef struct {
 } configuration;
 
 static configuration config;
+static ankah_host *loading_host;
 
 static void close_connection(connection *c);
 static void send_asset_chunk(connection *c);
@@ -356,11 +438,30 @@ static void allocate_read(uv_handle_t *handle, size_t suggested, uv_buf_t *buffe
 static void refresh_timeout(connection *c);
 static size_t header_end(const char *bytes, size_t length);
 static int save_stats(void);
+static void disable_dashboard(void);
+static void hex_encode(const unsigned char *input, size_t size, char *out);
+static void on_disk_result(int kind, void *context, int result,
+                           uint64_t generation, void *owner);
+static void on_session_tick(uv_timer_t *timer);
+static void close_handle(uv_handle_t *handle);
+static void on_link_message(int type, const unsigned char *data, size_t size,
+                            ankah_link_connection *connection, void *owner);
+static void broadcast_solved(const ankah_session *session);
+static int gateway_blocked(const char *ip);
+static void gateway_block(const char *ip, int forward);
+static void finish_peer_consume(consume_job *job, int result);
+static int submit_language_log(const char *data, size_t size, void *owner) {
+    (void)owner;
+    return ankah_disk_log(config.unknown_languages_path, data, size);
+}
 static void maybe_finish_drain(void);
 static void finish_shutdown(void);
 static void handle_initial(connection *c);
 static void release_crawler_slot(connection *c);
 static void release_external_crawler_slot(connection *c);
+static void finish_continue_after_ack(connection *c, int result);
+static const char *dashboard_public_target(const char *target);
+static int dashboard_public_bare_path(const connection *c);
 
 /* Dashboard API traffic never reaches the statistics it reports. */
 static void tally(const connection *c, unsigned int field, uint64_t amount) {
@@ -388,9 +489,19 @@ static void tally_status(const connection *c, int status) {
 
 static void body_release(shared_body *body) {
     if (body && --body->pins == 0) {
-        free(body->data);
+        if (!body->borrowed) free(body->data);
         free(body);
     }
+}
+
+static shared_body *body_wrap(unsigned char *data, size_t size, int borrowed) {
+    shared_body *body = malloc(sizeof(*body));
+    if (!body) return NULL;
+    body->data = (char *)data;
+    body->size = size;
+    body->pins = 1;
+    body->borrowed = borrowed;
+    return body;
 }
 
 static void registry_link(connection *c) {
@@ -499,18 +610,23 @@ static void respond_binary(connection *c, const char *type,
     }
 }
 
-static ankah_session *request_session(const ankah_request *request) {
+static int request_session_id(const ankah_request *request, char id[33]) {
     const char *cookie = ankah_header_value(request, "Cookie");
     const char *item;
-    char id[33];
-    if (!cookie) return NULL;
+    if (!cookie) return -1;
     item = strstr(cookie, "ankah_sid=");
-    if (!item || (item != cookie && item[-1] != ';' && item[-1] != ' ')) return NULL;
+    if (!item || (item != cookie && item[-1] != ';' && item[-1] != ' ')) return -1;
     item += strlen("ankah_sid=");
     if (strspn(item, "0123456789abcdef") != 32 ||
-        (item[32] != ';' && item[32] != ' ' && item[32] != 0)) return NULL;
+        (item[32] != ';' && item[32] != ' ' && item[32] != 0)) return -1;
     memcpy(id, item, 32);
     id[32] = 0;
+    return 0;
+}
+
+static ankah_session *request_session(const ankah_request *request) {
+    char id[33];
+    if (request_session_id(request, id) != 0) return NULL;
     return ankah_session_find(id, (uint64_t)time(NULL));
 }
 
@@ -640,6 +756,65 @@ static int load_hex_file(const char *path, unsigned char out[ANKAH_SECRET_SIZE])
     return 0;
 }
 
+static int load_or_create_dashboard_token(void) {
+    uv_fs_t request;
+    int file, result, close_result, attempt;
+    char encoded[ANKAH_SECRET_SIZE * 2 + 2];
+    uv_buf_t buffer;
+    if (config.dashboard_token_explicit)
+        return load_hex_file(config.dashboard_token_path, config.dashboard_token);
+    file = uv_fs_open(NULL, &request, config.dashboard_token_path,
+                      UV_FS_O_WRONLY | UV_FS_O_CREAT | UV_FS_O_EXCL, 0600, NULL);
+    uv_fs_req_cleanup(&request);
+#ifdef _WIN32
+    if (file >= 0 && (ankah_file_private_descriptor(file) != 0 ||
+        ankah_file_private_check(config.dashboard_token_path) != 0)) {
+        (void)uv_fs_close(NULL, &request, file, NULL);
+        uv_fs_req_cleanup(&request);
+        (void)uv_fs_unlink(NULL, &request, config.dashboard_token_path, NULL);
+        uv_fs_req_cleanup(&request);
+        file = -1;
+    }
+#endif
+    if (file == UV_EEXIST) {
+        for (attempt = 0; attempt < 20; ++attempt) {
+            if (load_hex_file(config.dashboard_token_path, config.dashboard_token) == 0)
+                return 0;
+            uv_sleep(10);
+        }
+        return -1;
+    }
+    if (ankah_random(config.dashboard_token, ANKAH_SECRET_SIZE) != 0) {
+        if (file >= 0) {
+            (void)uv_fs_close(NULL, &request, file, NULL);
+            uv_fs_req_cleanup(&request);
+            (void)uv_fs_unlink(NULL, &request, config.dashboard_token_path, NULL);
+            uv_fs_req_cleanup(&request);
+        }
+        return -1;
+    }
+    hex_encode(config.dashboard_token, ANKAH_SECRET_SIZE, encoded);
+    encoded[ANKAH_SECRET_SIZE * 2] = '\n';
+    encoded[ANKAH_SECRET_SIZE * 2 + 1] = 0;
+    if (file >= 0) {
+        buffer = uv_buf_init(encoded, ANKAH_SECRET_SIZE * 2 + 1);
+        result = uv_fs_write(NULL, &request, file, &buffer, 1, -1, NULL);
+        uv_fs_req_cleanup(&request);
+        if (result == ANKAH_SECRET_SIZE * 2 + 1) {
+            result = uv_fs_fsync(NULL, &request, file, NULL);
+            uv_fs_req_cleanup(&request);
+        } else result = -1;
+        close_result = uv_fs_close(NULL, &request, file, NULL);
+        uv_fs_req_cleanup(&request);
+        if (result == 0 && close_result == 0) return 0;
+        (void)uv_fs_unlink(NULL, &request, config.dashboard_token_path, NULL);
+        uv_fs_req_cleanup(&request);
+    }
+    fprintf(stderr, "Ankah dashboard token could not be saved; temporary token for this run: %s",
+            encoded);
+    return 0;
+}
+
 static int finish_asset(static_asset *asset) {
     static const char digits[] = "0123456789abcdef";
     unsigned char digest[32];
@@ -698,6 +873,75 @@ static int load_assets(void) {
 #endif
         } else if (load_asset(&config.assets[i], config.assets_dir) != 0) return -1;
     }
+    return 0;
+}
+
+static uint32_t png_word(const unsigned char *data) {
+    return ((uint32_t)data[0] << 24) | ((uint32_t)data[1] << 16) |
+           ((uint32_t)data[2] << 8) | data[3];
+}
+
+static uint32_t png_crc(const unsigned char *data, size_t size) {
+    uint32_t crc = UINT32_MAX;
+    size_t i;
+    for (i = 0; i < size; ++i) {
+        unsigned int bit;
+        crc ^= data[i];
+        for (bit = 0; bit < 8; ++bit)
+            crc = (crc >> 1) ^ ((crc & 1U) ? UINT32_C(0xedb88320) : 0);
+    }
+    return ~crc;
+}
+
+static int valid_mascot_png(const unsigned char *data, size_t size) {
+    static const unsigned char signature[8] = {137, 80, 78, 71, 13, 10, 26, 10};
+    size_t at = 8;
+    int image_data = 0;
+    if (size < 45 || size > MAX_ASSET_SIZE || memcmp(data, signature, 8) != 0)
+        return 0;
+    while (at <= size && size - at >= 12) {
+        uint32_t length = png_word(data + at);
+        const unsigned char *type = data + at + 4;
+        if ((size_t)length > size - at - 12 ||
+            png_crc(type, (size_t)length + 4) !=
+                png_word(data + at + 8 + length)) return 0;
+        if (at == 8) {
+            if (length != 13 || memcmp(type, "IHDR", 4) != 0 ||
+                png_word(data + at + 8) == 0 ||
+                png_word(data + at + 8) > 4096 ||
+                png_word(data + at + 12) == 0 ||
+                png_word(data + at + 12) > 4096) return 0;
+        } else if (memcmp(type, "IHDR", 4) == 0) return 0;
+        if (memcmp(type, "IDAT", 4) == 0) image_data = 1;
+        at += (size_t)length + 12;
+        if (memcmp(type, "IEND", 4) == 0)
+            return length == 0 && image_data && at == size;
+    }
+    return 0;
+}
+
+static int load_mascot(void) {
+    unsigned char *data = NULL;
+    size_t size = 0;
+    int result;
+    config.mascot_default = body_wrap((unsigned char *)config.assets[0].data,
+                                      config.assets[0].size, 1);
+    if (!config.mascot_default) return -1;
+    config.mascot_current = config.mascot_default;
+    ++config.mascot_current->pins;
+    result = ankah_file_read_optional(config.mascot_path, MAX_ASSET_SIZE, 1,
+                                      &data, &size);
+    if (result == 0 && valid_mascot_png(data, size)) {
+        shared_body *replacement = body_wrap(data, size, 0);
+        if (!replacement) { free(data); return -1; }
+        data = NULL;
+        body_release(config.mascot_current);
+        config.mascot_current = replacement;
+    } else if (result != 1) {
+        fprintf(stderr, "Ankah mascot override is invalid or unreadable: %s\n",
+                config.mascot_path);
+    }
+    free(data);
     return 0;
 }
 
@@ -766,6 +1010,32 @@ static int parse_address(const char *input, char *ip, size_t capacity, int *port
     value = strtol(colon + 1, &end, 10);
     if (*end || value < 1 || value > 65535) return -1;
     *port = (int)value;
+    return 0;
+}
+
+static int parse_link_peer(const char *input, ankah_link_peer *peer) {
+    const char *host = input, *end, *port_text = NULL;
+    size_t length;
+    uint64_t port = 41113;
+    if (input[0] == '[') {
+        host = input + 1;
+        end = strchr(host, ']');
+        if (!end || end[1] != ':' || !end[2]) return -1;
+        port_text = end + 2;
+    } else {
+        end = strchr(input, ':');
+        if (end) {
+            if (strchr(end + 1, ':') || !end[1]) return -1;
+            port_text = end + 1;
+        } else end = input + strlen(input);
+    }
+    length = (size_t)(end - host);
+    if (!length || length >= sizeof(peer->host) ||
+        (port_text && (decimal_u64(port_text, &port) != 0 ||
+                       port == 0 || port > 65535))) return -1;
+    memcpy(peer->host, host, length);
+    peer->host[length] = 0;
+    peer->port = (int)port;
     return 0;
 }
 
@@ -840,6 +1110,8 @@ typedef struct {
     unsigned char health[3];
     unsigned char stats_file;
     unsigned char no_stats_file;
+    unsigned char session_state_file;
+    unsigned char no_session_state_file;
     unsigned char unknown_languages;
 } option_state;
 
@@ -963,9 +1235,89 @@ static int health_name(const char *name) {
     return -1;
 }
 
+static int load_config_file(const char *path, option_state *state);
+
+static int host_option(const char *name, const char *value, const option_context *context) {
+    ankah_host *h = loading_host;
+    uint64_t n;
+    unsigned int i;
+    if (!strcmp(name, "public-origin")) {
+        if (h->origin[0]) return -1;
+        return ankah_host_origin(h, value);
+    }
+    if (!strcmp(name, "tls-cert") || !strcmp(name, "tls-key")) {
+        char *out = !strcmp(name, "tls-cert") ? h->certificate : h->key;
+        if (*out) return -1;
+        return copy_path(out, 512, value, context);
+    }
+    if (!strcmp(name, "upstream")) {
+        if (h->upstream[0]) return -1;
+        return copy_text(h->upstream, sizeof(h->upstream), value);
+    }
+    if (!strcmp(name, "route")) {
+        ankah_exact_route r;
+        char extra;
+        memset(&r, 0, sizeof(r));
+        if (h->route_count == ANKAH_MAX_ROUTES ||
+            sscanf(value, "%63s %15s %2047s %c", r.id, r.method, r.path, &extra) != 3 ||
+            strspn(r.id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != strlen(r.id) ||
+            strspn(r.method, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != strlen(r.method) ||
+            r.path[0] != '/' || strpbrk(r.path, "?#%") || strstr(r.path, "/./") ||
+            strstr(r.path, "/../")) return -1;
+        for (i = 0; i < h->route_count; ++i)
+            if (!strcmp(r.id, h->routes[i].id) ||
+                (!strcmp(r.path, h->routes[i].path) &&
+                 !strcmp(r.method, h->routes[i].method))) return -1;
+        h->routes[h->route_count++] = r;
+        return 0;
+    }
+    if (decimal_u64(value, &n) || !n || n > 1073741824) return -1;
+#define LIMIT(KEY, FIELD, MAXIMUM) if (!strcmp(name, KEY)) { \
+    if (h->FIELD || n > MAXIMUM) { return -1; } h->FIELD = n; return 0; }
+    LIMIT("body-limit", body_limit, 1073741824)
+    LIMIT("concurrency", concurrency, 256)
+    LIMIT("connect-timeout-ms", connect_ms, 300000)
+    LIMIT("upload-timeout-ms", upload_ms, 3600000)
+    LIMIT("response-timeout-ms", response_ms, 3600000)
+#undef LIMIT
+    return -1;
+}
+
 static int apply_option(const char *name, const char *value,
                         const option_context *context, option_state *state) {
     int health = health_name(name);
+    if (loading_host) return host_option(name, value, context);
+    if (!strcmp(name, "virtual-host")) {
+        char path[CONFIG_PATH_MAX];
+        option_state host_state = {0};
+        int result;
+        if (!config.host_count) config.host_count = 1;
+        if (config.host_count == ANKAH_MAX_HOSTS ||
+            copy_path(path, sizeof(path), value, context)) return -1;
+        loading_host = &config.hosts[config.host_count];
+        result = load_config_file(path, &host_state);
+        loading_host = NULL;
+        if (!result) ++config.host_count;
+        return result;
+    }
+    if (!strcmp(name, "max-connections") || !strcmp(name, "max-h2-streams") ||
+        !strcmp(name, "upload-queue-bytes") || !strcmp(name, "request-queue-bytes") ||
+        !strcmp(name, "response-queue-bytes")) {
+        uint64_t n;
+        if (decimal_u64(value, &n) || !n || n > 1073741824) return -1;
+        if (!strcmp(name, "max-connections")) {
+            if (n > MAX_CONNECTIONS) return -1;
+            config.max_connections = (unsigned int)n;
+        } else if (!strcmp(name, "max-h2-streams")) {
+            if (n > 256) return -1;
+            config.max_streams = (unsigned int)n;
+        } else if (!strcmp(name, "upload-queue-bytes")) {
+            if (n < 32768 || n > 512 * 1024) return -1;
+            config.upload_queue = (size_t)n;
+        } else if (!strcmp(name, "request-queue-bytes")) config.request_queue = (size_t)n;
+        else config.response_queue = (size_t)n;
+        return 0;
+    }
     if (health >= 0) {
         size_t size = strlen(value);
         if (state->health[health] == context->source || !size || value[0] != '/' ||
@@ -978,8 +1330,32 @@ static int apply_option(const char *name, const char *value,
         if (parse_address(value, config.listen_ip, sizeof(config.listen_ip),
                           &config.listen_port) != 0) return -1;
     } else if (strcmp(name, "upstream") == 0) {
-        if (parse_address(value, config.upstream_ip, sizeof(config.upstream_ip),
-                          &config.upstream_port) != 0) return -1;
+        if (prefix(value, "unix:")) {
+#ifdef _WIN32
+            return -1;
+#else
+            if (value[5] != '/' || !value[6] ||
+                copy_text(config.upstream_unix, sizeof(config.upstream_unix), value + 5)) return -1;
+#endif
+        } else {
+            config.upstream_unix[0] = 0;
+            if (parse_address(value, config.upstream_ip, sizeof(config.upstream_ip),
+                              &config.upstream_port) != 0) return -1;
+        }
+    } else if (strcmp(name, "ankah-link") == 0) {
+        ankah_link_peer peer;
+        unsigned int i;
+        if (config.link_peer_count == ANKAH_LINK_MAX_PEERS ||
+            parse_link_peer(value, &peer) != 0) return -1;
+        for (i = 0; i < config.link_peer_count; ++i)
+            if (config.link_peers[i].port == peer.port &&
+                same_ascii(config.link_peers[i].host, peer.host)) return -1;
+        config.link_peers[config.link_peer_count++] = peer;
+    } else if (strcmp(name, "ankah-link-listen") == 0) {
+        if (parse_address(value, config.link_listen_ip,
+                          sizeof(config.link_listen_ip),
+                          &config.link_listen_port) != 0) return -1;
+        config.link_listen_explicit = 1;
     } else if (strcmp(name, "public-origin") == 0) {
         if (copy_text(config.public_origin, sizeof(config.public_origin), value) != 0) return -1;
     } else if (strcmp(name, "secret-file") == 0) {
@@ -988,6 +1364,10 @@ static int apply_option(const char *name, const char *value,
     } else if (strcmp(name, "assets-dir") == 0) {
         if (copy_path(config.assets_dir, sizeof(config.assets_dir), value, context) != 0)
             return -1;
+    } else if (strcmp(name, "mascot-file") == 0) {
+        if (!value[0] ||
+            copy_path(config.mascot_path, sizeof(config.mascot_path), value, context) != 0 ||
+            strlen(config.mascot_path) + 4 >= sizeof(config.mascot_path)) return -1;
     } else if (strcmp(name, "static-bundle") == 0) {
         if (copy_path(config.static_dir, sizeof(config.static_dir), value, context) != 0)
             return -1;
@@ -1060,6 +1440,9 @@ static int apply_option(const char *name, const char *value,
     } else if (strcmp(name, "dashboard-token-file") == 0) {
         if (copy_path(config.dashboard_token_path, sizeof(config.dashboard_token_path),
                       value, context) != 0) return -1;
+        config.dashboard_token_explicit = 1;
+    } else if (strcmp(name, "no-dashboard") == 0) {
+        if (boolean_value(value, &config.no_dashboard) != 0) return -1;
     } else if (strcmp(name, "stats-file") == 0) {
         char path[sizeof(config.stats_path)];
         if (state->stats_file == context->source ||
@@ -1077,6 +1460,23 @@ static int apply_option(const char *name, const char *value,
         config.stats_persistence_disabled = disabled;
         if (disabled) config.stats_path[0] = 0;
         state->no_stats_file = (unsigned char)context->source;
+    } else if (strcmp(name, "session-state-file") == 0) {
+        char path[sizeof(config.session_state_path)];
+        if (state->session_state_file == context->source ||
+            state->no_session_state_file == context->source || !value[0] ||
+            copy_path(path, sizeof(path), value, context) != 0 ||
+            strlen(path) + 16 >= sizeof(config.session_state_path)) return -1;
+        strcpy(config.session_state_path, path);
+        config.session_persistence_disabled = 0;
+        state->session_state_file = (unsigned char)context->source;
+    } else if (strcmp(name, "no-session-state-file") == 0) {
+        int disabled;
+        if (state->no_session_state_file == context->source ||
+            state->session_state_file == context->source ||
+            boolean_value(value, &disabled) != 0) return -1;
+        config.session_persistence_disabled = disabled;
+        if (disabled) config.session_state_path[0] = 0;
+        state->no_session_state_file = (unsigned char)context->source;
     } else if (strcmp(name, "log-unknown-languages") == 0) {
         if (state->unknown_languages == context->source || !value[0] ||
             copy_path(config.unknown_languages_path,
@@ -1133,6 +1533,8 @@ static int find_config_file(int argc, char **argv, char *path, size_t capacity) 
             seen = 1;
             ++i;
         } else if (strcmp(argv[i], "--no-stats-file") == 0 ||
+                   strcmp(argv[i], "--no-dashboard") == 0 ||
+                   strcmp(argv[i], "--no-session-state-file") == 0 ||
                    health_argument(argv[i], &name, &value)) {
             continue;
         } else if (i + 1 < argc) ++i;
@@ -1201,9 +1603,12 @@ static int apply_environment(option_state *state) {
     static const struct { const char *variable; const char *option; } options[] = {
         {"ANKAH_LISTEN", "listen"},
         {"ANKAH_UPSTREAM", "upstream"},
+        {"ANKAH_LINK", "ankah-link"},
+        {"ANKAH_LINK_LISTEN", "ankah-link-listen"},
         {"ANKAH_PUBLIC_ORIGIN", "public-origin"},
         {"ANKAH_SECRET_FILE", "secret-file"},
         {"ANKAH_ASSETS_DIR", "assets-dir"},
+        {"ANKAH_MASCOT_FILE", "mascot-file"},
         {"ANKAH_STATIC_BUNDLE", "static-bundle"},
         {"ANKAH_STATIC_CACHE_MB", "static-cache-mb"},
         {"ANKAH_MAX_UPLOAD_MB", "max-upload-mb"},
@@ -1223,8 +1628,11 @@ static int apply_environment(option_state *state) {
         {"ANKAH_DASHBOARD_LISTEN", "dashboard-listen"},
         {"ANKAH_DASHBOARD_PUBLIC_ROUTE", "dashboard-public-route"},
         {"ANKAH_DASHBOARD_TOKEN_FILE", "dashboard-token-file"},
+        {"ANKAH_NO_DASHBOARD", "no-dashboard"},
         {"ANKAH_STATS_FILE", "stats-file"},
         {"ANKAH_NO_STATS_FILE", "no-stats-file"},
+        {"ANKAH_SESSION_STATE_FILE", "session-state-file"},
+        {"ANKAH_NO_SESSION_STATE_FILE", "no-session-state-file"},
         {"ANKAH_LOG_UNKNOWN_LANGUAGES", "log-unknown-languages"},
         {"ANKAH_ALLOW_PREFIX", "allow-prefix"},
         {"ANKAH_DOTS_SERVER", "dots-server"},
@@ -1259,6 +1667,32 @@ static int apply_environment(option_state *state) {
 }
 
 static int finish_configuration(void) {
+    ankah_queue_limits(config.request_queue, config.response_queue);
+    if (config.host_count) {
+        unsigned int i, j;
+        if (config.http3_enabled || !config.tls_certificate[0] ||
+            ankah_host_origin(&config.hosts[0], config.public_origin)) return -1;
+        strcpy(config.hosts[0].certificate, config.tls_certificate);
+        strcpy(config.hosts[0].key, config.tls_key);
+        for (i = 1; i < config.host_count; ++i) {
+            ankah_host *h = &config.hosts[i];
+            char ip[64];
+            int port;
+            if (!h->origin[0] || !h->certificate[0] || !h->key[0] || !h->route_count ||
+                !h->body_limit || !h->concurrency || !h->connect_ms ||
+                !h->upload_ms || h->response_ms < h->upload_ms) return -1;
+            if (prefix(h->upstream, "unix:")) {
+#ifdef _WIN32
+                return -1;
+#else
+                if (h->upstream[5] != '/' || !h->upstream[6] || strlen(h->upstream + 5) >= 108)
+                    return -1;
+#endif
+            } else if (parse_address(h->upstream, ip, sizeof(ip), &port)) return -1;
+            for (j = 0; j < i; ++j)
+                if (!strcmp(h->name, config.hosts[j].name)) return -1;
+        }
+    }
     {
         unsigned int left, right;
         for (left = 0; left < 3; ++left)
@@ -1269,6 +1703,11 @@ static int finish_configuration(void) {
     }
     if (!!config.throttle_prefix_count != !!config.throttle_limit_seen ||
         (config.throttle_prefix_count && !config.static_dir[0])) return -1;
+    if (config.link_listen_explicit && !config.link_peer_count) return -1;
+    if (config.link_peer_count && !config.link_listen_explicit) {
+        strcpy(config.link_listen_ip, "0.0.0.0");
+        config.link_listen_port = 41113;
+    }
     if (config.throttle_prefix_count && !config.throttle_global_connections)
         config.throttle_global_connections = MAX_THROTTLE_CONNECTIONS;
     if (config.throttle_prefix_count && !config.throttle_client_connections)
@@ -1277,16 +1716,26 @@ static int finish_configuration(void) {
     if (!prefix(config.public_origin, "https://") &&
         !prefix(config.public_origin, "http://")) return -1;
     config.public_https = prefix(config.public_origin, "https://");
+    if (config.no_dashboard &&
+        (config.dashboard_ip[0] || config.dashboard_public_route[0] ||
+         config.dashboard_token_explicit || config.stats_path[0] ||
+         config.stats_persistence_disabled)) return -1;
+    if (!config.no_dashboard && !config.dashboard_ip[0] &&
+        !config.dashboard_public_route[0])
+        strcpy(config.dashboard_public_route, "/ankah-admin/");
+    if (!config.no_dashboard && !config.dashboard_token_path[0] &&
+        canonical_path("ankah.dashboard.token", NULL, config.dashboard_token_path,
+                       sizeof(config.dashboard_token_path)) != 0) return -1;
     if (!!config.tls_certificate[0] != !!config.tls_key[0] ||
         (config.tls_certificate[0] && !config.public_https) ||
-        !!(config.dashboard_ip[0] || config.dashboard_public_route[0]) !=
-            !!config.dashboard_token_path[0] ||
         (config.stats_path[0] && config.stats_persistence_disabled)) return -1;
-    config.dashboard = config.dashboard_ip[0] != 0 || config.dashboard_public_route[0] != 0;
-    if (!config.dashboard && (config.stats_path[0] || config.stats_persistence_disabled))
-        return -1;
+    config.dashboard = !config.no_dashboard;
     if (config.dashboard && !config.stats_path[0] && !config.stats_persistence_disabled)
         strcpy(config.stats_path, "ankah.stats");
+    if (!config.session_state_path[0] && !config.session_persistence_disabled)
+        strcpy(config.session_state_path, "ankah.sessions");
+    if (config.session_state_path[0] && config.stats_path[0] &&
+        strcmp(config.session_state_path, config.stats_path) == 0) return -1;
     {
         const char *host = strstr(config.public_origin, "://") + 3;
         if (!*host || strspn(host, "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -1322,15 +1771,27 @@ static int finish_configuration(void) {
                   memcmp(config.health_paths[i], config.dashboard_public_route,
                          bare_length) == 0))) return -1;
     }
+    {
+        char source[sizeof(config.assets_dir) + 16];
+        char source_path[sizeof(config.mascot_path)];
+        if (snprintf(source, sizeof(source), "%s/ankah.png", config.assets_dir) >=
+                (int)sizeof(source) ||
+            canonical_path(source, NULL, source_path, sizeof(source_path)) != 0 ||
+            strcmp(config.mascot_path, source_path) == 0 ||
+            strcmp(config.mascot_path, config.secret_path) == 0 ||
+            (config.dashboard_token_path[0] &&
+             strcmp(config.mascot_path, config.dashboard_token_path) == 0)) return -1;
+    }
     if (config.secret_path[0] == 0 || load_hex_file(config.secret_path, config.secret) != 0 ||
         (config.dashboard &&
-         (load_hex_file(config.dashboard_token_path, config.dashboard_token) != 0 ||
+         (load_or_create_dashboard_token() != 0 ||
           memcmp(config.dashboard_token, config.secret, ANKAH_SECRET_SIZE) == 0 ||
           load_dashboard_assets() != 0)) ||
-        load_assets() != 0 ||
+        load_assets() != 0 || load_mascot() != 0 ||
         (config.static_dir[0] &&
          ankah_static_load(&config.static_bundle, config.static_dir) != 0)) return -1;
     if (config.dashboard_public_route[0] && config.static_bundle.prefix &&
+        strcmp(config.static_bundle.prefix, "/") != 0 &&
         (prefix(config.dashboard_public_route, config.static_bundle.prefix) ||
          prefix(config.static_bundle.prefix, config.dashboard_public_route))) return -1;
     if (config.throttle_prefix_count) {
@@ -1354,6 +1815,8 @@ static int parse_options(int argc, char **argv, int *child_index) {
     strcpy(config.upstream_ip, "127.0.0.1");
     config.upstream_port = 8001;
     strcpy(config.assets_dir, ".");
+    if (canonical_path("ankah.mascot.png", NULL, config.mascot_path,
+                       sizeof(config.mascot_path)) != 0) return -1;
     config.static_cache_limit = 64U * 1024U * 1024U;
     config.max_upload = (size_t)DEFAULT_MAX_UPLOAD_MB * 1024U * 1024U;
     *child_index = argc;
@@ -1378,6 +1841,15 @@ static int parse_options(int argc, char **argv, int *child_index) {
             if (apply_option("no-stats-file", "true", &context, &state) != 0) return -1;
             continue;
         }
+        if (strcmp(argv[i], "--no-dashboard") == 0) {
+            if (apply_option("no-dashboard", "true", &context, &state) != 0) return -1;
+            continue;
+        }
+        if (strcmp(argv[i], "--no-session-state-file") == 0) {
+            if (apply_option("no-session-state-file", "true", &context, &state) != 0)
+                return -1;
+            continue;
+        }
         if (health_argument(argv[i], &name, &value)) {
             if (apply_option(name, value, &context, &state) != 0) return -1;
             continue;
@@ -1400,8 +1872,7 @@ static int parse_options(int argc, char **argv, int *child_index) {
     return finish_configuration();
 }
 
-static void on_handle_closed(uv_handle_t *handle) {
-    connection *c = (connection *)handle->data;
+static void release_connection(connection *c) {
     if (--c->handles == 0) {
         if (c->dashboard) --config.dashboard_connections;
         else {
@@ -1413,9 +1884,17 @@ static void on_handle_closed(uv_handle_t *handle) {
     }
 }
 
+static void on_handle_closed(uv_handle_t *handle) {
+    release_connection((connection *)handle->data);
+}
+
 static void close_connection(connection *c) {
     if (c->closed) return;
     c->closed = 1;
+    if (c->host) fprintf(stderr,
+        "Ankah route=%s elapsed_ms=%" PRIu64 " request_queue=%zu response_queue=%zu request_peak=%zu response_peak=%zu\n",
+        c->host->routes[c->route_id].id, uv_now(config.loop) - c->accepted_ms,
+        ankah_queue_current(0), ankah_queue_current(1), ankah_queue_peak(0), ankah_queue_peak(1));
     if (c->bing_pending) ankah_bingbot_verify_cancel(c);
     release_crawler_slot(c);
     if (!c->crawler) release_external_crawler_slot(c);
@@ -1430,8 +1909,14 @@ static void close_connection(connection *c) {
     c->body_pin = NULL;
     if (c->cache_pin) --c->cache_pin->pins;
     if (c->capture_session) ankah_session_discard(c->capture_session);
-    free(c->replay_body);
+    free(c->mascot_upload);
+    c->mascot_upload = NULL;
+    if (c->replay_raw) free(c->replay_body);
+    else ankah_post_payload_release(c->replay_payload);
     c->replay_body = NULL;
+    c->replay_payload = NULL;
+    free(c->response_head_buffer);
+    c->response_head_buffer = NULL;
     uv_read_stop((uv_stream_t *)&c->client);
     if (c->upstream_initialized) uv_read_stop((uv_stream_t *)&c->upstream);
     if (!uv_is_closing((uv_handle_t *)&c->client))
@@ -1460,8 +1945,13 @@ static void finish_upstream_response(connection *c) {
     int result;
     if (c->closed || c->response_finishing) return;
     c->response_finishing = 1;
-    c->reply_deadline_ns = 0;
-    c->request_deadline_ns = uv_hrtime() + UINT64_C(30000000000);
+    if (c->host) {
+        /* EOF does not complete writes still queued to the frontend bridge. */
+        c->request_deadline_ns = 0;
+    } else {
+        c->reply_deadline_ns = 0;
+        c->request_deadline_ns = uv_hrtime() + UINT64_C(30000000000);
+    }
     uv_read_stop((uv_stream_t *)&c->upstream);
     if (!uv_is_closing((uv_handle_t *)&c->upstream))
         uv_close((uv_handle_t *)&c->upstream, on_handle_closed);
@@ -1476,13 +1966,19 @@ static void finish_upstream_response(connection *c) {
 
 static int request_body_complete(const connection *c);
 static void abuse_event(connection *c, ankah_abuse_event event, const char *path) {
-    if (!c->trusted_direct_peer) return;
     if (ankah_abuse_record(config.abuse_policy, c->peer_ip, event, path, uv_hrtime())) {
-        c->abuse_action = 1;
+        gateway_block(c->peer_ip, 1);
+        if (c->trusted_direct_peer) c->abuse_action = 1;
     }
 }
 static void on_timeout(uv_timer_t *timer) {
     connection *c = (connection *)timer->data;
+    if (c->host && !c->status_seen && !c->upstream_final_started) {
+        int status = c->connect_deadline_ns ? 502 : 408;
+        respond(c, status, status == 502 ? "Bad Gateway" : "Request Timeout",
+                "text/plain", "Route deadline exceeded\n", NULL);
+        return;
+    }
     if (c->headers_handled && c->request.method[0] && !request_body_complete(c) &&
         !c->response_started && !c->upstream_final_started && !c->status_seen &&
         !c->pending_client && c->trusted_direct_peer) {
@@ -1504,6 +2000,8 @@ static int request_body_complete(const connection *c) {
 static void refresh_timeout(connection *c) {
     uint64_t timeout = ankah_core_timeout_ms(uv_hrtime(), c->request_deadline_ns,
                                               c->reply_deadline_ns, c->websocket);
+    if (c->host) timeout = ankah_absolute_timeout_ms(uv_hrtime(),
+        c->request_deadline_ns, c->reply_deadline_ns, c->connect_deadline_ns);
     if (!timeout) { close_connection(c); return; }
     uv_timer_start(&c->timer, on_timeout, timeout, 0);
 }
@@ -1528,6 +2026,7 @@ static void on_write(uv_write_t *request, int status) {
             if (c->throttled) refresh_timeout(c);
         } else tally(c, ANKAH_STAT_upstream_bytes_out, write->buffer.len);
     }
+    ankah_queue_release(to_client, write->buffer.len);
     free(write->buffer.base);
     free(write);
     --c->pending;
@@ -1577,8 +2076,14 @@ static int queue_bytes(connection *c, uv_stream_t *destination,
                                         &c->pending_client : &c->pending_upstream;
     int result;
     if (!write || length > 65536) { free(write); return -1; }
+    if (ankah_queue_reserve(destination == (uv_stream_t *)&c->client, length)) {
+        free(write); return -1;
+    }
     write->buffer.base = (char *)malloc(length ? length : 1);
-    if (!write->buffer.base) { free(write); return -1; }
+    if (!write->buffer.base) {
+        ankah_queue_release(destination == (uv_stream_t *)&c->client, length);
+        free(write); return -1;
+    }
     memcpy(write->buffer.base, data, length);
     write->buffer.len = (unsigned int)length;
     write->owner = c;
@@ -1590,6 +2095,7 @@ static int queue_bytes(connection *c, uv_stream_t *destination,
     buffers[0] = write->buffer;
     result = uv_write(&write->request, destination, buffers, 1, on_write);
     if (result < 0) {
+        ankah_queue_release(destination == (uv_stream_t *)&c->client, length);
         --c->pending;
         --*destination_pending;
         free(write->buffer.base);
@@ -1603,8 +2109,11 @@ static int queue_bytes(connection *c, uv_stream_t *destination,
 static void send_replay_chunk(connection *c) {
     size_t amount;
     if (c->replay_offset == c->replay_size) {
-        free(c->replay_body);
+        if (c->replay_raw) free(c->replay_body);
+        else ankah_post_payload_release(c->replay_payload);
         c->replay_body = NULL;
+        c->replay_payload = NULL;
+        c->replay_raw = 0;
         c->replaying = 0;
         return;
     }
@@ -2537,6 +3046,9 @@ static int static_request_path(const connection *c, char path[ANKAH_MAX_TARGET])
  * 404 inside its namespace. */
 static int static_route(const connection *c) {
     char path[ANKAH_MAX_TARGET];
+    if (config.dashboard &&
+        (dashboard_public_target(c->request.target) || dashboard_public_bare_path(c)))
+        return 0;
     if (!config.static_bundle.prefix || static_request_path(c, path) != 0) return 0;
     return ankah_static_find(&config.static_bundle, path) ||
            (!spa_navigation(c, path) &&
@@ -2725,7 +3237,12 @@ static int frontend_admit(const ankah_request *request, const char *host,
     if (!status && ankah_resolve_client_ip(request, direct_peer,
             config.trusted_proxies, config.trusted_proxy_count,
             resolved, sizeof(resolved)) != 0) status = 400;
-    if (!status && (!host || !same_ascii(host, config.public_host))) status = 421;
+    if (config.host_count) {
+        int index = ankah_host_find(config.hosts, config.host_count, host);
+        if (index < 0) return -index;
+        if (index > 0) { *kind = 1; *proved = 0; *crawler = 0; *bing_claim = 0; return 0; }
+    } else if (!status && (!host || !same_ascii(host, config.public_host))) status = 421;
+    if (!status && gateway_blocked(resolved)) status = 403;
     if (!status) {
         *proved = request_proved(request);
         *crawler = ankah_google_crawler_is_known(resolved);
@@ -2734,6 +3251,10 @@ static int frontend_admit(const ankah_request *request, const char *host,
         *kind = request_rate_class(request, *proved, *crawler || *bing_claim);
         if (!*bing_claim) rate_result = allow_rate((rate_class)*kind, resolved);
         if (rate_result) status = 429;
+        if (rate_result == 1 &&
+            ankah_abuse_record(config.abuse_policy, resolved,
+                               ANKAH_ABUSE_CLIENT_RATE, NULL, uv_hrtime()))
+            gateway_block(resolved, 1);
     }
     if (status) {
         ankah_stats_add(ANKAH_STAT_requests, 1);
@@ -3037,11 +3558,12 @@ static void render_gate(connection *c, ankah_session *session) {
         "<title>%s</title>"
         "<style>html,body{margin:0;min-height:100%%;font:16px system-ui;background:#101929;color:#f4f7fb}"
         "main{max-width:38rem;margin:5vh auto;padding:2rem;text-align:center;background:#18253b;border-radius:1rem}"
-        "img{height:auto}#phone{width:100px}#qr{width:220px;background:white;padding:8px}"
+        "img{height:auto}#mascot{display:block;width:min(72vw,300px);max-height:32vh;object-fit:contain;margin:0 auto 1.25rem}"
+        "#phone{width:100px}#qr{width:220px;background:white;padding:8px}"
         "#phone-help{display:flex;align-items:center;justify-content:center;gap:1rem;flex-wrap:wrap}"
         "button{padding:.7rem 1.5rem;font:inherit;cursor:pointer}"
         "</style><body data-challenge='%s' data-session='%s' data-worker='%s' data-wasm='%s'>"
-        "<main><h1>%s</h1><p>%s</p>"
+        "<main><img id=mascot src='/ankah/mascot.png' alt='%s'><h1>%s</h1><p>%s</p>"
         "<output id=progress>%s</output>"
         "<section id=phone-panel><h2>%s</h2>"
         "<div id=phone-help><img id=phone src='%s' alt='%s'>"
@@ -3052,6 +3574,7 @@ static void render_gate(connection *c, ankah_session *session) {
         ankah_language_tag(language),
         ankah_language_message(language, "Checking your browser"),
         session->challenge, session->id, worker_js, wasm_path,
+        ankah_language_message(language, "Site mascot"),
         ankah_language_message(language, "Checking your browser"),
         ankah_language_message(language, "Solving a short proof of work."),
         ankah_language_message(language, "Starting challenge..."),
@@ -3140,9 +3663,43 @@ static void handle_unlock(connection *c) {
     render_gate(c, session);
 }
 
+static void serve_mascot(connection *c, int dashboard) {
+    char head[512];
+    shared_body *body = config.mascot_current;
+    int head_only = strcmp(c->request.method, "HEAD") == 0;
+    int length = snprintf(head, sizeof(head),
+        "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %zu\r\n"
+        "Cache-Control: no-store\r\nX-Content-Type-Options: nosniff\r\n"
+        "Referrer-Policy: no-referrer\r\n%sConnection: close\r\n\r\n",
+        body->size, dashboard ?
+            (body == config.mascot_default ?
+                "X-Ankah-Mascot-Source: default\r\n" :
+                "X-Ankah-Mascot-Source: custom\r\n") : "");
+    if (length < 0 || (size_t)length >= sizeof(head)) { close_connection(c); return; }
+    tally_status(c, 200);
+    c->response_started = 1;
+    if (!head_only && body->size) {
+        ++body->pins;
+        c->body_pin = body;
+        if (static_add_segment(c, (const unsigned char *)body->data, body->size) != 0) {
+            close_connection(c);
+            return;
+        }
+        c->segmented = 1;
+    }
+    if (queue_bytes(c, (uv_stream_t *)&c->client, NULL, head, (size_t)length,
+                    !c->segmented) != 0) close_connection(c);
+}
+
 static void handle_internal(connection *c) {
     const char *target = c->request.target;
     const char *host = config.public_host;
+    if (strcmp(target, "/ankah/mascot.png") == 0 &&
+        (strcmp(c->request.method, "GET") == 0 ||
+         strcmp(c->request.method, "HEAD") == 0)) {
+        serve_mascot(c, 0);
+        return;
+    }
     if ((strcmp(target, UNLOCK_PATH) == 0 || prefix(target, UNLOCK_PATH "?")) &&
         strcmp(c->request.method, "GET") == 0) {
         handle_unlock(c);
@@ -3159,7 +3716,15 @@ static void handle_internal(connection *c) {
         }
         memcpy(key, id, 32); key[32] = 0;
         session = ankah_session_find(key, (uint64_t)time(NULL));
-        if (!session || snprintf(url, sizeof(url), "%s/ankah/solve/%s",
+        if (!session) {
+            char challenge[ANKAH_CHALLENGE_TEXT_MAX];
+            if (ankah_challenge_for_session(config.secret, config.public_host,
+                    (uint64_t)time(NULL), key, challenge) != 0) {
+                respond(c, 404, "Not Found", "text/plain", "Unknown code\n", NULL);
+                return;
+            }
+        }
+        if (snprintf(url, sizeof(url), "%s/ankah/solve/%s",
                                  config.public_origin, key) >= (int)sizeof(url) ||
             ankah_qr_png(url, &png, &size) != 0) {
             respond(c, 404, "Not Found", "text/plain", "Unknown code\n", NULL); return;
@@ -3171,10 +3736,20 @@ static void handle_internal(connection *c) {
     if (prefix(target, "/ankah/solve/") && strcmp(c->request.method, "GET") == 0) {
         ankah_session *session = ankah_session_find(target + strlen("/ankah/solve/"),
                                                     (uint64_t)time(NULL));
+        ankah_session reconstructed = {0};
         char body[8192], challenge_text[4096];
         char script[160], worker_js[160] = "", wasm_path[160] = "";
         ankah_language language = ankah_language_select(&c->request);
         int n;
+        if (!session) {
+            const char *id = target + strlen("/ankah/solve/");
+            if (strlen(id) == 32 && ankah_challenge_for_session(config.secret,
+                    config.public_host, (uint64_t)time(NULL), id,
+                    reconstructed.challenge) == 0) {
+                strcpy(reconstructed.id, id);
+                session = &reconstructed;
+            }
+        }
         if (!session || asset_path(3, script, sizeof(script)) != 0) {
             respond(c, 404, "Not Found", "text/plain", "Challenge expired\n", NULL); return;
         }
@@ -3235,26 +3810,47 @@ static void handle_internal(connection *c) {
         }
         memcpy(key, target + strlen("/ankah/answer/"), 32); key[32] = 0;
         session = ankah_session_find(key, (uint64_t)time(NULL));
+        if (!session) {
+            char reconstructed[ANKAH_CHALLENGE_TEXT_MAX];
+            if (ankah_challenge_for_session(config.secret, host,
+                    (uint64_t)time(NULL), key, reconstructed) == 0 &&
+                decimal_u64(answer + 8, &counter) == 0 &&
+                ankah_check_answer(config.secret, host, (uint64_t)time(NULL),
+                                   reconstructed, counter) == 0)
+                session = ankah_session_accept_solved(key, (uint64_t)time(NULL),
+                                                       NULL, 0);
+        }
         if (decimal_u64(answer + 8, &counter) != 0 || !session ||
+            (!session->challenge[0] &&
+             !ankah_session_solved(session, (uint64_t)time(NULL))) ||
+            (session->challenge[0] &&
             ankah_check_answer(config.secret, host, (uint64_t)time(NULL),
-                               session->challenge, counter) != 0 ||
-            ankah_session_solve(session, (uint64_t)time(NULL)) != 0) {
+                               session->challenge, counter) != 0) ||
+            (!ankah_session_solved(session, (uint64_t)time(NULL)) &&
+             ankah_session_solve(session, (uint64_t)time(NULL)) != 0)) {
             tally(c, ANKAH_STAT_challenges_failed, 1);
             abuse_event(c, ANKAH_ABUSE_INVALID_PROOF, NULL);
             respond(c, 403, "Forbidden", "text/plain", "Invalid answer\n", NULL); return;
         }
         tally(c, ANKAH_STAT_challenges_solved, 1);
+        broadcast_solved(session);
         respond(c, 200, "OK", "text/plain", "Challenge passed. Click Finished on the original page.\n", NULL);
         return;
     }
     if (prefix(target, "/ankah/finish/") && strcmp(c->request.method, "GET") == 0) {
         ankah_session *session = ankah_session_find(target + strlen("/ankah/finish/"),
                                                     (uint64_t)time(NULL));
-        char extra[sizeof(config.public_origin) + ANKAH_MAX_TARGET + 64];
+        char extra[sizeof(config.public_origin) + ANKAH_MAX_TARGET + 320];
+        char pass[ANKAH_PASS_TEXT_MAX];
         int n;
         if (!session || session != request_session(&c->request) || session->is_post ||
             !ankah_session_solved(session, (uint64_t)time(NULL))) {
             respond(c, 403, "Forbidden", "text/plain", "Challenge not passed\n", NULL); return;
+        }
+        if (!session->target[0]) {
+            respond(c, 503, "Service Unavailable", "text/plain",
+                    "Challenge state is syncing\n", "Retry-After: 1\r\n");
+            return;
         }
         if (session->target[1] == '/' || session->target[1] == '\\')
             n = snprintf(extra, sizeof(extra), "Location: %s%s\r\n",
@@ -3262,6 +3858,16 @@ static void handle_internal(connection *c) {
         else
             n = snprintf(extra, sizeof(extra), "Location: %s\r\n", session->target);
         if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
+        if (ankah_issue_pass(config.secret, config.public_host,
+                             (uint64_t)time(NULL) + 43200, pass) != 0) {
+            close_connection(c); return;
+        }
+        n += snprintf(extra + n, sizeof(extra) - (size_t)n,
+                      "Set-Cookie: ankah_pass=%s; Max-Age=43200; Path=/; "
+                      "HttpOnly; SameSite=Lax%s\r\n", pass,
+                      config.public_https ? "; Secure" : "");
+        if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
+        tally(c, ANKAH_STAT_passes_issued, 1);
         respond(c, 303, "See Other", "text/plain", "Continuing\n", extra);
         return;
     }
@@ -3464,14 +4070,19 @@ static int build_upstream_request(const connection *c, char *out, size_t capacit
                       "Connection: %s\r\nX-Forwarded-For: %s\r\n"
                       "X-Forwarded-Proto: %s\r\nX-Forwarded-Host: %s\r\n\r\n",
                       c->websocket ? "Upgrade" : "close", c->peer_ip,
-                      config.public_https ? "https" : "http", config.public_host);
+                      config.public_https ? "https" : "http", c->host ? c->host->authority : config.public_host);
     if (length < 0 || (size_t)length >= capacity - used) return -1;
     return (int)(used + (size_t)length);
 }
 
 static void upstream_final_start(connection *c) {
     c->upstream_final_started = 1;
-    c->reply_deadline_ns = 0;
+    if (!c->host) c->reply_deadline_ns = 0;
+    else {
+        c->forwarding = 0;
+        c->request_deadline_ns = 0;
+        uv_read_stop((uv_stream_t *)&c->client);
+    }
 }
 
 static int upstream_status_complete(llhttp_t *parser) {
@@ -3492,6 +4103,11 @@ static void on_connected(uv_connect_t *request, int status) {
         }
         return;
     }
+    c->connect_deadline_ns = 0;
+    if (c->host) {
+        c->reply_deadline_ns = uv_hrtime() + c->host->response_ms * UINT64_C(1000000);
+        ankah_frontend_response_deadline(c->bridge_port, c->reply_deadline_ns);
+    }
     head_size = build_upstream_request(c, head, sizeof(head));
     end = c->replaying ? 0 : header_end(c->initial, c->initial_size);
     if (head_size < 0 || (!c->replaying && end == 0) ||
@@ -3503,6 +4119,7 @@ static void on_connected(uv_connect_t *request, int status) {
         return;
     }
     c->forwarding = 1;
+    refresh_timeout(c);
     llhttp_settings_init(&c->upstream_response_settings);
     c->upstream_response_settings.on_status_complete = upstream_status_complete;
     llhttp_init(&c->upstream_response_parser, HTTP_RESPONSE,
@@ -3517,14 +4134,34 @@ static void on_connected(uv_connect_t *request, int status) {
 
 static int connect_upstream(connection *c) {
     struct sockaddr_storage address;
+    char ip[64];
+    int port = config.upstream_port;
+    const char *unix_path = config.upstream_unix;
     int result;
-    if (socket_address(config.upstream_ip, config.upstream_port, &address) != 0) return -1;
-    if (uv_tcp_init(config.loop, &c->upstream) != 0) return -1;
+    strcpy(ip, config.upstream_ip);
+    if (c->host) {
+        if (prefix(c->host->upstream, "unix:")) unix_path = c->host->upstream + 5;
+        else {
+            unix_path = "";
+            if (parse_address(c->host->upstream, ip, sizeof(ip), &port)) return -1;
+        }
+        c->connect_deadline_ns = uv_hrtime() + c->host->connect_ms * UINT64_C(1000000);
+        refresh_timeout(c);
+    }
+    if (*unix_path) {
+        if (uv_pipe_init(config.loop, &c->upstream.pipe, 0)) return -1;
+    } else {
+        if (socket_address(ip, port, &address) != 0 ||
+            uv_tcp_init(config.loop, &c->upstream.tcp) != 0) return -1;
+    }
     c->upstream_initialized = 1;
-    c->upstream.data = c;
+    c->upstream.tcp.data = c;
     ++c->handles;
     c->connect_request.data = c;
-    result = uv_tcp_connect(&c->connect_request, &c->upstream,
+    if (*unix_path) {
+        uv_pipe_connect(&c->connect_request, &c->upstream.pipe, unix_path, on_connected);
+        result = 0;
+    } else result = uv_tcp_connect(&c->connect_request, &c->upstream.tcp,
                             (const struct sockaddr *)&address, on_connected);
     return result;
 }
@@ -3538,11 +4175,92 @@ static int start_upstream(connection *c) {
     return result;
 }
 
+static void wire_put64(unsigned char out[8], uint64_t value) {
+    unsigned int i;
+    for (i = 0; i < 8; ++i) out[i] = (unsigned char)(value >> (56 - i * 8));
+}
+
+static uint64_t wire_get64(const unsigned char in[8]) {
+    uint64_t value = 0;
+    unsigned int i;
+    for (i = 0; i < 8; ++i) value = (value << 8) | in[i];
+    return value;
+}
+
+static void wire_put32(unsigned char out[4], uint32_t value) {
+    out[0] = (unsigned char)(value >> 24);
+    out[1] = (unsigned char)(value >> 16);
+    out[2] = (unsigned char)(value >> 8);
+    out[3] = (unsigned char)value;
+}
+
+static uint32_t wire_get32(const unsigned char in[4]) {
+    return (uint32_t)in[0] << 24 | (uint32_t)in[1] << 16 |
+           (uint32_t)in[2] << 8 | in[3];
+}
+
+static remote_pending *remove_remote_pending(uint64_t request_id) {
+    remote_pending **at = &config.remote_first;
+    while (*at) {
+        remote_pending *pending = *at;
+        if (pending->request_id == request_id) {
+            *at = pending->next;
+            pending->next = NULL;
+            return pending;
+        }
+        at = &pending->next;
+    }
+    return NULL;
+}
+
+static void start_remote_continue(connection *c, const char id[33],
+                                  const char token[33]) {
+    unsigned char message[8 + 32 + 32 + 2 + ANKAH_MAX_TARGET];
+    size_t length = strlen(c->request.target);
+    remote_pending *pending;
+    int sent;
+    if (!config.link_started || length == 0 || length >= ANKAH_MAX_TARGET) {
+        respond(c, 503, "Service Unavailable", "text/plain",
+                "Continuation owner unavailable\n", "Retry-After: 1\r\n");
+        return;
+    }
+    pending = calloc(1, sizeof(*pending));
+    if (!pending) {
+        respond(c, 503, "Service Unavailable", "text/plain",
+                "Continuation owner unavailable\n", "Retry-After: 1\r\n");
+        return;
+    }
+    pending->client = c;
+    pending->request_id = ++config.next_link_request_id;
+    pending->deadline_ns = uv_hrtime() + UINT64_C(10000000000);
+    pending->next = config.remote_first;
+    config.remote_first = pending;
+    c->link_request_id = pending->request_id;
+    c->continuation_waiting = 1;
+    ++c->handles;
+    wire_put64(message, pending->request_id);
+    memcpy(message + 8, id, 32);
+    memcpy(message + 40, token, 32);
+    message[72] = (unsigned char)(length >> 8);
+    message[73] = (unsigned char)length;
+    memcpy(message + 74, c->request.target, length);
+    uv_read_stop((uv_stream_t *)&c->client);
+    sent = ankah_link_broadcast(ANKAH_LINK_CONSUME_REQUEST,
+                                message, length + 74);
+    if (!sent) {
+        remote_pending *removed = remove_remote_pending(pending->request_id);
+        free(removed);
+        c->continuation_waiting = 0;
+        release_connection(c);
+        respond(c, 503, "Service Unavailable", "text/plain",
+                "Continuation owner unavailable\n", "Retry-After: 1\r\n");
+    }
+}
+
 static void finish_continue(connection *c) {
     ankah_session *session = request_session(&c->request);
-    ankah_request *saved;
-    unsigned char *body;
-    size_t size;
+    consume_job *job;
+    char id[33];
     char token[33];
     if (c->continue_received != c->continue_expected ||
         c->continue_expected != 47 ||
@@ -3552,23 +4270,138 @@ static void finish_continue(connection *c) {
     }
     memcpy(token, c->continue_body + 15, 32);
     token[32] = 0;
-    if (!session || strcmp(c->request.target, session->target) != 0 ||
-        ankah_session_take_post(session, token, (uint64_t)time(NULL),
-                                &saved, &body, &size) != 0) {
+    if (request_session_id(&c->request, id) != 0) {
         respond(c, 403, "Forbidden", "text/plain", "Continuation expired\n", NULL);
+        return;
+    }
+    if (!session || !session->saved_request) {
+        if (session && session->peer_ip[0]) {
+            respond(c, 403, "Forbidden", "text/plain", "Continuation expired\n", NULL);
+            return;
+        }
+        start_remote_continue(c, id, token);
+        return;
+    }
+    if (strcmp(c->request.target, session->target) != 0 ||
+        ankah_session_reserve_post(session, token, (uint64_t)time(NULL)) != 0) {
+        respond(c, 403, "Forbidden", "text/plain", "Continuation expired\n", NULL);
+        return;
+    }
+    strcpy(c->continue_session_id, session->id);
+    strcpy(c->continue_token, token);
+    if (!config.session_state_path[0]) {
+        finish_continue_after_ack(c, 0);
+        return;
+    }
+    c->continuation_waiting = 1;
+    job = calloc(1, sizeof(*job));
+    if (!job) {
+        c->continuation_waiting = 0;
+        ankah_session_unreserve_post(session);
+        respond(c, 503, "Service Unavailable", "text/plain",
+                "Continuation temporarily unavailable\n", "Retry-After: 1\r\n");
+        return;
+    }
+    job->client = c;
+    ++c->handles;
+    uv_read_stop((uv_stream_t *)&c->client);
+    if (ankah_disk_consume(config.session_state_path,
+                           c->continue_session_id, job) != 0) {
+        c->continuation_waiting = 0;
+        ankah_session_unreserve_post(session);
+        free(job);
+        release_connection(c);
+        respond(c, 503, "Service Unavailable", "text/plain",
+                "Continuation temporarily unavailable\n", "Retry-After: 1\r\n");
+    }
+}
+
+static void finish_continue_after_ack(connection *c, int result) {
+    ankah_session *session = ankah_session_find(c->continue_session_id,
+                                                (uint64_t)time(NULL));
+    ankah_request *saved = NULL;
+    unsigned char *body = NULL;
+    ankah_post_payload *payload = NULL;
+    size_t size = 0;
+    c->continuation_waiting = 0;
+    if (result != 0) {
+        ankah_session_unreserve_post(session);
+        if (!c->closed)
+            respond(c, 503, "Service Unavailable", "text/plain",
+                    "Continuation temporarily unavailable\n", "Retry-After: 1\r\n");
+        return;
+    }
+    if (!session || strcmp(c->request.target, session->target) != 0 ||
+        ankah_session_take_post(session, c->continue_token, (uint64_t)time(NULL),
+                                &saved, &body, &size, &payload) != 0) {
+        ankah_session_cancel_post(session);
+        if (!c->closed)
+            respond(c, 403, "Forbidden", "text/plain", "Continuation expired\n", NULL);
+        return;
+    }
+    if (c->closed) {
+        ankah_post_payload_release(payload);
         return;
     }
     tally(c, ANKAH_STAT_posts_replayed, 1);
     c->request = *saved;
-    free(saved);
     strcpy(c->peer_ip, session->peer_ip);
     c->replay_body = body;
+    c->replay_payload = payload;
     c->replay_size = size;
     c->replaying = 1;
+    c->pass_after_replay = 1;
     c->continue_expected = 0;
     uv_read_stop((uv_stream_t *)&c->client);
     if (start_upstream(c) != 0)
         respond(c, 502, "Bad Gateway", "text/plain", "Upstream unavailable\n", NULL);
+}
+
+static void peer_consume_failure(ankah_link_connection *link_connection,
+                                 uint64_t request_id, unsigned char reason) {
+    unsigned char message[9];
+    wire_put64(message, request_id);
+    message[8] = reason;
+    (void)ankah_link_send(link_connection, ANKAH_LINK_CONSUME_FAIL,
+                          message, sizeof(message));
+}
+
+static void finish_peer_consume(consume_job *job, int result) {
+    ankah_session *session = ankah_session_find(job->id, (uint64_t)time(NULL));
+    ankah_request *saved = NULL;
+    unsigned char *body = NULL, *message = NULL;
+    ankah_post_payload *payload = NULL;
+    size_t body_size = 0, ip_size, message_size, at;
+    if (result != 0) {
+        ankah_session_unreserve_post(session);
+        peer_consume_failure(job->link, job->request_id, 1);
+        goto done;
+    }
+    if (!session || ankah_session_take_post(session, job->token,
+            (uint64_t)time(NULL), &saved, &body, &body_size, &payload) != 0) {
+        ankah_session_cancel_post(session);
+        peer_consume_failure(job->link, job->request_id, 2);
+        goto done;
+    }
+    ip_size = strlen(session->peer_ip);
+    message_size = 8 + 1 + ip_size + 4 + sizeof(*saved) + 4 + body_size;
+    if (ip_size >= 64 || message_size > ANKAH_LINK_MESSAGE_MAX) goto done;
+    message = malloc(message_size);
+    if (!message) goto done;
+    wire_put64(message, job->request_id);
+    message[8] = (unsigned char)ip_size;
+    at = 9;
+    memcpy(message + at, session->peer_ip, ip_size); at += ip_size;
+    wire_put32(message + at, (uint32_t)sizeof(*saved)); at += 4;
+    memcpy(message + at, saved, sizeof(*saved)); at += sizeof(*saved);
+    wire_put32(message + at, (uint32_t)body_size); at += 4;
+    memcpy(message + at, body, body_size);
+    (void)ankah_link_send(job->link, ANKAH_LINK_CONSUME_OK,
+                          message, message_size);
+done:
+    free(message);
+    ankah_post_payload_release(payload);
+    ankah_link_release(job->link);
 }
 
 static void stats_sample(uint64_t wall, ankah_session_totals *sessions) {
@@ -4247,22 +5080,61 @@ static void serve_dashboard_asset(connection *c, const static_asset *asset) {
                     !c->segmented) != 0) close_connection(c);
 }
 
+static void finish_mascot_upload(connection *c) {
+    shared_body *replacement;
+    char temporary[sizeof(config.mascot_path)];
+    if (!valid_mascot_png(c->mascot_upload, c->mascot_received)) {
+        respond(c, 400, "Bad Request", "text/plain", "Invalid PNG image\n", NULL);
+        return;
+    }
+    replacement = malloc(sizeof(*replacement));
+    if (!replacement) {
+        respond(c, 503, "Unavailable", "text/plain", "Could not save mascot\n", NULL);
+        return;
+    }
+    replacement->data = (char *)c->mascot_upload;
+    replacement->size = c->mascot_received;
+    replacement->pins = 1;
+    replacement->borrowed = 0;
+    c->mascot_upload = NULL;
+    if (snprintf(temporary, sizeof(temporary), "%s.tmp", config.mascot_path) >=
+            (int)sizeof(temporary) ||
+        ankah_file_replace(temporary, config.mascot_path,
+                           (const unsigned char *)replacement->data,
+                           replacement->size) != 0) {
+        body_release(replacement);
+        respond(c, 503, "Unavailable", "text/plain", "Could not save mascot\n", NULL);
+        return;
+    }
+    body_release(config.mascot_current);
+    config.mascot_current = replacement;
+    respond(c, 204, "No Content", "text/plain", "", NULL);
+}
+
 static void handle_dashboard(connection *c, size_t end, const char *target) {
     enum { UNKNOWN, SCHEMA, LIVE, HISTORY, EXPORT, RESET, METRICS, AUTH_QR,
-           AUTH_LOGIN, AUTH_LOGOUT } route = UNKNOWN;
+           AUTH_LOGIN, AUTH_LOGOUT, MASCOT, DISABLE } route = UNKNOWN;
     const char *query = strchr(target, '?');
     size_t length = query ? (size_t)(query - target) : strlen(target);
     shared_body *body = NULL;
     uv_read_stop((uv_stream_t *)&c->client);
-    if (c->request.chunked || c->request.content_length || c->initial_size != end ||
-        ankah_header_value(&c->request, "Expect") || c->request.websocket) {
-        respond(c, 400, "Bad Request", "text/plain", "Dashboard requests carry no body\n", NULL);
+    if (!config.dashboard) {
+        respond(c, 410, "Gone", "text/plain", "Dashboard disabled until restart\n", NULL);
         return;
     }
     if (same_path(target, length, "/metrics")) route = METRICS;
     else if (same_path(target, length, "/auth/qr")) route = AUTH_QR;
     else if (same_path(target, length, "/auth/login")) route = AUTH_LOGIN;
     else if (same_path(target, length, "/auth/logout")) route = AUTH_LOGOUT;
+    else if (same_path(target, length, "/settings/mascot")) route = MASCOT;
+    else if (same_path(target, length, "/settings/disable")) route = DISABLE;
+    if (c->request.chunked || ankah_header_value(&c->request, "Expect") ||
+        c->request.websocket ||
+        ((route != MASCOT || strcmp(c->request.method, "PUT") != 0) &&
+         (c->request.content_length || c->initial_size != end))) {
+        respond(c, 400, "Bad Request", "text/plain", "Dashboard requests carry no body\n", NULL);
+        return;
+    }
     if (strncmp(target, "/stats/", 7) != 0 && route == UNKNOWN) {
         ankah_language language = ankah_language_select(&c->request);
         const static_asset *asset = dashboard_page_asset(target, language);
@@ -4278,6 +5150,64 @@ static void handle_dashboard(connection *c, size_t end, const char *target) {
     if (route != AUTH_LOGIN && !dashboard_token_matches(&c->request, route != AUTH_QR)) {
         respond(c, 401, "Unauthorized", "text/plain", "Dashboard token required\n",
                 "WWW-Authenticate: Bearer realm=\"ankah\"\r\n");
+        return;
+    }
+    if (route == DISABLE) {
+        if (strcmp(c->request.method, "POST") != 0) {
+            respond(c, 405, "Method Not Allowed", "text/plain", "Use POST\n",
+                    "Allow: POST\r\n");
+            return;
+        }
+        respond(c, 204, "No Content", "text/plain", "", NULL);
+        disable_dashboard();
+        return;
+    }
+    if (route == MASCOT) {
+        const char *type = ankah_header_value(&c->request, "Content-Type");
+        if (strcmp(c->request.method, "GET") == 0) {
+            serve_mascot(c, 1);
+        } else if (strcmp(c->request.method, "DELETE") == 0) {
+            if (remove(config.mascot_path) != 0 && errno != ENOENT) {
+                respond(c, 503, "Unavailable", "text/plain", "Could not restore mascot\n", NULL);
+                return;
+            }
+            body_release(config.mascot_current);
+            config.mascot_current = config.mascot_default;
+            ++config.mascot_current->pins;
+            respond(c, 204, "No Content", "text/plain", "", NULL);
+        } else if (strcmp(c->request.method, "PUT") == 0) {
+            size_t received = c->initial_size - end;
+            if (!type || strcmp(type, "image/png") != 0 ||
+                !c->request.content_length ||
+                c->request.content_length > MAX_ASSET_SIZE ||
+                received > c->request.content_length) {
+                respond(c, c->request.content_length > MAX_ASSET_SIZE ? 413 : 400,
+                    c->request.content_length > MAX_ASSET_SIZE ?
+                        "Content Too Large" : "Bad Request", "text/plain",
+                    "Invalid mascot upload\n", NULL);
+                return;
+            }
+            c->mascot_upload = malloc(c->request.content_length);
+            if (!c->mascot_upload) {
+                respond(c, 503, "Unavailable", "text/plain", "Could not save mascot\n", NULL);
+                return;
+            }
+            memcpy(c->mascot_upload, c->initial + end, received);
+            c->mascot_received = received;
+            c->body_received = received;
+            if (received == c->request.content_length) {
+                finish_mascot_upload(c);
+            } else {
+                c->body_started_ns = uv_hrtime();
+                c->request_deadline_ns = c->body_started_ns + UPLOAD_GRACE_NS;
+                refresh_timeout(c);
+                if (!c->closed && uv_read_start((uv_stream_t *)&c->client,
+                        allocate_read, on_client_read) != 0) close_connection(c);
+            }
+        } else {
+            respond(c, 405, "Method Not Allowed", "text/plain", "Use GET\n",
+                    "Allow: GET, PUT, DELETE\r\n");
+        }
         return;
     }
     if (route == AUTH_QR) {
@@ -4393,7 +5323,7 @@ static void handle_dashboard(connection *c, size_t end, const char *target) {
         config.live_body = NULL;
         stats_sample(wall, &sessions);
         saved = save_stats();
-        persistence = saved > 0 ? "saved" : saved == 0 ? "disabled" : "failed";
+        persistence = saved > 0 ? "queued" : saved == 0 ? "disabled" : "failed";
         snprintf(reply, sizeof(reply),
                  "{\"epoch\":%" PRIu64 ",\"persistence\":\"%s\"}\n",
                  wall, persistence);
@@ -4451,7 +5381,7 @@ static void handle_dashboard(connection *c, size_t end, const char *target) {
 typedef enum {
     ROUTE_HEALTH, ROUTE_CONTINUATION, ROUTE_INTERNAL, ROUTE_STATIC,
     ROUTE_DASHBOARD_API, ROUTE_CHALLENGE, ROUTE_DASHBOARD_REDIRECT,
-    ROUTE_DASHBOARD_ASSET, ROUTE_SPA, ROUTE_UPSTREAM
+    ROUTE_DASHBOARD_ASSET, ROUTE_DASHBOARD_GONE, ROUTE_SPA, ROUTE_UPSTREAM
 } request_route;
 
 static const char *dashboard_public_target(const char *target) {
@@ -4468,7 +5398,9 @@ static int dashboard_public_api(const connection *c) {
     if (!target) return 0;
     length = strcspn(target, "?");
     return strncmp(target, "/stats/", 7) == 0 ||
-           strncmp(target, "/auth/", 6) == 0 || same_path(target, length, "/metrics");
+           strncmp(target, "/auth/", 6) == 0 ||
+           strncmp(target, "/settings/", 10) == 0 ||
+           same_path(target, length, "/metrics");
 }
 
 static int dashboard_public_bare_path(const connection *c) {
@@ -4492,19 +5424,25 @@ static void serve_dashboard_public_redirect(connection *c) {
 static int continuation_route(const connection *c) {
     ankah_session *session;
     const char *type = ankah_header_value(&c->request, "Content-Type");
+    char id[33];
     if (strcmp(c->request.method, "POST") != 0) return 0;
+    if (!type || !prefix(type, "application/x-www-form-urlencoded") ||
+        c->request.content_length != 47) return 0;
     session = request_session(&c->request);
-    return session && session->is_post &&
-           strcmp(c->request.target, session->target) == 0 &&
-           ankah_session_solved(session, (uint64_t)time(NULL)) &&
-           type && prefix(type, "application/x-www-form-urlencoded") &&
-           c->request.content_length == 47;
+    if (session && session->is_post &&
+        strcmp(c->request.target, session->target) == 0 &&
+        ankah_session_solved(session, (uint64_t)time(NULL))) return 1;
+    return config.link_started && request_session_id(&c->request, id) == 0;
 }
 
 /* Decides where a request goes before its body is read, so the body limit
  * can depend on whether the body is forwarded. handle_initial dispatches on
  * the result, in this order. */
 static request_route route_request(const connection *c) {
+    if (!config.dashboard && config.dashboard_public_route[0] &&
+        (dashboard_public_bare_path(c) ||
+         dashboard_public_target(c->request.target)))
+        return ROUTE_DASHBOARD_GONE;
     if (health_route(c)) return ROUTE_HEALTH;
     if (continuation_route(c)) return ROUTE_CONTINUATION;
     if (dashboard_public_api(c)) return ROUTE_DASHBOARD_API;
@@ -4558,6 +5496,64 @@ static void handle_initial(connection *c) {
         respond(c, 400, "Bad Request", "text/plain", "Invalid HTTP request\n", NULL);
         return;
     }
+    if (config.host_count && !c->dashboard) {
+        const char *authority = ankah_header_value(&c->request, "Host");
+        int host_index = ankah_host_find(config.hosts, config.host_count, authority);
+        int status;
+        unsigned int route_id = 0, i, identities = 0;
+        const char *identity = NULL;
+        if (host_index < 0) {
+            respond(c, -host_index, host_index == -400 ? "Bad Request" : "Misdirected Request",
+                    "text/plain", "Invalid authority\n", NULL);
+            return;
+        }
+        status = ankah_host_request(&config.hosts[host_index], &c->request,
+                                    authority, 0, &route_id);
+        for (i = 0; i < c->request.count; ++i)
+            if (same_ascii(c->request.headers[i].name, "X-Ankah-Internal-Host")) {
+                identity = c->request.headers[i].value;
+                ++identities;
+            }
+        if (!status && (!c->internal || prepare_client_ip(c) || identities != 1 ||
+                         strcmp(identity, config.hosts[host_index].name))) status = 421;
+        if (status) {
+            respond(c, status, status == 405 ? "Method Not Allowed" :
+                    status == 404 ? "Not Found" : status == 413 ? "Content Too Large" :
+                    status == 421 ? "Misdirected Request" : "Bad Request",
+                    "text/plain", "Request rejected\n", NULL);
+            return;
+        }
+        if (host_index > 0) {
+            c->host = &config.hosts[host_index];
+            c->route_id = route_id;
+            registry_unlink(c);
+            if (!admit_request(c)) return;
+            if (c->admission_state == 0) { --config.pending_connections; c->admission_state = 2; }
+            if (c->request.chunked) {
+                ankah_chunked_body_init(&c->chunked_body);
+                if (ankah_chunked_body_consume(&c->chunked_body, c->initial + end,
+                        c->initial_size - end, c->host->body_limit, &decoded) < 0 || c->chunked_body.trailer_size) {
+                    respond(c, c->chunked_body.limit_exceeded ? 413 : 400,
+                            "Request Rejected", "text/plain", "Invalid body\n", NULL);
+                    return;
+                }
+                c->body_received = decoded;
+            } else {
+                c->body_received = c->initial_size - end;
+                if (c->body_received > c->request.content_length) {
+                    respond(c, 400, "Bad Request", "text/plain", "Invalid body\n", NULL);
+                    return;
+                }
+            }
+            c->body_started_ns = uv_hrtime();
+            c->request_deadline_ns = request_body_complete(c) ? 0 :
+                c->body_started_ns + c->host->upload_ms * UINT64_C(1000000);
+            uv_read_stop((uv_stream_t *)&c->client);
+            if (start_upstream(c))
+                respond(c, 502, "Bad Gateway", "text/plain", "Upstream unavailable\n", NULL);
+            return;
+        }
+    }
     if (dashboard_public_api(c)) {
         c->dashboard_api = 1;
         registry_unlink(c);
@@ -4583,11 +5579,17 @@ static void handle_initial(connection *c) {
         respond(c, 400, "Bad Request", "text/plain", "Invalid forwarding information\n", NULL);
         return;
     }
+    if (gateway_blocked(c->peer_ip)) {
+        c->abuse_action = c->trusted_direct_peer;
+        respond(c, 403, "Forbidden", "text/plain",
+                "Client temporarily blocked\n", "Retry-After: 600\r\n");
+        return;
+    }
     if (c->internal && !language_already_logged(c))
         ankah_language_log_request(&c->request);
     {
         const char *request_host = ankah_header_value(&c->request, "Host");
-        if (!request_host || !same_ascii(request_host, config.public_host)) {
+        if (!config.host_count && (!request_host || !same_ascii(request_host, config.public_host))) {
             respond(c, 421, "Misdirected Request", "text/plain",
                     "Unexpected Host\n", NULL);
             return;
@@ -4732,6 +5734,9 @@ static void handle_initial(connection *c) {
     case ROUTE_DASHBOARD_ASSET:
         handle_dashboard(c, end, dashboard_public_target(c->request.target));
         break;
+    case ROUTE_DASHBOARD_GONE:
+        respond(c, 410, "Gone", "text/plain", "Dashboard disabled until restart\n", NULL);
+        break;
     case ROUTE_SPA:
         serve_spa_fallback(c);
         break;
@@ -4752,6 +5757,21 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
         if (c->closed) { free(buffer->base); return; }
         if (c->response_finishing) {
             /* The upstream has finished, so no more request data is forwarded. */
+        } else if (c->mascot_upload) {
+            if ((size_t)count > c->request.content_length - c->mascot_received) {
+                respond(c, 400, "Bad Request", "text/plain", "Invalid mascot upload\n", NULL);
+            } else {
+                memcpy(c->mascot_upload + c->mascot_received, buffer->base,
+                       (size_t)count);
+                c->mascot_received += (size_t)count;
+                c->body_received = c->mascot_received;
+                if (c->mascot_received == c->request.content_length) {
+                    c->request_deadline_ns = 0;
+                    refresh_timeout(c);
+                    uv_read_stop(stream);
+                    finish_mascot_upload(c);
+                }
+            }
         } else if (c->capture_session) {
             int complete = ankah_session_append(c->capture_session, buffer->base, (size_t)count);
             if (complete < 0) {
@@ -4796,7 +5816,8 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
                 if (c->request.chunked) {
                     size_t decoded = 0;
                     if (ankah_chunked_body_consume(&c->chunked_body, buffer->base,
-                            (size_t)count, forward_body_limit(), &decoded) < 0) {
+                            (size_t)count, c->host ? c->host->body_limit : forward_body_limit(), &decoded) < 0 ||
+                        (c->host && c->chunked_body.trailer_size)) {
                         if (c->chunked_body.limit_exceeded && !c->upstream_final_started) {
                             c->forwarding = 0;
                             respond(c, 413, "Content Too Large", "text/plain",
@@ -4807,6 +5828,10 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
                             c->request_deadline_ns = 0;
                             uv_read_stop(stream);
                             refresh_timeout(c);
+                        } else if (c->host && !c->upstream_final_started) {
+                            c->forwarding = 0;
+                            respond(c, 400, "Bad Request", "text/plain", "Invalid body framing\n", NULL);
+                            finish_upstream_response(c);
                         } else close_connection(c);
                         free(buffer->base);
                         return;
@@ -4821,7 +5846,7 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
                     }
                     c->body_received += (size_t)count;
                 }
-                if (c->large_body) {
+                if (c->large_body && !c->host) {
                     c->request_deadline_ns = body_deadline_ns(c);
                     refresh_timeout(c);
                 }
@@ -4830,7 +5855,7 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
                             buffer->base, (size_t)count, 0) != 0) close_connection(c);
             if (!c->websocket && request_body_complete(c)) {
                 c->request_deadline_ns = 0;
-                c->reply_deadline_ns = ankah_reply_deadline_ns(
+                if (!c->host) c->reply_deadline_ns = ankah_reply_deadline_ns(
                     uv_hrtime(), c->large_body, 1, c->upstream_final_started);
                 refresh_timeout(c);
                 uv_read_stop(stream);
@@ -4860,6 +5885,75 @@ static void note_upstream_response(connection *c, const char *data, size_t size)
         tally_status(c, (data[9] - '0') * 100 + (data[10] - '0') * 10 + (data[11] - '0'));
 }
 
+static int forward_replay_response(connection *c, uv_stream_t *source,
+                                   const unsigned char *data, size_t size) {
+    static const char marker[] = "\r\n\r\n";
+    size_t at = 0;
+    if (c->response_head_done)
+        return queue_bytes(c, (uv_stream_t *)&c->client, source,
+                           (const char *)data, size, 0);
+    if (!c->response_head_buffer) {
+        c->response_head_buffer = malloc(ANKAH_HEADER_LIMIT);
+        if (!c->response_head_buffer) return -1;
+    }
+    while (at < size) {
+        unsigned char byte = data[at++];
+        size_t used = c->response_head_size;
+        int complete = 0;
+        if (used >= ANKAH_HEADER_LIMIT) return -1;
+        c->response_head_buffer[used] = byte;
+        c->response_head_size = used + 1;
+        if (c->response_head_size >= sizeof(marker) - 1 &&
+            memcmp(c->response_head_buffer + c->response_head_size - 4,
+                   marker, 4) == 0) complete = 1;
+        if (!complete) continue;
+        if (c->response_head_size >= 12 &&
+            memcmp(c->response_head_buffer, "HTTP/1.", 7) == 0 &&
+            c->response_head_buffer[9] == '1') {
+            if (queue_bytes(c, (uv_stream_t *)&c->client, source,
+                    (const char *)c->response_head_buffer,
+                    c->response_head_size, 0) != 0) return -1;
+            c->response_head_size = 0;
+            continue;
+        }
+        {
+            char pass[ANKAH_PASS_TEXT_MAX], cookie[256];
+            unsigned char *head;
+            int cookie_size;
+            size_t head_size;
+            if (ankah_issue_pass(config.secret, config.public_host,
+                    (uint64_t)time(NULL) + 43200, pass) != 0) return -1;
+            cookie_size = snprintf(cookie, sizeof(cookie),
+                "Set-Cookie: ankah_pass=%s; Max-Age=43200; Path=/; "
+                "HttpOnly; SameSite=Lax%s\r\n",
+                pass, config.public_https ? "; Secure" : "");
+            if (cookie_size < 0 || (size_t)cookie_size >= sizeof(cookie)) return -1;
+            head_size = c->response_head_size + (size_t)cookie_size;
+            head = malloc(head_size);
+            if (!head) return -1;
+            memcpy(head, c->response_head_buffer, c->response_head_size - 2);
+            memcpy(head + c->response_head_size - 2, cookie, (size_t)cookie_size);
+            memcpy(head + head_size - 2, "\r\n", 2);
+            if (queue_bytes(c, (uv_stream_t *)&c->client, source,
+                            (const char *)head, head_size, 0) != 0) {
+                free(head);
+                return -1;
+            }
+            free(head);
+            tally(c, ANKAH_STAT_passes_issued, 1);
+            c->response_head_done = 1;
+            free(c->response_head_buffer);
+            c->response_head_buffer = NULL;
+            c->response_head_size = 0;
+        }
+        if (at < size)
+            return queue_bytes(c, (uv_stream_t *)&c->client, source,
+                               (const char *)data + at, size - at, 0);
+        return 0;
+    }
+    return 0;
+}
+
 static void on_upstream_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer) {
     connection *c = (connection *)stream->data;
     if (c->response_finishing && !c->forwarding) {
@@ -4875,10 +5969,16 @@ static void on_upstream_read(uv_stream_t *stream, ssize_t count, const uv_buf_t 
             upstream_final_start(c);
         refresh_timeout(c);
         if (c->closed) { free(buffer->base); return; }
-        if (queue_bytes(c, (uv_stream_t *)&c->client, stream,
-                        buffer->base, (size_t)count, 0) != 0) close_connection(c);
+        if (c->pass_after_replay) {
+            if (forward_replay_response(c, stream,
+                    (const unsigned char *)buffer->base, (size_t)count) != 0)
+                close_connection(c);
+        } else if (queue_bytes(c, (uv_stream_t *)&c->client, stream,
+                               buffer->base, (size_t)count, 0) != 0)
+            close_connection(c);
     } else if (count < 0) {
         if (c->status_seen) finish_upstream_response(c);
+        else if (c->host) respond(c, 502, "Bad Gateway", "text/plain", "Upstream unavailable\n", NULL);
         else close_connection(c);
     }
     free(buffer->base);
@@ -4938,6 +6038,7 @@ static void accept_connection(uv_stream_t *server, int dashboard) {
     if (uv_tcp_getpeername(&c->client, (struct sockaddr *)&address, &address_size) == 0 &&
         address.ss_family == AF_INET) {
         uv_ip4_name((const struct sockaddr_in *)&address, c->peer_ip, sizeof(c->peer_ip));
+        if (c->internal) c->bridge_port = ntohs(((const struct sockaddr_in *)&address)->sin_port);
     } else if (address.ss_family == AF_INET6) {
         uv_ip6_name((const struct sockaddr_in6 *)&address, c->peer_ip, sizeof(c->peer_ip));
     } else strcpy(c->peer_ip, "0.0.0.0");
@@ -4954,25 +6055,213 @@ static void on_dashboard_connection(uv_stream_t *server, int status) {
     if (status >= 0) accept_connection(server, 1);
 }
 
-/* Returns 1 after a durable save, 0 when persistence is disabled, and -1
+/* Returns 1 after queueing, 0 when persistence is disabled, and -1
  * after a nonfatal persistence failure. */
 static int save_stats(void) {
-    uint64_t wall;
+    uint64_t wall, generation;
+    unsigned char *data;
+    size_t size;
     if (!config.stats_path[0]) return 0;
     wall = (uint64_t)time(NULL);
-    ankah_stats_roll(wall);
-    if (ankah_stats_save(config.stats_path, wall) != 0) {
+    data = ankah_stats_snapshot(wall, &size, &generation);
+    if (!data || ankah_disk_snapshot(ANKAH_DISK_STATS, config.stats_path,
+                                      data, size, generation) != 0) {
+        free(data);
         if (!config.stats_persistence_failed)
             fprintf(stderr, "Ankah statistics persistence unavailable: %s\n",
                     config.stats_path);
         config.stats_persistence_failed = 1;
         return -1;
     }
-    if (config.stats_persistence_failed)
-        fprintf(stderr, "Ankah statistics persistence recovered: %s\n",
-                config.stats_path);
-    config.stats_persistence_failed = 0;
     return 1;
+}
+
+static void disable_dashboard(void) {
+    ankah_session_totals sessions;
+    stats_sample((uint64_t)time(NULL), &sessions);
+    (void)save_stats();
+    config.dashboard = 0;
+    ankah_stats_disable();
+    if (config.stats_timer_initialized)
+        close_handle((uv_handle_t *)&config.stats_timer);
+    if (config.dashboard_listener_initialized)
+        close_handle((uv_handle_t *)&config.dashboard_listener);
+    config.stats_timer_initialized = 0;
+    config.dashboard_listener_initialized = 0;
+    while (config.live_first) registry_unlink(config.live_first);
+    body_release(config.live_body);
+    config.live_body = NULL;
+    memset(config.dashboard_sessions, 0, sizeof(config.dashboard_sessions));
+    fprintf(stderr, "Ankah dashboard disabled until restart\n");
+}
+
+static void on_disk_result(int kind, void *context, int result,
+                           uint64_t generation, void *owner) {
+    (void)generation; (void)owner;
+    if (kind == ANKAH_DISK_CONSUME) {
+        consume_job *job = context;
+        if (job->peer) finish_peer_consume(job, result);
+        else {
+            finish_continue_after_ack(job->client, result);
+            release_connection(job->client);
+        }
+        free(job);
+        return;
+    }
+    if (kind == ANKAH_DISK_STATS) {
+        if (result != 0 && !config.stats_persistence_failed)
+            fprintf(stderr, "Ankah statistics persistence unavailable: %s\n",
+                    config.stats_path);
+        else if (result == 0 && config.stats_persistence_failed)
+            fprintf(stderr, "Ankah statistics persistence recovered: %s\n",
+                    config.stats_path);
+        config.stats_persistence_failed = result != 0;
+    } else if (kind == ANKAH_DISK_SESSIONS) {
+        ankah_disk_session_state state;
+        ankah_disk_session_result_done();
+        config.session_snapshot_inflight = 0;
+        config.next_session_save_ns = uv_hrtime() + SESSION_SAVE_NS;
+        if (result != 0) ankah_session_snapshot_retry();
+        if (result != 0 && !config.session_persistence_failed)
+            fprintf(stderr, "Ankah session persistence unavailable: %s\n",
+                    config.session_state_path);
+        else if (result == 0 && config.session_persistence_failed)
+            fprintf(stderr, "Ankah session persistence recovered: %s\n",
+                    config.session_state_path);
+        config.session_persistence_failed = result != 0;
+        if (generation == config.session_snapshot_generation) {
+            config.session_snapshot_queued_ns = 0;
+            config.session_snapshot_lag_reported = 0;
+        }
+        ankah_disk_session_state_get(&state);
+        if (state.journal_bytes || state.unknown_slots || state.repair_started ||
+            state.journal_bad)
+            config.next_journal_refresh_ns = uv_hrtime() +
+                (result == 0 ? SESSION_REFRESH_NS : SESSION_SAVE_NS);
+        else config.next_journal_refresh_ns = 0;
+    } else if (kind == ANKAH_DISK_LOG && result != 0) {
+        fprintf(stderr, "Ankah unknown-language log write failed\n");
+    } else if (kind == ANKAH_DISK_MAINTAIN && result != 0) {
+        config.next_journal_maintain_ns = uv_hrtime() + SESSION_SAVE_NS;
+    }
+}
+
+static int start_session_snapshot(void) {
+    if (!config.session_state_path[0] || config.session_snapshot ||
+        config.session_snapshot_inflight ||
+        ankah_disk_session_capture_begin() != 0) return 0;
+    config.session_snapshot_inflight = 1;
+    config.session_snapshot = ankah_session_snapshot_begin((uint64_t)time(NULL));
+    if (!config.session_snapshot) {
+        ankah_disk_session_capture_cancel();
+        config.session_snapshot_inflight = 0;
+        if (!config.session_persistence_failed)
+            fprintf(stderr, "Ankah could not build session snapshot\n");
+        config.session_persistence_failed = 1;
+        return -1;
+    }
+    return 1;
+}
+
+static void on_session_tick(uv_timer_t *timer) {
+    uint64_t now = uv_hrtime();
+    ankah_disk_session_state state;
+    int completed;
+    (void)timer;
+    ankah_disk_session_state_get(&state);
+    {
+        int unavailable = state.poisoned ||
+            state.journal_bytes > ANKAH_JOURNAL_LIMIT - 33;
+        if (unavailable && !config.journal_persistence_failed)
+            fprintf(stderr, "Ankah consumption journal unavailable: %s\n",
+                    config.session_state_path);
+        else if (!unavailable && config.journal_persistence_failed)
+            fprintf(stderr, "Ankah consumption journal recovered: %s\n",
+                    config.session_state_path);
+        config.journal_persistence_failed = unavailable;
+    }
+    if (!state.journal_bytes && !state.unknown_slots &&
+        !state.repair_started && !state.journal_bad)
+        config.next_journal_refresh_ns = 0;
+    if (state.journal_bytes >= ANKAH_JOURNAL_REFRESH &&
+        !config.next_journal_refresh_ns)
+        config.next_journal_refresh_ns = now + SESSION_REFRESH_NS;
+    if (state.journal_bad && !state.repair_started &&
+        !config.session_snapshot_inflight && !config.session_snapshot) {
+        ankah_session_discard_saved_posts();
+        if (ankah_disk_session_repair_begin() == 0)
+            config.next_journal_refresh_ns = now;
+    }
+    if (config.lifecycle != LIFECYCLE_STOPPING &&
+        now >= config.next_journal_maintain_ns &&
+        (state.poisoned || state.journal_bytes >= ANKAH_JOURNAL_REFRESH)) {
+        (void)ankah_disk_maintain();
+        config.next_journal_maintain_ns = now + SESSION_REFRESH_NS;
+    }
+    if (!config.session_snapshot && !config.session_snapshot_inflight &&
+        config.lifecycle != LIFECYCLE_STOPPING) {
+        int normal_due = now >= config.next_session_save_ns &&
+                         ankah_session_changed();
+        int journal_due = config.next_journal_refresh_ns &&
+                          now >= config.next_journal_refresh_ns &&
+                          (state.journal_bytes || state.unknown_slots ||
+                           state.repair_started || state.journal_bad);
+        if (normal_due || journal_due) {
+            int started = start_session_snapshot();
+            if (started != 0) {
+                config.next_session_save_ns = now + SESSION_SAVE_NS;
+                config.next_journal_refresh_ns = now +
+                    (started > 0 ? SESSION_REFRESH_NS : SESSION_SAVE_NS);
+            }
+        }
+    }
+    if (config.session_snapshot) {
+        completed = ankah_session_snapshot_step(config.session_snapshot, 256U * 1024U);
+        if (completed != 0) {
+            if (completed > 0) {
+                size_t size;
+                uint64_t generation;
+                unsigned char *data = ankah_session_snapshot_detach(
+                    config.session_snapshot, &size, &generation);
+                if (!data || ankah_disk_snapshot(ANKAH_DISK_SESSIONS,
+                        config.session_state_path, data, size, generation) != 0) {
+                    free(data);
+                    ankah_disk_session_capture_cancel();
+                    config.session_snapshot_inflight = 0;
+                    ankah_session_snapshot_retry();
+                    config.session_persistence_failed = 1;
+                    fprintf(stderr, "Ankah could not queue session snapshot\n");
+                } else {
+                    if (!config.session_snapshot_queued_ns)
+                        config.session_snapshot_queued_ns = now;
+                    config.session_snapshot_generation = generation;
+                }
+            } else {
+                ankah_disk_session_capture_cancel();
+                config.session_snapshot_inflight = 0;
+                config.session_persistence_failed = 1;
+                fprintf(stderr, "Ankah could not build session snapshot\n");
+            }
+            ankah_session_snapshot_free(config.session_snapshot);
+            config.session_snapshot = NULL;
+        }
+    }
+    if (config.session_snapshot_queued_ns &&
+        now - config.session_snapshot_queued_ns > 3 * SESSION_SAVE_NS &&
+        !config.session_snapshot_lag_reported) {
+        fprintf(stderr, "Ankah session snapshot lag exceeds 90 seconds\n");
+        config.session_snapshot_lag_reported = 1;
+    }
+    if (config.lifecycle == LIFECYCLE_STOPPING && !config.session_snapshot &&
+        !config.session_snapshot_inflight) {
+        if (config.shutdown_session_snapshot) {
+            int started = start_session_snapshot();
+            if (started != 0) config.shutdown_session_snapshot = 0;
+        } else {
+            close_handle((uv_handle_t *)&config.session_timer);
+            ankah_disk_stop();
+        }
+    }
 }
 
 static void on_stats_tick(uv_timer_t *timer) {
@@ -4983,6 +6272,309 @@ static void on_stats_tick(uv_timer_t *timer) {
     if (config.stats_path[0] && now >= config.next_stats_save_ns) {
         (void)save_stats();
         config.next_stats_save_ns = now + STATS_SAVE_NS;
+    }
+}
+
+static int gateway_blocked(const char *ip) {
+    uint64_t now = uv_hrtime();
+    unsigned int i;
+    for (i = 0; i < 4096; ++i)
+        if (config.gateway_blocks[i].until_ns > now &&
+            strcmp(config.gateway_blocks[i].ip, ip) == 0) return 1;
+    return 0;
+}
+
+static void send_block_batch(ankah_link_connection *connection,
+                             char addresses[][64], unsigned int count) {
+    unsigned char message[1 + ANKAH_LINK_BLOCK_BATCH_MAX * 64];
+    size_t used = 1;
+    unsigned int i;
+    if (!count || count > ANKAH_LINK_BLOCK_BATCH_MAX) return;
+    message[0] = (unsigned char)count;
+    for (i = 0; i < count; ++i) {
+        size_t length = strlen(addresses[i]);
+        if (!length || length > 63) return;
+        message[used++] = (unsigned char)length;
+        memcpy(message + used, addresses[i], length);
+        used += length;
+    }
+    if (connection)
+        (void)ankah_link_send(connection, ANKAH_LINK_BLOCKS, message, used);
+    else (void)ankah_link_broadcast(ANKAH_LINK_BLOCKS, message, used);
+}
+
+static void flush_blocks(void) {
+    if (config.pending_block_count && config.link_started)
+        send_block_batch(NULL, config.pending_blocks, config.pending_block_count);
+    config.pending_block_count = 0;
+}
+
+static void gateway_block(const char *ip, int forward) {
+    uint64_t now = uv_hrtime();
+    unsigned int i, selected = 0;
+    if (!ip || !*ip || strlen(ip) >= 64) return;
+    for (i = 0; i < 4096; ++i) {
+        if (strcmp(config.gateway_blocks[i].ip, ip) == 0) {
+            selected = i;
+            break;
+        }
+        if (config.gateway_blocks[i].until_ns < config.gateway_blocks[selected].until_ns)
+            selected = i;
+    }
+    strcpy(config.gateway_blocks[selected].ip, ip);
+    config.gateway_blocks[selected].until_ns = now + GATEWAY_BLOCK_NS;
+    if (forward && config.link_started) {
+        for (i = 0; i < config.pending_block_count; ++i)
+            if (strcmp(config.pending_blocks[i], ip) == 0) return;
+        if (config.pending_block_count == ANKAH_LINK_BLOCK_BATCH_MAX) flush_blocks();
+        strcpy(config.pending_blocks[config.pending_block_count++], ip);
+        if (config.pending_block_count == ANKAH_LINK_BLOCK_BATCH_MAX) flush_blocks();
+    }
+}
+
+static void on_block_tick(uv_timer_t *timer) {
+    (void)timer;
+    flush_blocks();
+}
+
+static void sync_blocks(ankah_link_connection *connection) {
+    char batch[ANKAH_LINK_BLOCK_BATCH_MAX][64];
+    uint64_t now = uv_hrtime();
+    unsigned int i, count = 0;
+    for (i = 0; i < 4096; ++i) {
+        if (config.gateway_blocks[i].until_ns <= now) continue;
+        strcpy(batch[count++], config.gateway_blocks[i].ip);
+        if (count == ANKAH_LINK_BLOCK_BATCH_MAX) {
+            send_block_batch(connection, batch, count);
+            count = 0;
+        }
+    }
+    if (count) send_block_batch(connection, batch, count);
+}
+
+static void send_solved_to(const ankah_session *session,
+                           ankah_link_connection *connection) {
+    unsigned char message[32 + 1 + 2 + ANKAH_MAX_TARGET];
+    size_t length;
+    int type;
+    if (!session || !ankah_session_solved(session, (uint64_t)time(NULL))) return;
+    memcpy(message, session->id, 32);
+    if (session->target[0]) {
+        length = strlen(session->target);
+        message[32] = (unsigned char)(session->is_post != 0);
+        message[33] = (unsigned char)(length >> 8);
+        message[34] = (unsigned char)length;
+        memcpy(message + 35, session->target, length);
+        length += 35;
+        type = ANKAH_LINK_META;
+    } else {
+        length = 32;
+        type = ANKAH_LINK_SOLVED;
+    }
+    if (connection) (void)ankah_link_send(connection, type, message, length);
+    else (void)ankah_link_broadcast(type, message, length);
+}
+
+static void broadcast_solved(const ankah_session *session) {
+    if (config.link_started) send_solved_to(session, NULL);
+}
+
+static void sync_solved(const ankah_session *session, void *owner) {
+    send_solved_to(session, owner);
+}
+
+static void on_remote_result(int type, const unsigned char *data, size_t size) {
+    remote_pending *pending;
+    connection *c;
+    uint64_t request_id;
+    if (size < 8) return;
+    request_id = wire_get64(data);
+    pending = remove_remote_pending(request_id);
+    if (!pending) return;
+    c = pending->client;
+    free(pending);
+    c->continuation_waiting = 0;
+    if (!c->closed) {
+        if (type == ANKAH_LINK_CONSUME_FAIL) {
+            if (size == 9 && data[8] == 2)
+                respond(c, 403, "Forbidden", "text/plain",
+                        "Continuation expired\n", NULL);
+            else
+                respond(c, 503, "Service Unavailable", "text/plain",
+                        "Continuation owner unavailable\n", "Retry-After: 1\r\n");
+        } else {
+            size_t at = 8, ip_size, request_size, body_size;
+            char ip[64], normalized[64];
+            if (size < 8 + 1 + 4 + sizeof(ankah_request) + 4) goto malformed;
+            ip_size = data[at++];
+            if (!ip_size || ip_size >= sizeof(ip) ||
+                at + ip_size + 4 > size) goto malformed;
+            memcpy(ip, data + at, ip_size); ip[ip_size] = 0; at += ip_size;
+            if (ankah_normalize_ip(ip, normalized, sizeof(normalized)) != 0 ||
+                strcmp(ip, normalized) != 0) goto malformed;
+            request_size = wire_get32(data + at); at += 4;
+            if (request_size != sizeof(ankah_request) ||
+                request_size > size - at || size - at - request_size < 4)
+                goto malformed;
+            memcpy(&c->request, data + at, request_size); at += request_size;
+            body_size = wire_get32(data + at); at += 4;
+            if (body_size > ANKAH_POST_REPLAY_MAX || body_size != size - at ||
+                strcmp(c->request.method, "POST") != 0 ||
+                c->request.content_length != body_size) goto malformed;
+            c->replay_body = malloc(body_size ? body_size : 1);
+            if (!c->replay_body) goto malformed;
+            memcpy(c->replay_body, data + at, body_size);
+            c->replay_raw = 1;
+            strcpy(c->peer_ip, ip);
+            c->replay_size = body_size;
+            c->replaying = 1;
+            c->pass_after_replay = 1;
+            c->continue_expected = 0;
+            tally(c, ANKAH_STAT_posts_replayed, 1);
+            if (start_upstream(c) != 0)
+                respond(c, 502, "Bad Gateway", "text/plain",
+                        "Upstream unavailable\n", NULL);
+            goto finished;
+malformed:
+            respond(c, 502, "Bad Gateway", "text/plain",
+                    "Continuation response invalid\n", NULL);
+        }
+    }
+finished:
+    release_connection(c);
+}
+
+static void on_peer_consume_request(const unsigned char *data, size_t size,
+                                    ankah_link_connection *connection) {
+    consume_job *job;
+    ankah_session *session;
+    char id[33], token[33], target[ANKAH_MAX_TARGET];
+    uint64_t request_id;
+    size_t target_size;
+    if (size < 74) return;
+    request_id = wire_get64(data);
+    target_size = (size_t)data[72] << 8 | data[73];
+    if (!target_size || target_size >= sizeof(target) ||
+        size != target_size + 74) return;
+    memcpy(id, data + 8, 32); id[32] = 0;
+    memcpy(token, data + 40, 32); token[32] = 0;
+    memcpy(target, data + 74, target_size); target[target_size] = 0;
+    session = ankah_session_find(id, (uint64_t)time(NULL));
+    if (!session) return;
+    if (!session->saved_request) {
+        if (session->peer_ip[0]) peer_consume_failure(connection, request_id, 2);
+        return;
+    }
+    if (!ankah_session_solved(session, (uint64_t)time(NULL)) ||
+        strcmp(target, session->target) != 0 ||
+        ankah_session_reserve_post(session, token, (uint64_t)time(NULL)) != 0) {
+        peer_consume_failure(connection, request_id, 2);
+        return;
+    }
+    job = calloc(1, sizeof(*job));
+    if (!job || ankah_link_retain(connection) != 0) {
+        free(job);
+        ankah_session_unreserve_post(session);
+        peer_consume_failure(connection, request_id, 1);
+        return;
+    }
+    job->peer = 1;
+    job->link = connection;
+    job->request_id = request_id;
+    strcpy(job->id, id);
+    strcpy(job->token, token);
+    if (!config.session_state_path[0]) {
+        finish_peer_consume(job, 0);
+        free(job);
+    } else if (ankah_disk_consume(config.session_state_path, id, job) != 0) {
+        ankah_session_unreserve_post(session);
+        peer_consume_failure(connection, request_id, 1);
+        ankah_link_release(connection);
+        free(job);
+    }
+}
+
+static void on_link_rpc_tick(uv_timer_t *timer) {
+    remote_pending **at = &config.remote_first;
+    uint64_t now = uv_hrtime();
+    (void)timer;
+    while (*at) {
+        remote_pending *pending = *at;
+        if (pending->deadline_ns > now) {
+            at = &pending->next;
+            continue;
+        }
+        *at = pending->next;
+        if (!pending->client->closed)
+            respond(pending->client, 503, "Service Unavailable", "text/plain",
+                    "Continuation owner unavailable\n", "Retry-After: 1\r\n");
+        pending->client->continuation_waiting = 0;
+        release_connection(pending->client);
+        free(pending);
+    }
+}
+
+static void on_link_message(int type, const unsigned char *data, size_t size,
+                            ankah_link_connection *connection, void *owner) {
+    char id[33];
+    ankah_session *session;
+    uint64_t now = (uint64_t)time(NULL);
+    (void)owner;
+    if (type == ANKAH_LINK_CONNECTED) {
+        ankah_session_each_solved(now, sync_solved, connection);
+        sync_blocks(connection);
+        return;
+    }
+    if (type == ANKAH_LINK_CONSUME_REQUEST) {
+        on_peer_consume_request(data, size, connection);
+        return;
+    }
+    if (type == ANKAH_LINK_CONSUME_OK || type == ANKAH_LINK_CONSUME_FAIL) {
+        on_remote_result(type, data, size);
+        return;
+    }
+    if (type == ANKAH_LINK_SOLVED && size == 32) {
+        memcpy(id, data, 32); id[32] = 0;
+        session = ankah_session_find(id, now);
+        if (session) {
+            if (!ankah_session_solved(session, now) &&
+                ankah_session_solve(session, now) != 0) return;
+        } else session = ankah_session_accept_solved(id, now, NULL, 0);
+        if (session && session->target[0]) send_solved_to(session, connection);
+        return;
+    }
+    if (type == ANKAH_LINK_META && size >= 35) {
+        size_t length = (size_t)data[33] << 8 | data[34];
+        char target[ANKAH_MAX_TARGET];
+        if (length == 0 || length >= sizeof(target) || size != length + 35 ||
+            data[32] > 1) return;
+        memcpy(target, data + 35, length);
+        target[length] = 0;
+        if (!valid_return_path(target)) return;
+        memcpy(id, data, 32); id[32] = 0;
+        (void)ankah_session_accept_solved(id, now, target, data[32]);
+        return;
+    }
+    if (type == ANKAH_LINK_BLOCKS && size >= 1 &&
+        data[0] >= 1 && data[0] <= ANKAH_LINK_BLOCK_BATCH_MAX) {
+        size_t at = 1;
+        unsigned int i;
+        char addresses[ANKAH_LINK_BLOCK_BATCH_MAX][64];
+        for (i = 0; i < data[0]; ++i) {
+            char normalized[64];
+            size_t length;
+            if (at >= size) return;
+            length = data[at++];
+            if (!length || length >= sizeof(addresses[0]) || length > size - at)
+                return;
+            memcpy(addresses[i], data + at, length);
+            addresses[i][length] = 0;
+            if (ankah_normalize_ip(addresses[i], normalized, sizeof(normalized)) != 0 ||
+                strcmp(addresses[i], normalized) != 0) return;
+            at += length;
+        }
+        if (at != size) return;
+        for (i = 0; i < data[0]; ++i) gateway_block(addresses[i], 0);
     }
 }
 
@@ -4999,7 +6591,6 @@ static void close_connections(int include_dashboard) {
     }
 }
 
-#ifndef _WIN32
 static void clear_throttle_queue(void) {
     unsigned int i;
     for (i = 0; i < MAX_THROTTLE_QUEUE; ++i) {
@@ -5010,11 +6601,11 @@ static void clear_throttle_queue(void) {
     }
     config.throttle_queue_count = 0;
 }
-#endif
 
 static void finish_shutdown(void) {
     if (config.lifecycle == LIFECYCLE_STOPPING) return;
     config.lifecycle = LIFECYCLE_STOPPING;
+    if (config.dashboard) (void)save_stats();
     close_handle((uv_handle_t *)&config.listener);
     if (config.internal_listener_initialized)
         close_handle((uv_handle_t *)&config.internal_listener);
@@ -5025,13 +6616,32 @@ static void finish_shutdown(void) {
     if (config.throttle_timer_initialized)
         close_handle((uv_handle_t *)&config.throttle_timer);
     ankah_dots_close();
-#ifndef _WIN32
     if (config.terminate_signal_initialized)
         close_handle((uv_handle_t *)&config.terminate_signal);
     if (config.interrupt_signal_initialized)
         close_handle((uv_handle_t *)&config.interrupt_signal);
-#endif
     close_connections(1);
+    if (config.link_started) ankah_link_stop();
+    if (config.block_timer_initialized)
+        close_handle((uv_handle_t *)&config.block_timer);
+    if (config.link_rpc_timer_initialized)
+        close_handle((uv_handle_t *)&config.link_rpc_timer);
+    while (config.remote_first) {
+        remote_pending *pending = config.remote_first;
+        config.remote_first = pending->next;
+        release_connection(pending->client);
+        free(pending);
+    }
+    if (config.session_timer_initialized) {
+        if (config.session_snapshot) {
+            ankah_session_snapshot_free(config.session_snapshot);
+            config.session_snapshot = NULL;
+            ankah_disk_session_capture_cancel();
+            config.session_snapshot_inflight = 0;
+        }
+        config.shutdown_session_snapshot = 1;
+        uv_ref((uv_handle_t *)&config.session_timer);
+    } else ankah_disk_stop();
     if (config.tls_certificate[0]) {
         ankah_frontend_force_close();
         ankah_h3_force_close();
@@ -5066,7 +6676,6 @@ static void on_frontend_drained(void *data) {
     maybe_finish_drain();
 }
 
-#ifndef _WIN32
 static void on_shutdown_signal(uv_signal_t *handle, int number) {
     (void)handle;
     if (config.lifecycle == LIFECYCLE_RUNNING) {
@@ -5087,7 +6696,6 @@ static void on_shutdown_signal(uv_signal_t *handle, int number) {
         (void)uv_process_kill(&config.child, SIGKILL);
     finish_shutdown();
 }
-#endif
 
 static void on_child_exit(uv_process_t *process, int64_t status, int signal_number) {
     fprintf(stderr, "Ankah child exited: status=%" PRId64 " signal=%d\n",
@@ -5120,8 +6728,10 @@ int main(int argc, char **argv) {
         fprintf(stderr, "usage: ankah [--config path] "
                         "--public-origin https://host --secret-file path "
                         "[--listen ip:port] [--upstream ip:port] "
+                        "[--ankah-link host[:port]] [--ankah-link-listen ip:port] "
                         "[--allow-prefix /path] [--max-upload-mb n] "
                         "[--static-bundle dir] [--static-cache-mb n] "
+                        "[--mascot-file path] "
                         "[--static-throttle-prefix /path/] "
                         "[--static-throttle-global-connections n] "
                         "[--static-throttle-client-connections n] "
@@ -5133,8 +6743,9 @@ int main(int argc, char **argv) {
                         "[--trusted-proxy cidr] "
                         "[--proxy-abuse-profile off|conservative|strict] "
                         "[--dashboard-listen ip:port] [--dashboard-public-route /path/] "
-                        "[--dashboard-token-file path] "
+                        "[--dashboard-token-file path] [--no-dashboard] "
                         "[--stats-file path | --no-stats-file] "
+                        "[--session-state-file path | --no-session-state-file] "
                         "[--log-unknown-languages path] "
                         "[--dots-server ip:port --dots-server-name name "
                         "--dots-ca-file path --dots-cert-file path --dots-key-file path "
@@ -5156,6 +6767,67 @@ int main(int argc, char **argv) {
         return 1;
     }
     config.loop = uv_default_loop();
+    if (config.session_state_path[0]) {
+        int restored = ankah_session_restore(config.session_state_path,
+                                             (uint64_t)time(NULL));
+        if (restored == -2)
+            fprintf(stderr, "Ankah consumption journal was unavailable or invalid: %s\n",
+                    config.session_state_path);
+        else if (restored != 0)
+            fprintf(stderr, "Ankah session snapshot was unavailable or invalid: %s\n",
+                    config.session_state_path);
+    }
+    if ((config.session_state_path[0] || config.stats_path[0] ||
+         config.unknown_languages_path[0]) &&
+        ankah_disk_start(config.loop, on_disk_result, NULL,
+                         config.session_state_path) != 0) {
+        fprintf(stderr, "Ankah failed to start disk writer\n");
+        return 1;
+    }
+    config.writer_started = config.session_state_path[0] ||
+        config.stats_path[0] || config.unknown_languages_path[0];
+    if (config.unknown_languages_path[0])
+        ankah_language_log_set_writer(submit_language_log, NULL);
+    if (config.session_state_path[0]) {
+        if (uv_timer_init(config.loop, &config.session_timer) != 0 ||
+            uv_timer_start(&config.session_timer, on_session_tick, 10, 10) != 0) {
+            fprintf(stderr, "Ankah failed to start session snapshots\n");
+            return 1;
+        }
+        config.session_timer_initialized = 1;
+        config.next_session_save_ns = uv_hrtime() + SESSION_SAVE_NS;
+        {
+            ankah_disk_session_state state;
+            ankah_disk_session_state_get(&state);
+            if (state.journal_bytes || state.unknown_slots || state.journal_bad)
+                config.next_journal_refresh_ns = uv_hrtime() + SESSION_REFRESH_NS;
+        }
+        uv_unref((uv_handle_t *)&config.session_timer);
+    }
+    if (config.link_peer_count) {
+        if (ankah_link_start(config.loop, config.secret, config.public_host,
+                             config.link_listen_ip, config.link_listen_port,
+                             config.link_peers, config.link_peer_count,
+                             on_link_message, NULL) != 0) {
+            fprintf(stderr, "Ankah failed to start gateway links\n");
+            return 1;
+        }
+        config.link_started = 1;
+        if (uv_timer_init(config.loop, &config.block_timer) != 0 ||
+            uv_timer_start(&config.block_timer, on_block_tick, 100, 100) != 0) {
+            fprintf(stderr, "Ankah failed to start block batching\n");
+            return 1;
+        }
+        config.block_timer_initialized = 1;
+        uv_unref((uv_handle_t *)&config.block_timer);
+        if (uv_timer_init(config.loop, &config.link_rpc_timer) != 0 ||
+            uv_timer_start(&config.link_rpc_timer, on_link_rpc_tick, 100, 100) != 0) {
+            fprintf(stderr, "Ankah failed to start link continuations\n");
+            return 1;
+        }
+        config.link_rpc_timer_initialized = 1;
+        uv_unref((uv_handle_t *)&config.link_rpc_timer);
+    }
 #ifndef _WIN32
     if (uv_signal_init(config.loop, &config.terminate_signal) != 0 ||
         uv_signal_start(&config.terminate_signal, on_shutdown_signal, SIGTERM) != 0) {
@@ -5163,13 +6835,13 @@ int main(int argc, char **argv) {
         return 1;
     }
     config.terminate_signal_initialized = 1;
+#endif
     if (uv_signal_init(config.loop, &config.interrupt_signal) != 0 ||
         uv_signal_start(&config.interrupt_signal, on_shutdown_signal, SIGINT) != 0) {
         fprintf(stderr, "Ankah failed to initialize shutdown signals\n");
         return 1;
     }
     config.interrupt_signal_initialized = 1;
-#endif
     if (config.throttle_prefix_count &&
         (config.throttle_global_bytes_per_second ||
          config.throttle_client_bytes_per_second)) {
@@ -5205,6 +6877,13 @@ int main(int argc, char **argv) {
         config.internal_listener_initialized = 1;
         memset(&frontend_options, 0, sizeof(frontend_options));
         frontend_options.loop = config.loop;
+        frontend_options.hosts = config.hosts;
+        frontend_options.host_count = config.host_count;
+        frontend_options.max_connections = config.max_connections;
+        frontend_options.max_streams = config.max_streams;
+        frontend_options.upload_queue = config.upload_queue;
+        frontend_options.request_queue = config.request_queue;
+        frontend_options.response_queue = config.response_queue;
         frontend_options.certificate_path = config.tls_certificate;
         frontend_options.key_path = config.tls_key;
         frontend_options.internal_key = config.internal_key;
@@ -5298,7 +6977,12 @@ int main(int argc, char **argv) {
     result = uv_run(config.loop, UV_RUN_DEFAULT) == 0 ? 0 : 1;
     if (config.intentional_shutdown) result = 0;
     else if (config.child_started) result = config.child_exit_code;
-    if (config.dashboard) (void)save_stats();
+    if (config.writer_started) ankah_disk_join();
+    if (config.link_started) {
+        fprintf(stderr, "Ankah gateway link bytes sent: %" PRIu64 "\n",
+                ankah_link_bytes_sent());
+        ankah_link_cleanup();
+    }
     if (config.tls_certificate[0]) {
         ankah_frontend_shutdown();
         ankah_h3_shutdown();

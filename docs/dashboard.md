@@ -1,14 +1,34 @@
 # Operator dashboard
 
-Ankah can collect traffic statistics and serve them on a private listener or
-under an explicit route on its public listener. The feature is off by default.
-Without a dashboard listener or public route Ankah starts no timer and keeps no
-counters.
+Ankah collects traffic statistics and serves the dashboard at
+`/ankah-admin/` on the public listener by default. For a site with
+`--public-origin https://example.test`, open
+`https://example.test/ankah-admin/`. Ankah logs the public route at startup.
+Dashboard API requests require a token or authenticator session. The page may
+still require a normal challenge before sign-in.
 
-## Enabling it
+Without `--dashboard-token-file`, Ankah creates `ankah.dashboard.token` in its
+working directory with mode `0600` on Unix and reuses it after restart. On
+Windows, protect the working directory with suitable file permissions.
+Give its 64-character token to dashboard users or use it once to set up an
+authenticator. Persist the working directory in containers if the token should
+survive replacement of the container. If Ankah cannot save the file, it keeps
+the dashboard available with a temporary token and prints that token to
+standard error; it changes on restart. Protect logs containing a temporary
+token. An existing malformed token file stops startup instead of being replaced.
 
-The dashboard token file is required with either listener option. The private
-listener remains the most isolated deployment:
+To turn the dashboard and its statistics off from startup, pass
+`--no-dashboard` (or set `no-dashboard=true` in the configuration file or
+`ANKAH_NO_DASHBOARD=true` in the environment). This skips token creation,
+dashboard assets, and statistics collection. Do not combine it with dashboard
+listener, route, token, or statistics options.
+
+## Choosing a private listener or another route
+
+`--dashboard-listen` alone replaces the default public route with a private
+listener. Add `--dashboard-public-route` as well if both are needed. An
+explicit public route replaces `/ankah-admin/`. A token file is optional with
+either choice; to manage the token yourself, create one before starting:
 
 ```sh
 python3 -c 'import secrets; print(secrets.token_hex(32))' > dashboard.token
@@ -41,12 +61,16 @@ prefix instead of creating a second listener:
 
 The route must be a non-root path with leading and trailing slashes. Ankah
 reserves it and rejects startup if it conflicts with a configured health route
-or packaged static namespace. The private listener and public route may be
-enabled together.
+or non-root packaged static namespace. A root static namespace can coexist;
+the dashboard path remains reserved. An application using `/ankah-admin/` must
+configure another dashboard route or disable the dashboard. The private
+listener and public route may be enabled together.
 
 ## Where to bind it
 
-The dashboard listener speaks plain HTTP. Keep it off public interfaces.
+The dashboard listener speaks plain HTTP. Keep it off public interfaces. A
+public route uses the site's transport; use HTTPS when sending credentials
+over a public connection.
 
 **Native deployment.** Bind to loopback, as above. For a remote host, reach it
 through an SSH tunnel: `ssh -L 9000:127.0.0.1:9000 host`.
@@ -125,6 +149,28 @@ table view. The green spreadsheet button downloads the complete retained
 metrics history as CSV. Addresses can be masked on screen. A reset asks for a
 second click before it clears the statistics.
 
+The dashboard also offers **Disable dashboard**. Its confirmation explains
+that access and dashboard statistics stop immediately for the current run.
+The gateway keeps serving the site. The public dashboard route answers `410`,
+and a private dashboard listener closes. A restart enables the dashboard again
+unless Ankah starts with `--no-dashboard`. Statistics collected before the
+disable are saved when persistence is configured.
+
+The **Challenge page image** card shows the current mascot. Choose a PNG,
+JPEG, or WebP file to preview it, then select **Save image**. New challenge
+pages show the image immediately. **Restore default** returns to the
+`ankah.png` supplied by `--assets-dir`. The phone illustration beside the QR
+code is separate and does not change.
+
+Ankah saves uploads as PNG in `ankah.mascot.png` in its working directory by
+default. Set `--mascot-file path` (or `ANKAH_MASCOT_FILE`) to use a different
+writable location, such as a mounted volume in a container. The saved file is
+loaded after restart and takes precedence over `assets-dir/ankah.png`. If the
+file is unreadable or invalid, Ankah logs a warning and shows the bundled
+image. A failed save leaves the current image in use and shows an error in the
+dashboard. Files over 20 MiB cannot be selected; the browser scales the image
+to at most 1024 pixels on its longest side and uploads a PNG of at most 4 MiB.
+
 The page files load from the `dashboard` directory inside `--assets-dir` when
 the dashboard is enabled, and Ankah refuses to start if they are missing. The
 public listener does not serve them unless a dashboard public route is
@@ -160,6 +206,10 @@ order given by `/stats/schema`. The JSON schema version is 3.
 | `GET /auth/qr` | authenticator setup QR code; requires the dashboard token |
 | `POST /auth/login` | exchange a six-digit `X-Ankah-Code` header for a temporary bearer session |
 | `POST /auth/logout` | revoke a temporary bearer session |
+| `GET /settings/mascot` | current PNG and `X-Ankah-Mascot-Source: default` or `custom` |
+| `PUT /settings/mascot` | save a PNG body of at most 4 MiB as the challenge mascot |
+| `DELETE /settings/mascot` | remove the saved override and restore the bundled mascot |
+| `POST /settings/disable` | disable dashboard access and statistics until restart; accepts dashboard token or authenticator session |
 
 The metrics response excludes history, request paths, and connection
 addresses. Dashboard and metrics requests are not included in the public
@@ -243,15 +293,16 @@ starts a new epoch.
 
 ## Persistent history
 
-Dashboard statistics are saved every 15 minutes, after a reset, and when the
-event loop exits normally. The default snapshot basename is `ankah.stats` in
+Dashboard statistics are queued for a dedicated disk writer every 15 minutes,
+after a reset, and when the event loop exits normally. The default snapshot basename is `ankah.stats` in
 the process working directory. Use `--stats-file path` to choose another
 basename, or `--no-stats-file` to keep statistics only in memory. These
 options are valid only when the dashboard is enabled.
 
 Ankah keeps two generations named with `.0` and `.1` suffixes and uses a
 `.tmp` file while replacing one. At most three snapshots exist, for a maximum
-of about 5 MiB. A crash can lose up to 15 minutes of recent counts. Version
+of about 5 MiB. A crash can lose recent counts since the last durable save;
+slow disk writes can extend the 15-minute scheduling interval. Version
 1 snapshots with 32 fields are migrated in memory, preserving their existing
 history and starting the eight throttle fields at zero. Version 2 snapshots
 with 40 fields also migrate in memory, starting the five admission fields at
@@ -264,6 +315,7 @@ and writes a warning to standard error. Snapshot write failures also leave the
 gateway and dashboard running, so a read-only filesystem is supported with
 in-memory statistics. A later successful save reports recovery.
 
-The reset response includes `persistence` with a value of `saved`, `disabled`,
-or `failed`. A failed save still resets the running process, but the dashboard
-warns that older data could return after a restart.
+The reset response includes `persistence` with a value of `queued`, `disabled`,
+or `failed`. `queued` means the writer accepted a snapshot; completion is
+reported asynchronously. A failed save still resets the running process, but
+the dashboard warns that older data could return after a restart.

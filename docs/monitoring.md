@@ -1,8 +1,9 @@
 # External health monitoring
 
-Ankah can expose local gateway health routes and Prometheus metrics. Both are
-off by default. The health switches affect the public listener. Metrics are
-available through the configured dashboard listener or dashboard public route.
+Ankah can expose local gateway health routes and Prometheus metrics. Health
+routes are off by default; the switches affect the public listener. Metrics
+are available through the default dashboard public route or a configured
+dashboard listener or route, unless the dashboard has been disabled.
 
 Run monitors outside the application host when possible. A separate host or
 failure domain can detect machine, network, and process failures that a monitor
@@ -64,6 +65,13 @@ one-second retry hint. Crawler matching uses the resolved client address, so a
 proxy must be listed with `--trusted-proxy` before its forwarding headers can
 identify a crawler.
 
+The concurrency slot and the rate bucket are independent. Completing or
+cancelling a request releases its slot; spent tokens return only as time
+passes, at one token per half-second up to the ten-token burst. A request
+rejected for crawler contention may already have spent a rate token. The
+one-second retry hint is not a reservation or a guarantee of admission, since
+other requests share the bucket and slot.
+
 At most 192 anonymous and 32 header-pending sockets can occupy each public
 connection layer, out of its 256-socket limit. Unsolved challenges issued
 without proof are limited to 3,072 globally and 64 per resolved address, out
@@ -80,8 +88,9 @@ expected body or digest as success.
 
 ## Prometheus metrics
 
-Enable the dashboard as described in [the operator dashboard](dashboard.md),
-then scrape `GET /metrics` on its private listener with its bearer token:
+Configure a private dashboard listener as described in
+[the operator dashboard](dashboard.md), then scrape `GET /metrics` with its
+bearer token:
 
 ```yaml
 scrape_configs:

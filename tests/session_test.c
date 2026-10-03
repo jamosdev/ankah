@@ -1,4 +1,5 @@
 #include "ankah/session.h"
+#include "ankah/files.h"
 #ifdef NDEBUG
 #undef NDEBUG
 #endif
@@ -13,6 +14,7 @@ int main(void) {
     ankah_session *session;
     ankah_request *saved = NULL;
     unsigned char *body = NULL;
+    ankah_post_payload *payload = NULL;
     size_t size = 0;
     char id[33], token[33];
     const uint64_t now = 1700000000;
@@ -29,15 +31,14 @@ int main(void) {
     assert(ankah_session_append(session, "cd", 2) == 1);
     assert(ankah_session_solve(session, now + 1) == 0);
     assert(ankah_session_take_post(session, "wrong", now + 2,
-                                   &saved, &body, &size) == -1);
+                                   &saved, &body, &size, &payload) == -1);
     assert(ankah_session_take_post(session, token, now + 2,
-                                   &saved, &body, &size) == 0);
+                                   &saved, &body, &size, &payload) == 0);
     assert(size == 4 && memcmp(body, "abcd", 4) == 0);
     assert(strcmp(saved->target, "/upload?x=1") == 0);
-    free(saved);
-    free(body);
+    ankah_post_payload_release(payload);
     assert(ankah_session_take_post(session, token, now + 2,
-                                   &saved, &body, &size) == -1);
+                                   &saved, &body, &size, &payload) == -1);
     assert(ankah_session_find(id, now + 1802) == NULL);
 
     session = ankah_session_new(secret, "localhost", now, &request, "127.0.0.1");
@@ -52,7 +53,7 @@ int main(void) {
     assert(ankah_session_append(session, "abcd", 4) == 1);
     assert(ankah_session_solve(session, now + 1) == 0);
     assert(ankah_session_take_post(session, token, now + 302,
-                                   &saved, &body, &size) == -1);
+                                   &saved, &body, &size, &payload) == -1);
     assert(ankah_session_find(id, now + 302));
     assert(!ankah_session_find(id, now + 302)->saved_request);
 
@@ -99,6 +100,53 @@ int main(void) {
                                             &request, "proved", 1));
         assert(ankah_session_solve(second, issued + 1) == 0);
         assert(ankah_session_new(secret, "localhost", issued, &request, "extra"));
+    }
+    {
+        ankah_session_snapshot *snapshot;
+        unsigned char *image;
+        size_t image_size;
+        uint64_t generation;
+        const uint64_t issued = now + 100001;
+        ankah_session_totals totals;
+        FILE *journal;
+        ankah_session_count(issued, &totals);
+        strcpy(request.method, "POST");
+        strcpy(request.target, "/restart");
+        request.content_length = 4;
+        session = ankah_session_new(secret, "localhost", issued, &request, "127.0.0.1");
+        assert(session);
+        strcpy(id, session->id);
+        strcpy(token, session->token);
+        assert(ankah_session_append(session, "data", 4) == 1);
+        assert(ankah_session_solve(session, issued + 1) == 0);
+        snapshot = ankah_session_snapshot_begin(issued + 1);
+        assert(snapshot);
+        ankah_session_discard(session);
+        while ((size = (size_t)ankah_session_snapshot_step(snapshot, 1024)) == 0) {}
+        assert(size == 1);
+        image = ankah_session_snapshot_detach(snapshot, &image_size, &generation);
+        assert(image && generation);
+        ankah_session_snapshot_free(snapshot);
+        assert(ankah_file_replace("ankah-session-test.tmp", "ankah-session-test.1",
+                                  image, image_size) == 0);
+        free(image);
+        assert(ankah_session_restore("ankah-session-test", issued + 2) == 0);
+        session = ankah_session_find(id, issued + 2);
+        assert(session && session->saved_request &&
+               memcmp(session->body, "data", 4) == 0);
+        assert(ankah_session_reserve_post(session, token, issued + 2) == 0);
+        assert(ankah_session_reserve_post(session, token, issued + 2) == -1);
+        ankah_session_unreserve_post(session);
+        journal = fopen("ankah-session-test.journal", "wb");
+        assert(journal);
+        assert(fprintf(journal, "%s\n", id) == 33);
+        assert(fclose(journal) == 0);
+        ankah_session_discard(session);
+        assert(ankah_session_restore("ankah-session-test", issued + 2) == 0);
+        session = ankah_session_find(id, issued + 2);
+        assert(session && !session->saved_request);
+        remove("ankah-session-test.1");
+        remove("ankah-session-test.journal");
     }
     return 0;
 }

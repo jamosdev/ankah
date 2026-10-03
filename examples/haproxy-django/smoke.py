@@ -49,15 +49,30 @@ def main():
         time.sleep(11)
         client("client_a", "scan")
         client("client_b", "health")
-        time.sleep(62)
+        # HAProxy's one-minute ban is shorter than Ankah's ten-minute
+        # denylist. Recreate both gateways between independent scenarios.
+        # Check isolation before reset and explicit restart recovery after it.
+        client("client_a", "rejected")
+        run("up", "-d", "--force-recreate", "ankah", "haproxy")
+        ready()
         client("client_a", "health")
         client("client_a", "flood")
         client("client_b", "health")
-        time.sleep(62)
+        # HAProxy's one-minute ban is shorter than Ankah's ten-minute
+        # denylist. Recreate both gateways between independent scenarios.
+        # Check isolation before reset and explicit restart recovery after it.
+        client("client_a", "rejected")
+        run("up", "-d", "--force-recreate", "ankah", "haproxy")
+        ready()
         client("client_a", "health")
         client("client_a", "stalls")
         client("client_b", "health")
-        time.sleep(62)
+        # HAProxy's one-minute ban is shorter than Ankah's ten-minute
+        # denylist. Recreate both gateways between independent scenarios.
+        # Check isolation before reset and explicit restart recovery after it.
+        client("client_a", "rejected")
+        run("up", "-d", "--force-recreate", "ankah", "haproxy")
+        ready()
         client("client_a", "health")
     finally:
         run("down", "--volumes", "--remove-orphans")

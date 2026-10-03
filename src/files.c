@@ -5,6 +5,13 @@
 #include <stdlib.h>
 #include <string.h>
 
+#ifdef ANKAH_STORAGE_TEST
+static char fail_sync_suffix[32];
+void ankah_file_test_fail_parent_sync_once(const char *suffix) {
+    snprintf(fail_sync_suffix, sizeof(fail_sync_suffix), "%s", suffix);
+}
+#endif
+
 static void erase_free(unsigned char *data, size_t size) {
     volatile unsigned char *cursor = data;
     while (size--) *cursor++ = 0;
@@ -15,6 +22,72 @@ static void erase_free(unsigned char *data, size_t size) {
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
+#include <aclapi.h>
+#include <io.h>
+
+int ankah_file_private_descriptor(int descriptor) {
+    HANDLE original = (HANDLE)_get_osfhandle(descriptor), file;
+    WCHAR path[32768];
+    DWORD size;
+    PSECURITY_DESCRIPTOR security = NULL;
+    PSID owner = NULL;
+    PACL acl = NULL;
+    EXPLICIT_ACCESSA access;
+    DWORD result;
+    if (original == INVALID_HANDLE_VALUE) return -1;
+    size = GetFinalPathNameByHandleW(original, path, 32768, FILE_NAME_NORMALIZED);
+    if (!size || size >= 32768) return -1;
+    file = CreateFileW(path, READ_CONTROL | WRITE_DAC,
+                      FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                      NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) return -1;
+    if (GetSecurityInfo(file, SE_FILE_OBJECT, OWNER_SECURITY_INFORMATION,
+                        &owner, NULL, NULL, NULL, &security) != ERROR_SUCCESS) {
+        CloseHandle(file); return -1;
+    }
+    memset(&access, 0, sizeof(access));
+    access.grfAccessPermissions = FILE_ALL_ACCESS;
+    access.grfAccessMode = SET_ACCESS;
+    access.grfInheritance = NO_INHERITANCE;
+    access.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+    access.Trustee.TrusteeType = TRUSTEE_IS_USER;
+    access.Trustee.ptstrName = (LPSTR)owner;
+    result = SetEntriesInAclA(1, &access, NULL, &acl);
+    if (result == ERROR_SUCCESS)
+        result = SetSecurityInfo(file, SE_FILE_OBJECT,
+            DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+            NULL, NULL, acl, NULL);
+    if (acl) LocalFree(acl);
+    LocalFree(security);
+    CloseHandle(file);
+    return result == ERROR_SUCCESS ? 0 : -1;
+}
+
+int ankah_file_private_check(const char *path) {
+    PSECURITY_DESCRIPTOR security = NULL;
+    PSID owner = NULL;
+    PACL acl = NULL;
+    SECURITY_DESCRIPTOR_CONTROL control;
+    DWORD revision;
+    unsigned int i;
+    int result = -1;
+    if (GetNamedSecurityInfoA((LPSTR)path, SE_FILE_OBJECT,
+        OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+        &owner, NULL, &acl, NULL, &security) != ERROR_SUCCESS) return -1;
+    if (!owner || !acl || !acl->AceCount ||
+        !GetSecurityDescriptorControl(security, &control, &revision) ||
+        !(control & SE_DACL_PROTECTED)) goto done;
+    for (i = 0; i < acl->AceCount; ++i) {
+        ACCESS_ALLOWED_ACE *ace = NULL;
+        if (!GetAce(acl, i, (void **)&ace) || ace->Header.AceType != ACCESS_ALLOWED_ACE_TYPE ||
+            !EqualSid(owner, &ace->SidStart) || (ace->Header.AceFlags & INHERITED_ACE)) goto done;
+    }
+    result = 0;
+done:
+    LocalFree(security);
+    return result;
+}
+
 
 static int opened_as_requested(HANDLE file, const char *path) {
     char requested[32768], final[32768], unc[32768];
@@ -266,7 +339,7 @@ void ankah_file_unmap(unsigned char *data, size_t size) {
     if (data) munmap(data, size);
 }
 
-static void sync_parent(const char *path) {
+static int sync_parent(const char *path) {
     char directory[1024];
     const char *slash = strrchr(path, '/');
     size_t length;
@@ -275,7 +348,7 @@ static void sync_parent(const char *path) {
         strcpy(directory, ".");
     } else {
         length = slash == path ? 1 : (size_t)(slash - path);
-        if (length >= sizeof(directory)) return;
+        if (length >= sizeof(directory)) return -1;
         memcpy(directory, path, length);
         directory[length] = 0;
     }
@@ -286,9 +359,11 @@ static void sync_parent(const char *path) {
     flags |= O_DIRECTORY;
 #endif
     descriptor = open(directory, flags);
-    if (descriptor >= 0) {
-        (void)fsync(descriptor);
-        close(descriptor);
+    if (descriptor < 0) return -1;
+    {
+        int result = fsync(descriptor);
+        if (close(descriptor) != 0) result = -1;
+        return result;
     }
 }
 
@@ -325,8 +400,17 @@ int ankah_file_replace(const char *temp_path, const char *target_path,
     if (fsync(descriptor) != 0) { close(descriptor); return -1; }
     if (close(descriptor) != 0) return -1;
     if (rename(temp_path, target_path) != 0) return -1;
-    sync_parent(target_path);
-    return 0;
+#ifdef ANKAH_STORAGE_TEST
+    {
+        size_t suffix = strlen(fail_sync_suffix), length = strlen(target_path);
+        if (suffix && length >= suffix &&
+            strcmp(target_path + length - suffix, fail_sync_suffix) == 0) {
+            fail_sync_suffix[0] = 0;
+            return -1;
+        }
+    }
+#endif
+    return sync_parent(target_path);
 }
 
 #endif

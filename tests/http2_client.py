@@ -63,13 +63,13 @@ def request_headers(method, path, authority, length=None, headers=None):
 
 
 class Client:
-    def __init__(self, host, port):
+    def __init__(self, host, port, server_name="localhost"):
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         context.set_alpn_protocols(["h2"])
         raw = socket.create_connection((host, port), timeout=5)
-        self.socket = context.wrap_socket(raw, server_hostname="localhost")
+        self.socket = context.wrap_socket(raw, server_hostname=server_name)
         assert self.socket.selected_alpn_protocol() == "h2"
         self.socket.settimeout(.05)
         self.input = bytearray()
@@ -157,7 +157,9 @@ class Client:
             except (socket.timeout, ssl.SSLWantReadError):
                 break
             if not data:
-                raise AssertionError("HTTP/2 connection closed")
+                raise AssertionError(f"HTTP/2 connection closed; statuses={self.response_status!r}; "
+                                     f"resets={self.resets!r}; events={self.events[-16:]!r}; "
+                                     f"pending_prefix={bytes(self.input[:64])!r}")
             self.input.extend(data)
             self.process_frames()
             if len(data) < 65536:

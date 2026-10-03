@@ -131,6 +131,7 @@
 
   const state = {
     token: null,
+    disabled: false,
     bearer: false,
     setupPending: false,
     schema: null,
@@ -183,6 +184,10 @@
   }
 
   function showLogin(message) {
+    ++mascotSelection;
+    pendingMascot = null;
+    $("mascot-save").disabled = true;
+    $("mascot-file").value = "";
     state.token = null;
     state.bearer = false;
     state.setupPending = false;
@@ -204,6 +209,7 @@
   }
 
   function handleError(error) {
+    if (state.disabled) return;
     if (error instanceof Unauthorized) {
       const bearer = state.bearer;
       showLogin(text("enter_code"));
@@ -300,7 +306,7 @@
 
   async function poll() {
     clearTimeout(state.timer);
-    if (!state.token || state.polling) return;
+    if (!state.token || state.disabled || state.polling) return;
     if (document.hidden) {
       setStatus(text("paused"), false);
       return;
@@ -308,6 +314,10 @@
     state.polling = true;
     try {
       ingest(await api("stats/live"));
+      if (state.disabled) {
+        state.polling = false;
+        return;
+      }
       render();
       setStatus(text("live_updated", clockFormat(new Date())), false);
     } catch (error) {
@@ -319,7 +329,7 @@
       setStatus(text("connection_lost"), true);
     }
     state.polling = false;
-    state.timer = setTimeout(poll, POLL_MS);
+    if (!state.disabled) state.timer = setTimeout(poll, POLL_MS);
   }
 
   async function start() {
@@ -330,10 +340,12 @@
     try {
       await loadSchema();
       await loadHistory(state.range === "all");
+      if (state.disabled) return;
       $("export").hidden = false;
       $("setup").hidden = !state.bearer;
       $("signout").hidden = false;
       $("main").hidden = false;
+      loadMascot();
       poll();
       if (state.setupPending) {
         state.setupPending = false;
@@ -344,6 +356,127 @@
       if (!(error instanceof Unauthorized)) state.timer = setTimeout(start, 2000);
     }
   }
+
+  let pendingMascot = null;
+  let mascotPreviewUrl = null;
+  let mascotSelection = 0;
+
+  function mascotStatus(message, error = false) {
+    const node = $("mascot-status");
+    node.textContent = message || "";
+    node.classList.toggle("is-error", error);
+  }
+
+  function previewMascot(blob) {
+    if (mascotPreviewUrl) URL.revokeObjectURL(mascotPreviewUrl);
+    mascotPreviewUrl = URL.createObjectURL(blob);
+    $("mascot-preview").src = mascotPreviewUrl;
+  }
+
+  async function loadMascot() {
+    const selection = mascotSelection;
+    try {
+      const response = await fetch("settings/mascot", {
+        headers: {Authorization: `Bearer ${state.token}`}, cache: "no-store",
+      });
+      if (response.status === 401) throw new Unauthorized("unauthorized");
+      if (!response.ok) throw new Error(`settings/mascot answered ${response.status}`);
+      const current = await response.blob();
+      if (selection === mascotSelection) previewMascot(current);
+      $("mascot-restore").disabled =
+        response.headers.get("X-Ankah-Mascot-Source") === "default";
+      return true;
+    } catch (error) {
+      if (error instanceof Unauthorized) handleError(error);
+      else mascotStatus(text("mascot_load_failed"), true);
+      return false;
+    }
+  }
+
+  $("mascot-file").addEventListener("change", async () => {
+    const selection = ++mascotSelection;
+    const file = $("mascot-file").files[0];
+    pendingMascot = null;
+    $("mascot-save").disabled = true;
+    if (!file) return;
+    if (file.size > 20 * 1024 * 1024) {
+      mascotStatus(text("mascot_too_large"), true);
+      return;
+    }
+    if (!["image/png", "image/jpeg", "image/webp"].includes(file.type)) {
+      mascotStatus(text("mascot_invalid"), true);
+      return;
+    }
+    const sourceUrl = URL.createObjectURL(file);
+    try {
+      const image = new Image();
+      image.src = sourceUrl;
+      await image.decode();
+      if (!image.naturalWidth || !image.naturalHeight) throw new Error("empty image");
+      const scale = Math.min(1, 1024 / Math.max(image.naturalWidth, image.naturalHeight));
+      const canvas = document.createElement("canvas");
+      canvas.width = Math.max(1, Math.round(image.naturalWidth * scale));
+      canvas.height = Math.max(1, Math.round(image.naturalHeight * scale));
+      canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
+      const png = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
+      if (!png) throw new Error("invalid PNG");
+      if (png.size > 4 * 1024 * 1024) throw new Error("large PNG");
+      if (selection !== mascotSelection) return;
+      pendingMascot = png;
+      previewMascot(png);
+      $("mascot-save").disabled = false;
+      mascotStatus(text("mascot_ready"));
+    } catch (error) {
+      if (selection === mascotSelection) mascotStatus(
+        error.message === "large PNG" ?
+          text("mascot_output_too_large") : text("mascot_invalid"), true);
+    } finally {
+      URL.revokeObjectURL(sourceUrl);
+    }
+  });
+
+  $("mascot-save").addEventListener("click", async () => {
+    if (!pendingMascot) return;
+    $("mascot-save").disabled = true;
+    try {
+      const response = await fetch("settings/mascot", {
+        method: "PUT",
+        headers: {Authorization: `Bearer ${state.token}`, "Content-Type": "image/png"},
+        body: pendingMascot,
+        cache: "no-store",
+      });
+      if (response.status === 401) throw new Unauthorized("unauthorized");
+      if (!response.ok) throw new Error(`settings/mascot answered ${response.status}`);
+      pendingMascot = null;
+      $("mascot-file").value = "";
+      if (await loadMascot()) mascotStatus(text("mascot_saved"));
+    } catch (error) {
+      if (error instanceof Unauthorized) handleError(error);
+      else mascotStatus(text("mascot_save_failed"), true);
+      $("mascot-save").disabled = !pendingMascot;
+    }
+  });
+
+  $("mascot-restore").addEventListener("click", async () => {
+    ++mascotSelection;
+    $("mascot-restore").disabled = true;
+    try {
+      const response = await fetch("settings/mascot", {
+        method: "DELETE",
+        headers: {Authorization: `Bearer ${state.token}`}, cache: "no-store",
+      });
+      if (response.status === 401) throw new Unauthorized("unauthorized");
+      if (!response.ok) throw new Error(`settings/mascot answered ${response.status}`);
+      pendingMascot = null;
+      $("mascot-save").disabled = true;
+      $("mascot-file").value = "";
+      if (await loadMascot()) mascotStatus(text("mascot_restored"));
+    } catch (error) {
+      if (error instanceof Unauthorized) handleError(error);
+      else mascotStatus(text("mascot_save_failed"), true);
+      $("mascot-restore").disabled = false;
+    }
+  });
 
   /* One point per poll interval in live mode, or per bucket otherwise, oldest
    * first. `amounts` holds per field totals for the point. */
@@ -1230,6 +1363,42 @@
       poll();
     } catch (error) {
       handleError(error);
+    }
+  });
+
+  $("disable-open").addEventListener("click", () => {
+    $("disable-error").hidden = true;
+    $("disable-dialog").showModal();
+  });
+  $("disable-cancel").addEventListener("click", () => $("disable-dialog").close());
+  $("disable-confirm").addEventListener("click", async () => {
+    const button = $("disable-confirm");
+    button.disabled = true;
+    $("disable-error").hidden = true;
+    try {
+      const response = await fetch("settings/disable", {
+        method: "POST",
+        headers: {Authorization: `Bearer ${state.token}`},
+        cache: "no-store",
+      });
+      if (!response.ok) throw new Error(`settings/disable answered ${response.status}`);
+      state.disabled = true;
+      state.token = null;
+      clearTimeout(state.timer);
+      store("sessionStorage", "ankah-token", null);
+      store("sessionStorage", "ankah-bearer", null);
+      $("disable-dialog").close();
+      $("main").hidden = true;
+      $("disabled-state").hidden = false;
+      $("setup").hidden = true;
+      $("signout").hidden = true;
+      $("export").hidden = true;
+      setStatus(text("disable_complete"), false);
+    } catch (error) {
+      $("disable-error").textContent = text("disable_failed");
+      $("disable-error").hidden = false;
+    } finally {
+      button.disabled = false;
     }
   });
 

@@ -60,7 +60,39 @@
     <button type="button" id="setup-close"><!--#echo var="close" --></button>
   </dialog>
 
+  <dialog id="disable-dialog" aria-labelledby="disable-title">
+    <h2 id="disable-title"><!--#echo var="disable_title" --></h2>
+    <p class="note"><!--#echo var="disable_explanation" --></p>
+    <p id="disable-error" class="persistence-warning" role="alert" hidden></p>
+    <div class="dialog-actions">
+      <button type="button" id="disable-cancel"><!--#echo var="cancel" --></button>
+      <button type="button" id="disable-confirm"><!--#echo var="disable_dashboard" --></button>
+    </div>
+  </dialog>
+
+  <section id="disabled-state" class="card" role="status" hidden>
+    <p><!--#echo var="disable_complete" --></p>
+  </section>
+
   <main id="main" hidden>
+    <section class="card disable-banner" aria-label="<!--#echo var="disable_dashboard" -->">
+      <p class="note"><!--#echo var="disable_prompt" --></p>
+      <button type="button" id="disable-open"><!--#echo var="disable_dashboard" --></button>
+    </section>
+    <section class="card mascot-settings" aria-labelledby="mascot-title">
+      <div class="mascot-preview"><img id="mascot-preview" alt="<!--#echo var="mascot_preview_alt" -->"></div>
+      <div class="mascot-controls">
+        <h2 id="mascot-title"><!--#echo var="mascot_title" --></h2>
+        <p class="note"><!--#echo var="mascot_help" --></p>
+        <label for="mascot-file"><!--#echo var="mascot_choose" --></label>
+        <input id="mascot-file" type="file" accept="image/png,image/jpeg,image/webp">
+        <div class="mascot-buttons">
+          <button type="button" id="mascot-save" disabled><!--#echo var="mascot_save" --></button>
+          <button type="button" id="mascot-restore"><!--#echo var="mascot_restore" --></button>
+        </div>
+        <p id="mascot-status" class="note" role="status" aria-live="polite"></p>
+      </div>
+    </section>
     <section class="now" aria-label="<!--#echo var="now" -->">
       <div class="card">
         <p class="label"><!--#echo var="throughput_now" --></p>
@@ -275,6 +307,16 @@
     <span data-name="too_many_codes"><!--#echo var="too_many_codes" --></span>
     <span data-name="use_dashboard_token"><!--#echo var="use_dashboard_token" --></span>
     <span data-name="use_authenticator_code"><!--#echo var="use_authenticator_code" --></span>
+    <span data-name="mascot_ready"><!--#echo var="mascot_ready" --></span>
+    <span data-name="mascot_saved"><!--#echo var="mascot_saved" --></span>
+    <span data-name="mascot_restored"><!--#echo var="mascot_restored" --></span>
+    <span data-name="mascot_invalid"><!--#echo var="mascot_invalid" --></span>
+    <span data-name="mascot_too_large"><!--#echo var="mascot_too_large" --></span>
+    <span data-name="mascot_output_too_large"><!--#echo var="mascot_output_too_large" --></span>
+    <span data-name="mascot_save_failed"><!--#echo var="mascot_save_failed" --></span>
+    <span data-name="mascot_load_failed"><!--#echo var="mascot_load_failed" --></span>
+    <span data-name="disable_failed"><!--#echo var="disable_failed" --></span>
+    <span data-name="disable_complete"><!--#echo var="disable_complete" --></span>
   </div>
 </div>
 </body>

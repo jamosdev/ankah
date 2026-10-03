@@ -25,6 +25,7 @@ extern "C" {
 #include <deque>
 #include <map>
 #include <memory>
+#include <set>
 #include <string>
 #include <unordered_map>
 #include <vector>
@@ -145,11 +146,13 @@ struct Connection {
     socklen_t peer_len = 0;
     socklen_t local_len = 0;
     std::map<int64_t, std::unique_ptr<Stream>> streams;
+    std::set<int64_t> blocked_streams;
     std::vector<std::string> cids;
     std::string peer_ip;
     uint64_t created_at = 0;
     size_t unknown_body = 0;
     size_t response_queued = 0;
+    uint64_t max_client_streams_bidi = MAX_STREAMS;
     unsigned core_handles = 0;
     bool failed = false;
     bool closing = false;
@@ -160,6 +163,7 @@ struct Connection {
     Stream *find_stream(int64_t id);
     void setup_http();
     void flush();
+    void unblock_streams();
     void close();
 };
 
@@ -178,7 +182,6 @@ struct Server {
     size_t response_queued = 0;
     size_t stream_count = 0;
     size_t pending_sends = 0;
-    uint64_t next_crawler_slot = 0;
     bool udp_open = false;
     bool timer_open = false;
     bool draining = false;
@@ -189,6 +192,8 @@ struct Server {
     void receive(const sockaddr *peer, const uint8_t *data, size_t length);
     void send(const sockaddr *peer, const uint8_t *data, size_t length);
     void tick();
+    void pause_saturated_cores();
+    void resume_paused_cores();
 };
 
 Server *server = nullptr;
@@ -398,9 +403,7 @@ int end_headers(nghttp3_conn *, int64_t, int, void *, void *data) {
     stream->crawler_slot = crawler || bing_claim;
     stream->bing_claim = bing_claim;
     if (bing_claim) {
-        auto *s = stream->owner->server;
-        if (++s->next_crawler_slot == 0) ++s->next_crawler_slot;
-        stream->crawler_slot_id = s->next_crawler_slot;
+        stream->crawler_slot_id = ankah_frontend_next_crawler_slot_id();
     }
     stream->admitted = true;
     stream->proved = proved;
@@ -497,14 +500,7 @@ int acked_http_data(nghttp3_conn *, int64_t, uint64_t length,
         if (chunk->acknowledged == chunk->bytes.size())
             stream->response_inflight.pop_front();
     }
-    if (stream->core_open && stream->core_paused &&
-        stream->response_queued < MAX_STREAM_RESPONSE_QUEUE / 2 &&
-        stream->owner->response_queued < MAX_CONNECTION_RESPONSE_QUEUE / 2 &&
-        stream->owner->server->response_queued < MAX_GLOBAL_RESPONSE_QUEUE / 2) {
-        stream->core_paused = false;
-        uv_read_start(reinterpret_cast<uv_stream_t *>(&stream->core), allocation,
-                      core_read);
-    }
+    stream->owner->server->resume_paused_cores();
     return 0;
 }
 
@@ -536,6 +532,12 @@ int acked_quic_data(ngtcp2_conn *, int64_t id, uint64_t offset,
     return c->http ? nghttp3_conn_add_ack_offset(c->http, id, length) : 0;
 }
 
+int extend_max_stream_data(ngtcp2_conn *, int64_t, uint64_t,
+                           void *data, void *) {
+    static_cast<Connection *>(data)->unblock_streams();
+    return 0;
+}
+
 int stream_open(ngtcp2_conn *, int64_t id, void *data) {
     auto *c = static_cast<Connection *>(data);
     if (!ngtcp2_is_bidi_stream(id)) return 0;
@@ -555,6 +557,7 @@ int stream_open(ngtcp2_conn *, int64_t id, void *data) {
 int stream_close(ngtcp2_conn *, uint32_t flags, int64_t id,
                  uint64_t rx_error, uint64_t tx_error, void *data, void *) {
     auto *c = static_cast<Connection *>(data);
+    c->blocked_streams.erase(id);
     if (c->http) {
         uint32_t hflags = 0;
         if (flags & NGTCP2_STREAM_CLOSE2_FLAG_RX_APP_ERROR_CODE_SET)
@@ -635,7 +638,7 @@ void Connection::setup_http() {
         failed = true;
         return;
     }
-    nghttp3_conn_set_max_client_streams_bidi(http, MAX_STREAMS);
+    nghttp3_conn_set_max_client_streams_bidi(http, max_client_streams_bidi);
     nghttp3_conn_set_max_concurrent_streams(http, MAX_STREAMS + 8);
     int64_t control, encoder, decoder;
     if (ngtcp2_conn_open_uni_stream(quic, &control, nullptr) != 0 ||
@@ -855,6 +858,7 @@ void core_read(uv_stream_t *handle, ssize_t count, const uv_buf_t *buffer) {
                 uv_read_stop(handle);
                 stream->core_paused = true;
             }
+            stream->owner->server->pause_saturated_cores();
             stream->owner->flush();
         }
     } else if (count < 0) {
@@ -1024,10 +1028,14 @@ void Connection::flush() {
             flags, stream_id, reinterpret_cast<const ngtcp2_vec *>(vectors),
             static_cast<size_t>(vector_count), uv_hrtime());
         if (written == NGTCP2_ERR_STREAM_DATA_BLOCKED) {
-            if (http) nghttp3_conn_block_stream(http, stream_id);
+            if (http && stream_id >= 0) {
+                nghttp3_conn_block_stream(http, stream_id);
+                blocked_streams.insert(stream_id);
+            }
             continue;
         }
         if (written == NGTCP2_ERR_STREAM_SHUT_WR) {
+            blocked_streams.erase(stream_id);
             if (http) nghttp3_conn_shutdown_stream_write(http, stream_id);
             continue;
         }
@@ -1042,8 +1050,68 @@ void Connection::flush() {
     }
 }
 
+void Connection::unblock_streams() {
+    if (!http || !quic || !ngtcp2_conn_get_max_data_left2(quic)) return;
+    for (auto it = blocked_streams.begin(); it != blocked_streams.end();) {
+        if (!ngtcp2_conn_get_max_stream_data_left2(quic, *it)) {
+            ++it;
+            continue;
+        }
+        if (nghttp3_conn_unblock_stream(http, *it) != 0) {
+            failed = true;
+            return;
+        }
+        it = blocked_streams.erase(it);
+    }
+}
+
+void Server::pause_saturated_cores() {
+    const bool global_full = response_queued >=
+        MAX_GLOBAL_RESPONSE_QUEUE - MAX_GLOBAL_STREAMS * 16384;
+    for (const auto &entry : connections) {
+        auto *c = entry.get();
+        if (c->closing || c->failed ||
+            (!global_full && c->response_queued <
+             MAX_CONNECTION_RESPONSE_QUEUE - MAX_STREAMS * 16384)) continue;
+        for (const auto &item : c->streams) {
+            auto *stream = item.second.get();
+            if (!stream->core_open || !stream->core_connected ||
+                stream->core_paused ||
+                uv_is_closing(reinterpret_cast<uv_handle_t *>(&stream->core))) continue;
+            if (uv_read_stop(reinterpret_cast<uv_stream_t *>(&stream->core)) != 0) {
+                c->failed = true;
+                continue;
+            }
+            stream->core_paused = true;
+        }
+    }
+}
+
+void Server::resume_paused_cores() {
+    if (response_queued >= MAX_GLOBAL_RESPONSE_QUEUE / 2) return;
+    for (const auto &entry : connections) {
+        auto *c = entry.get();
+        if (c->closing || c->failed ||
+            c->response_queued >= MAX_CONNECTION_RESPONSE_QUEUE / 2) continue;
+        for (const auto &item : c->streams) {
+            auto *stream = item.second.get();
+            if (!stream->core_open || !stream->core_connected ||
+                !stream->core_paused ||
+                stream->response_queued >= MAX_STREAM_RESPONSE_QUEUE / 2 ||
+                uv_is_closing(reinterpret_cast<uv_handle_t *>(&stream->core))) continue;
+            if (uv_read_start(reinterpret_cast<uv_stream_t *>(&stream->core),
+                              allocation, core_read) != 0) {
+                c->failed = true;
+                continue;
+            }
+            stream->core_paused = false;
+        }
+    }
+}
+
 void Server::tick() {
     uint64_t now = uv_hrtime();
+    bool response_capacity_released = false;
     for (auto &entry : connections) {
         Connection *c = entry.get();
         if (c->failed || c->closing) { c->close(); continue; }
@@ -1056,20 +1124,33 @@ void Server::tick() {
             c->close();
             continue;
         }
-        c->flush();
-        if (ngtcp2_conn_in_draining_period2(c->quic)) c->close();
+        size_t released = 0;
         for (auto it = c->streams.begin(); it != c->streams.end();) {
             if (it->second->closed && !it->second->core_open &&
-                !it->second->writing) it = c->streams.erase(it);
+                !it->second->writing) {
+                response_capacity_released |= it->second->response_queued != 0;
+                it = c->streams.erase(it);
+                ++released;
+            }
             else ++it;
         }
+        if (released && !draining) {
+            ngtcp2_conn_extend_max_streams_bidi(c->quic, released);
+            c->max_client_streams_bidi += released;
+            if (c->http) nghttp3_conn_set_max_client_streams_bidi(
+                c->http, c->max_client_streams_bidi);
+        }
+        c->flush();
+        if (ngtcp2_conn_in_draining_period2(c->quic)) c->close();
     }
     connections.erase(std::remove_if(connections.begin(), connections.end(),
-        [this](const std::unique_ptr<Connection> &item) {
+        [this, &response_capacity_released](const std::unique_ptr<Connection> &item) {
             if (!item->closing || item->core_handles) return false;
+            response_capacity_released |= item->response_queued != 0;
             for (const auto &key : item->cids) by_cid.erase(key);
             return true;
         }), connections.end());
+    if (response_capacity_released) resume_paused_cores();
     if (draining && !drained_notified) {
         bool work = false;
         for (const auto &entry : connections)
@@ -1180,6 +1261,7 @@ void Server::receive(const sockaddr *peer, const uint8_t *data, size_t length) {
         callbacks.hp_mask = ngtcp2_crypto_hp_mask_cb;
         callbacks.recv_stream_data = receive_quic_data;
         callbacks.acked_stream_data_offset = acked_quic_data;
+        callbacks.extend_max_stream_data = extend_max_stream_data;
         callbacks.stream_open = stream_open;
         callbacks.stream_close2 = stream_close;
         callbacks.stream_reset = stream_reset;
@@ -1243,7 +1325,8 @@ void Server::receive(const sockaddr *peer, const uint8_t *data, size_t length) {
         c->failed = true;
         return;
     }
-    c->flush();
+    c->unblock_streams();
+    if (!c->failed) c->flush();
 }
 
 } // namespace

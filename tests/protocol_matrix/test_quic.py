@@ -36,6 +36,50 @@ def test_quic_independent_concurrent_streams(client, endpoint):
 
 
 @pytest.mark.quic
+def test_native_h3_reuses_more_than_32_streams(client, endpoint):
+    if endpoint["profile"] != "native" or endpoint["protocol"] != "h3":
+        pytest.skip("native HTTP/3 stream credit test")
+    requests = [("GET", f"/matrix/quic/reuse-{number}", {}, b"")
+                for number in range(40)]
+    responses = client.sequential(requests)
+    assert len(responses) == len(requests)
+    assert all(response.status == 200 for response in responses)
+
+
+@pytest.mark.quic
+def test_native_h3_resumes_flow_controlled_responses(client, endpoint):
+    if endpoint["profile"] != "native" or endpoint["protocol"] != "h3":
+        pytest.skip("native HTTP/3 response credit test")
+    response = client.sequential([("GET", "/matrix/_large", {}, b"")],
+                                 max_data=64 * 1024,
+                                 max_stream_data=32 * 1024)[0]
+    assert response.status == 200
+    assert response.body == b"x" * (3 * 1024 * 1024)
+
+
+@pytest.mark.quic
+def test_native_h3_resumes_other_streams_after_shared_queue_drains(client, endpoint):
+    if endpoint["profile"] != "native" or endpoint["protocol"] != "h3":
+        pytest.skip("native HTTP/3 shared response queue test")
+    requests = [("GET", "/matrix/_large", {}, b"") for _ in range(6)]
+    responses = client.concurrent(requests, max_data=128 * 1024,
+                                  max_stream_data=64 * 1024)
+    assert len(responses) == len(requests)
+    assert all(response.status == 200 and
+               response.body == b"x" * (3 * 1024 * 1024)
+               for response in responses)
+
+
+@pytest.mark.quic
+def test_native_h3_cancellation_releases_shared_response_capacity(client, endpoint):
+    if endpoint["profile"] != "native" or endpoint["protocol"] != "h3":
+        pytest.skip("native HTTP/3 cancellation queue test")
+    response = client.cancel_queued_responses()
+    assert response.status == 200
+    assert response.body == b"survivor"
+
+
+@pytest.mark.quic
 def test_native_h3_upload_windows_and_unknown_length_limit(client, endpoint):
     if endpoint["profile"] != "native" or endpoint["protocol"] != "h3":
         pytest.skip("native HTTP/3 upload flow control test")

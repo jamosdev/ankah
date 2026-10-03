@@ -138,8 +138,8 @@ def main(binary, assets):
             result = [None]
             raw(gate, b"POST /upload HTTP/1.1\r\nHost: localhost:PORT\r\n"
                 b"Content-Length: 100\r\n\r\n", result, 0)
-            assert result[0].startswith(b"HTTP/1.1 429") and \
-                   b"Retry-After: 1" in result[0] and \
+            assert result[0].startswith(b"HTTP/1.1 403") and \
+                   b"Retry-After: 600" in result[0] and \
                    b"Ankah-Proxy-Action" not in result[0], result[0]
         finally:
             process.terminate()

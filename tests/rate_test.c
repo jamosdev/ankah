@@ -7,11 +7,56 @@
 #include <stdio.h>
 
 static rate_limit anonymous_limit, protected_limit, client_limit;
+static rate_limit crawler_global_limit, crawler_client_limit;
+
+static void check_crawler_budget(void) {
+    const uint64_t now = UINT64_C(1000000000);
+    const uint64_t half_second = UINT64_C(500000000);
+    char peer[64];
+    unsigned int i;
+
+    /* Distinct callers exhaust the shared ten-request burst, even though
+     * each caller still has capacity. Two tokens per second restore one
+     * request after half a second. Rejections must not spend that refill. */
+    for (i = 0; i < 10; ++i) {
+        snprintf(peer, sizeof(peer), "crawler-%u", i);
+        assert(ankah_rate_allow(&crawler_global_limit, peer, now, 10, 2, 10, 2) == 0);
+    }
+    assert(ankah_rate_allow(&crawler_global_limit, "next", now, 10, 2, 10, 2) == 2);
+    assert(ankah_rate_allow(&crawler_global_limit, "next", now + half_second / 2,
+                            10, 2, 10, 2) == 2);
+    assert(ankah_rate_allow(&crawler_global_limit, "next", now + half_second,
+                            10, 2, 10, 2) == 0);
+    assert(ankah_rate_allow(&crawler_global_limit, "next", now + half_second,
+                            10, 2, 10, 2) == 2);
+
+    /* A single caller also has a ten-request burst and the same refill. */
+    for (i = 0; i < 10; ++i)
+        assert(ankah_rate_allow(&crawler_client_limit, "one", now, 10, 2, 10, 2) == 0);
+    assert(ankah_rate_allow(&crawler_client_limit, "one", now, 10, 2, 10, 2) == 1);
+    assert(ankah_rate_allow(&crawler_client_limit, "one", now + half_second / 2,
+                            10, 2, 10, 2) == 1);
+    assert(ankah_rate_allow(&crawler_client_limit, "one", now + half_second,
+                            10, 2, 10, 2) == 0);
+    assert(ankah_rate_allow(&crawler_client_limit, "one", now + half_second,
+                            10, 2, 10, 2) == 1);
+
+    /* Idle time cannot grow either burst beyond ten requests. */
+    for (i = 0; i < 10; ++i)
+        assert(ankah_rate_allow(&crawler_client_limit, "one", now + 100 * half_second,
+                                10, 2, 10, 2) == 0);
+    assert(ankah_rate_allow(&crawler_client_limit, "one", now + 100 * half_second,
+                            10, 2, 10, 2) == 1);
+    assert(ankah_rate_allow(&crawler_client_limit, "other", now + 100 * half_second,
+                            10, 2, 10, 2) == 2);
+}
 
 int main(void) {
     const uint64_t now = UINT64_C(1000000000);
     char peer[64];
     unsigned int i;
+
+    check_crawler_budget();
 
     for (i = 0; i < 200; ++i) {
         snprintf(peer, sizeof(peer), "anonymous-%u", i / 40);

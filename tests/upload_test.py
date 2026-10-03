@@ -219,8 +219,12 @@ def main():
             sized_port: ["--allow-prefix", "/upload", "--max-upload-mb", "32"],
             capped_port: ["--allow-prefix", "/upload", "--max-upload-mb", "0"],
         }
+        # Independent gateways must not race over default credentials or state.
+        workdirs = {listen: pathlib.Path(temp) / str(listen) for listen in gateways}
+        for directory in workdirs.values():
+            directory.mkdir()
         processes = [subprocess.Popen(gateway_command(executable, arguments(listen, *extra)),
-                                      stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+                                      cwd=workdirs[listen], stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
                      for listen, extra in gateways.items()]
         try:
             for listen in gateways:

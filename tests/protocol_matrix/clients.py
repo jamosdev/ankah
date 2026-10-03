@@ -19,6 +19,7 @@ from aioquic.quic.events import ConnectionTerminated, ProtocolNegotiated, Stream
 
 H3_NO_APPLICATION_PROTOCOL = 0x178
 QUIC_INTERNAL_ERROR = 0x1
+H3_REQUEST_CANCELLED = 0x10c
 
 
 class H3NegotiationUnavailable(ConnectionError):
@@ -116,6 +117,7 @@ class H3Protocol(QuicConnectionProtocol):
             response = self.responses[stream_id]
             if isinstance(http_event, HeadersReceived):
                 response["headers"].extend(http_event.headers)
+                response["headers_received"].set()
             elif isinstance(http_event, DataReceived):
                 response["body"].extend(http_event.data)
             if getattr(http_event, "stream_ended", False):
@@ -128,7 +130,7 @@ class H3Protocol(QuicConnectionProtocol):
                 waiter.set_exception(error)
         self.waiters.clear()
 
-    async def request(self, method, scheme, authority, path, headers=None, content=b""):
+    def start_request(self, method, scheme, authority, path, headers=None, content=b""):
         if self.http is None or self.alpn not in H3_ALPN:
             raise ConnectionError("HTTP/3 ALPN was not negotiated")
         stream_id = self._quic.get_next_available_stream_id()
@@ -138,6 +140,7 @@ class H3Protocol(QuicConnectionProtocol):
         self.responses[stream_id] = {
             "method": method,
             "headers": [],
+            "headers_received": asyncio.Event(),
             "body": bytearray(),
         }
         if method == "HEAD":
@@ -157,6 +160,11 @@ class H3Protocol(QuicConnectionProtocol):
             self.http.send_data(stream_id=stream_id, data=bytes(chunk),
                                 end_stream=index + 1 == len(chunks))
         self.transmit()
+        return stream_id, waiter
+
+    async def request(self, method, scheme, authority, path, headers=None, content=b""):
+        _, waiter = self.start_request(method, scheme, authority, path,
+                                       headers, content)
         return await asyncio.wait_for(waiter, timeout=20)
 
 
@@ -174,12 +182,17 @@ def _h3_negotiation_unavailable(protocol):
             termination.reason_phrase == "Idle timeout")
 
 
-async def _h3_requests(base_url, ca_file, requests):
+async def _h3_requests(base_url, ca_file, requests, sequential=False,
+                       max_data=None, max_stream_data=None):
     split = urlsplit(base_url)
     host = split.hostname
     port = split.port or 443
     configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
     configuration.idle_timeout = 10.0
+    if max_data is not None:
+        configuration.max_data = max_data
+    if max_stream_data is not None:
+        configuration.max_stream_data = max_stream_data
     configuration.load_verify_locations(ca_file)
     configuration.server_name = host
     created = []
@@ -196,10 +209,15 @@ async def _h3_requests(base_url, ca_file, requests):
             if protocol.alpn not in H3_ALPN:
                 raise H3NegotiationUnavailable(
                     f"HTTP/3 ALPN was not negotiated, selected {protocol.alpn!r}")
-            tasks = [protocol.request(method, split.scheme, split.netloc, path,
-                                      headers, content)
-                     for method, path, headers, content in requests]
-            raw = await asyncio.gather(*tasks)
+            if sequential:
+                raw = [await protocol.request(method, split.scheme, split.netloc,
+                                              path, headers, content)
+                       for method, path, headers, content in requests]
+            else:
+                tasks = [protocol.request(method, split.scheme, split.netloc, path,
+                                          headers, content)
+                         for method, path, headers, content in requests]
+                raw = await asyncio.gather(*tasks)
     except ConnectionError as error:
         protocol = created[0] if created else None
         if not isinstance(error, H3NegotiationUnavailable) and \
@@ -219,6 +237,43 @@ async def _h3_requests(base_url, ca_file, requests):
         return output
 
 
+async def _h3_cancel_queued_responses(base_url, ca_file):
+    split = urlsplit(base_url)
+    configuration = QuicConfiguration(is_client=True, alpn_protocols=H3_ALPN)
+    configuration.max_data = 128 * 1024
+    configuration.max_stream_data = 64 * 1024
+    configuration.load_verify_locations(ca_file)
+    configuration.server_name = split.hostname
+    async with connect(split.hostname, split.port or 443,
+                       configuration=configuration,
+                       create_protocol=H3Protocol,
+                       wait_connected=True) as protocol:
+        survivor_id, survivor = protocol.start_request(
+            "GET", split.scheme, split.netloc, "/matrix/_delayed_body")
+        await asyncio.wait_for(
+            protocol.responses[survivor_id]["headers_received"].wait(), 10)
+        protocol._transport.pause_reading()
+        try:
+            canceled = [protocol.start_request(
+                "GET", split.scheme, split.netloc, "/matrix/_large")
+                for _ in range(4)]
+            await asyncio.sleep(0.75)
+            for stream_id, waiter in canceled:
+                protocol._quic.stop_stream(stream_id, H3_REQUEST_CANCELLED)
+                protocol._quic.reset_stream(stream_id, H3_REQUEST_CANCELLED)
+                protocol.waiters.pop(stream_id, None)
+                protocol.responses.pop(stream_id, None)
+                waiter.cancel()
+            protocol.transmit()
+            await asyncio.sleep(1.5)
+        finally:
+            protocol._transport.resume_reading()
+        raw = await asyncio.wait_for(survivor, 10)
+        headers = _headers(raw["headers"])
+        return Response(int(headers.pop(":status")), headers,
+                        bytes(raw["body"]), "HTTP/3")
+
+
 class H3Client:
     def __init__(self, base_url, ca_file):
         self.base_url = base_url.rstrip("/")
@@ -231,8 +286,18 @@ class H3Client:
         return asyncio.run(_h3_requests(self.base_url, self.ca_file,
                            [(method, path, headers or {}, content or b"")]))[0]
 
-    def concurrent(self, requests):
-        return asyncio.run(_h3_requests(self.base_url, self.ca_file, requests))
+    def concurrent(self, requests, max_data=None, max_stream_data=None):
+        return asyncio.run(_h3_requests(self.base_url, self.ca_file, requests,
+                           max_data=max_data, max_stream_data=max_stream_data))
+
+    def sequential(self, requests, max_data=None, max_stream_data=None):
+        return asyncio.run(_h3_requests(self.base_url, self.ca_file, requests,
+                           sequential=True, max_data=max_data,
+                           max_stream_data=max_stream_data))
+
+    def cancel_queued_responses(self):
+        return asyncio.run(_h3_cancel_queued_responses(self.base_url,
+                                                       self.ca_file))
 
 
 def client_for(base_url, protocol, ca_file):
@@ -315,7 +380,8 @@ def raw_h1_request(base_url, ca_file, head, body=b"", wait_for_continue=False):
                     raise AssertionError(f"expected 100 Continue, got {buffered!r}")
             stream.sendall(body)
             header = _read_header(stream)
-            while header.startswith(b"HTTP/1.1 100 "):
+            while (header.startswith(b"HTTP/1.1 1") and
+                   header[10:12].isdigit()):
                 header = _read_header(stream)
             status_line, *lines = header[:-4].split(b"\r\n")
             status = int(status_line.split(b" ", 2)[1])

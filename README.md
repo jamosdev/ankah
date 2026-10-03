@@ -10,9 +10,15 @@ A solution had to be found, but existing projects were too much work for too lit
 gain. Now Ankah protects your site from becoming overloaded by bots. It can be used
 equally well by those who run a VPS, and those who are using docker containers.
 
-The mascot image can be overriden easily by changing a single .png on disk or in
-the Docker image. By default, you can also change the mascot image live at runtime
-without restarting so long as you configure bearer token security or a [TOTP](https://en.wikipedia.org/wiki/Time-based_one-time_password) key.
+The challenge page displays the mascot prominently. Replace it from the
+[dashboard](docs/dashboard.md) by choosing a PNG, JPEG, or WebP image and saving
+it; new challenge pages show the change without a restart. The dashboard is at
+`/ankah-admin/` by default and needs its generated token or authenticator
+sign-in. The uploaded image is saved to
+`ankah.mascot.png` in the working directory, or to `--mascot-file path` when
+configured. The destination must be writable. You can also replace
+`assets/ankah.png` with a PNG and restart Ankah. A dashboard upload takes
+precedence until you choose **Restore default** in the dashboard.
 
 This open-source lightweight web firewall will protect small websites and servers
 from aggressive AI scraper bots and automated traffic overload. It can also help
@@ -41,7 +47,7 @@ Nginx or an external storage service like Amazon S3.
     filtering [RFC 8783](https://www.rfc-editor.org/rfc/rfc8783.html), which lets an upstream filtering point block repeat flooders before
     they reach your server. See [DOTS data-channel filtering](docs/dots.md) and the
     [worked example](examples/dots-benchmark/README.md).
-  - The mascot image can be customised with a single Dockerfile line when deploying.
+  - The challenge mascot can be changed from the dashboard or customised with a single Dockerfile line when deploying.
 
 Ankah's low RAM usage is beneficial for those hosting on low end boxes, the kind of
 hardware which is most affected by AI scanners, bot floods, and automated spam scripts.
@@ -141,7 +147,10 @@ Saved POST bodies are limited to 2 MiB each and 64 MiB for the server in total.
 user who hasn't completed the proof of work challenge, and gets greeted with
 the challenge page to prove themselves while Ankah holds onto their submitted
 data before forwarding the original POST to the destination web application
-once they successfully verify**. No files are spooled to disk.
+once they successfully verify**. The receiving gateway keeps an unsolved POST
+locally; linked peers receive its saved request only after proof and only when
+the browser continues on another gateway. Session snapshots are enabled by
+default and can contain saved POST bodies.
 This will almost never happen to a normal user because how could someone even
 get to the point of uploading a file (or posting a form) without having to have
 loaded the website (and get challenged) to begin with? If the POST data is
@@ -149,7 +158,10 @@ abandoned then an unsolved session expires after five minutes, a solved but
 unsent session after thirty. Normal posts go straight through in a streaming
 manner and never enter into these buffer limits.
 
-A process restart clears sessions and saved requests. A blocked POST larger
+Session snapshots restore recent sessions and saved requests after a restart.
+Snapshots are scheduled every 30 seconds and on clean shutdown. A sudden stop
+can lose requests created since the last durable snapshot, and slow storage can
+extend that window. A blocked POST larger
 than 2 MiB, or a blocked request with a method other than GET or POST, is refused
 with a link to the unlock page: a browser that accepts HTML gets a small page with
 an Unlock link, curl and Wget get the terminal solver instructions, and other
@@ -213,6 +225,67 @@ produces a runtime package containing the executable and browser assets. See
 Linux and macOS release packaging is described in
 [release packages](docs/release-packages.md).
 
+### Test isolation and timing
+
+Keep independent admission scenarios in separate gateway processes. A crawler
+request finishing releases the one concurrency slot; it does not restore a
+rate token. The crawler bucket starts with ten tokens and refills at two per
+second. Some paths charge rate admission before checking crawler contention,
+so a rejected attempt may still consume a token. Count all requests and retry
+probes in a scenario against the initial burst, assuming no time has passed.
+Adding a scenario to an existing process can invalidate earlier budget counts.
+
+Test token exhaustion and refill with explicit timestamps in
+`tests/rate_test.c`. Use events or bounded polling for asynchronous completion,
+with every probe included in the request budget. Sleeps and retries until a
+test passes can hide accidental dependence on refill.
+
+Check the status and rejection reason together. Direct HTTP/1 and HTTP/2
+distinguish `Crawler concurrency exceeded` from `Rate limit exceeded`; TLS
+HTTP/1 currently returns `Rate limit exceeded` for both. For that path, use a
+held upstream request and a fresh, bounded request budget to establish
+contention. Keep status, headers, and a bounded body sample in assertion
+diagnostics. A response length alone does not establish success.
+
+Every gateway fixture should place session, statistics, secret, and dashboard
+token files in its temporary directory, or disable persistence when it is not
+under test. Reuse paths only for intentional restart/recovery tests. CTest also
+runs each Python integration test in a fresh temporary working directory via
+`tests/process_support.py`, preventing default `ankah.sessions.*` and
+`ankah.stats.*` files from leaking between test runs. To get the same isolation
+when running a test directly, pass absolute script and executable paths:
+
+```sh
+python3 tests/process_support.py "$PWD/tests/admission_test.py" \
+  "$PWD/build/ankah" "$PWD/build/libankah-crawler-dns-fixture.so"
+```
+
+The DNS fixture argument is for a dynamically linked Linux build. It uses
+`LD_PRELOAD`; a static executable cannot load it. macOS and Windows run the
+admission suite without that argument and omit verified-Bing fixture cases.
+Linux static packaging currently excludes the admission test, so keep the
+dynamic Linux CI job as a required check.
+
+For timing-sensitive changes, use an unused build directory with an explicit
+build type, then repeat the focused tests. With the build prerequisites above:
+
+```sh
+cmake -S . -B build-release-check -DCMAKE_BUILD_TYPE=Release \
+  -DANKAH_STRICT_WARNINGS=ON
+cmake --build build-release-check --parallel 2
+ctest --test-dir build-release-check --output-on-failure --timeout 180
+ctest --test-dir build-release-check --output-on-failure --timeout 180 \
+  -R '^(rate|admission)$' --repeat until-fail:5
+```
+
+GitLab tests Debug and Release builds on Linux and repeats the Release rate
+and admission tests. Check that environment as well as the development host
+before publishing. Repetition helps expose timing dependencies; fixed time and
+isolated state are what remove them. Preserve the first failure, its command,
+commit, build configuration, executable hash, and response diagnostics. A
+later pass or an identical executable does not identify which host difference
+affected timing without measurements.
+
 ## Local example
 
 Create a private 32-byte secret as 64 lowercase hexadecimal characters:
@@ -246,7 +319,8 @@ allow-prefix=/assets/
 Configuration is applied in this order: built-in defaults, the file named by
 `--config`, process environment variables, and command-line options. A scalar
 value in a later layer replaces an earlier value. Repeated `allow-prefix`,
-`trusted-proxy`, and `static-throttle-prefix` values accumulate across layers.
+`trusted-proxy`, `static-throttle-prefix`, and `ankah-link` values accumulate
+across layers.
 No file is read unless `--config path` is present.
 
 File keys are the long command-line names without `--`. Blank lines and lines
@@ -261,9 +335,9 @@ Each option also has an environment variable formed by changing its name to
 uppercase, replacing hyphens with underscores, and adding `ANKAH_`. For
 example, `public-origin` is `ANKAH_PUBLIC_ORIGIN`. The health variables use the
 shorter names `ANKAH_HEALTHZ`, `ANKAH_LIVEZ`, and `ANKAH_READYZ`. An environment
-variable supplies one occurrence of a repeated option. `no-stats-file` accepts
-`true`, `false`, `1`, or `0` in the file and environment; the command-line
-`--no-stats-file` form means `true`.
+variable supplies one occurrence of a repeated option. `no-stats-file` and
+`no-session-state-file` accept `true`, `false`, `1`, or `0` in the file and
+environment; their command-line forms mean `true`.
 
 `--allow-prefix /path` exempts a path prefix from the challenge. Use a distinct
 secret for each deployment. The upstream address must be reachable only by
@@ -344,12 +418,15 @@ drain; `docker kill` bypasses it.
 For direct TLS, HTTP/2, HTTP/3, certificate reload, IPv6 address syntax, and proxy
 configuration, see [TLS and proxy configuration](docs/tls-and-proxies.md).
 
-`--dashboard-listen` or `--dashboard-public-route=/ankah-admin/`, together
-with `--dashboard-token-file`, enables traffic statistics with hourly history
+The dashboard is on at `/ankah-admin/` by default, with a generated token in
+`ankah.dashboard.token`. `--dashboard-listen` selects a private listener instead;
+`--dashboard-public-route` selects another public route. `--no-dashboard` turns
+off access and collection from startup. Traffic statistics have hourly history
 for 30 days and daily history for about 11 years in a fixed 1.2 MiB store. The
 dashboard serves throughput, connections, resource limits and challenge
 outcomes. Statistics are saved to bounded snapshots in the working directory
-by default. See the [operator dashboard](docs/dashboard.md).
+by default. Signed-in users can turn off the dashboard and its counters until
+restart. See the [operator dashboard](docs/dashboard.md).
 
 For public gateway health overrides, Prometheus scraping, application and
 static asset checks, and a standalone Uptime Kuma example, see
@@ -360,9 +437,12 @@ static asset checks, and a standalone Uptime Kuma example, see
 See [out-of-scope features](docs/limitations.md) for features Ankah will not
 implement.
 
-## Ankah link
-multiple instances of Ankah can be linked with each other using "Ankah link" which
-results in shared client block/pass state, and allows state restore on node fail-over.
+## Linked gateways
+
+Multiple gateways can share solved sessions and temporary client blocks through
+authenticated links. Each gateway still checks browser sessions and signed
+passes locally. See [linked gateway configuration](docs/gateway-links.md) for
+mesh setup, POST continuation, and session storage.
 
 ![Port 41113 belongs to Ankah who defends your docker instances from spam](41113-artist.jpg)
 
@@ -581,3 +661,7 @@ go-dots is distributed under the Apache 2.0 license:
 >      of your accepting any such warranty or additional liability.
 >
 >   END OF TERMS AND CONDITIONS
+
+
+Additional exact-route TLS hosts, per-host certificates, Unix upstreams and
+streaming limits are described in [virtual hosts](docs/virtual-hosts.md).

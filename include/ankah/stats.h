@@ -86,6 +86,7 @@ void ankah_text_u64(ankah_text *text, uint64_t value);
 
 /* Times are whole seconds since the Unix epoch. Buckets are UTC hours and days. */
 void ankah_stats_init(uint64_t wall);
+void ankah_stats_disable(void);
 void ankah_stats_add(unsigned int field, uint64_t amount);
 void ankah_stats_max(unsigned int field, uint64_t value);
 void ankah_stats_roll(uint64_t wall);
@@ -96,6 +97,8 @@ void ankah_stats_roll(uint64_t wall);
 int ankah_stats_restore(const char *path, uint64_t wall);
 /* Writes the next generation through PATH.tmp into the older snapshot slot. */
 int ankah_stats_save(const char *path, uint64_t wall);
+/* Builds a detached snapshot. The caller owns the returned buffer. */
+unsigned char *ankah_stats_snapshot(uint64_t wall, size_t *size, uint64_t *generation);
 
 const char *ankah_stat_name(unsigned int field);
 int ankah_stat_is_max(unsigned int field);

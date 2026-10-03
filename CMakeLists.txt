@@ -265,7 +265,9 @@ else()
   set(ANKAH_LIBUV ${LIBUV_LIBRARY})
 endif()
 add_executable(ankah src/main.c src/rate.c src/crawler.c src/static.c src/session.c src/files.c
-  src/proxy.c src/frontend.c src/h3_frontend.cpp src/stats.c src/abuse_policy.c
+  src/disk_writer.c
+  src/link.c
+  src/proxy.c src/host.c src/frontend.c src/h3_frontend.cpp src/stats.c src/abuse_policy.c
   src/dots.c src/dots_policy.c)
 add_dependencies(ankah ankah_ngtcp2 ankah_nghttp3)
 target_include_directories(ankah PRIVATE
@@ -294,6 +296,14 @@ target_link_libraries(ankah PRIVATE ankah_http ankah_pow ankah_qr ${ANKAH_LIBUV}
   ${ANKAH_AWS_SSL} ${ANKAH_AWS_CRYPTO})
 if(WIN32)
   target_link_libraries(ankah PRIVATE ws2_32 bcrypt crypt32 winpthread)
+  if(MINGW)
+    # Select C99 printf semantics even when the target defaults to MSVCRT.
+    target_compile_definitions(ankah PRIVATE __USE_MINGW_ANSI_STDIO=1)
+    # Use the MinGW header's GNU format annotations, not GCC's MSVCRT builtins.
+    # Format/type warnings remain enabled on the annotated declarations.
+    target_compile_options(ankah PRIVATE -fno-builtin-printf -fno-builtin-fprintf
+      -fno-builtin-snprintf -fno-builtin-vsnprintf)
+  endif()
   target_link_options(ankah PRIVATE -static -static-libgcc -static-libstdc++)
 endif()
 if(ANKAH_STATIC_LINUX)
@@ -312,8 +322,22 @@ target_link_libraries(ankah-header-names PRIVATE ankah_header_names)
 add_executable(ankah-language tests/language_test.c)
 target_include_directories(ankah-language PRIVATE src)
 target_link_libraries(ankah-language PRIVATE ankah_language)
-add_executable(ankah-session tests/session_test.c src/session.c)
+add_executable(ankah-session tests/session_test.c src/session.c src/files.c)
 target_link_libraries(ankah-session PRIVATE ankah_pow)
+if(UNIX)
+  add_executable(ankah-storage tests/storage_test.c src/disk_writer.c
+    src/session.c src/files.c)
+  target_include_directories(ankah-storage PRIVATE src)
+  target_compile_definitions(ankah-storage PRIVATE _POSIX_C_SOURCE=200809L
+    ANKAH_STORAGE_TEST)
+  target_link_libraries(ankah-storage PRIVATE ankah_pow ${ANKAH_LIBUV})
+  if(NOT ANKAH_BUNDLED_RUNTIME_DEPS)
+    target_include_directories(ankah-storage PRIVATE ${LIBUV_INCLUDE_DIR})
+  endif()
+endif()
+if(UNIX)
+  target_compile_definitions(ankah-session PRIVATE _POSIX_C_SOURCE=200809L)
+endif()
 add_executable(ankah-rate tests/rate_test.c src/rate.c)
 target_include_directories(ankah-rate PRIVATE src)
 add_executable(ankah-stats tests/stats_test.c src/stats.c src/files.c)
@@ -339,6 +363,9 @@ set(ANKAH_PROJECT_TARGETS ankah ankah-pow ankah-http ankah-session ankah-rate an
   ankah-upload-policy ankah-dots-policy
   ankah-stats ankah-header-names ankah-language ankah_qr ankah_pow ankah_http
   ankah_header_names ankah_language)
+if(UNIX)
+  list(APPEND ANKAH_PROJECT_TARGETS ankah-storage)
+endif()
 if(ANKAH_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
   foreach(target IN LISTS ANKAH_PROJECT_TARGETS)
     target_compile_options(${target} PRIVATE -Wall -Wextra -Wpedantic -Werror)
@@ -356,6 +383,11 @@ add_test(NAME http COMMAND ankah-http)
 add_test(NAME header_names COMMAND ankah-header-names)
 add_test(NAME language COMMAND ankah-language)
 add_test(NAME session COMMAND ankah-session)
+if(UNIX)
+  foreach(case building queued pending priority snapshot-sync journal-sync repair oversized cap unknown-slot append-poison)
+    add_test(NAME storage_${case} COMMAND ankah-storage ${case})
+  endforeach()
+endif()
 add_test(NAME rate COMMAND ankah-rate)
 add_test(NAME proxy COMMAND ankah-proxy)
 add_test(NAME upload_policy COMMAND ankah-upload-policy)
@@ -366,6 +398,8 @@ if(NOT Python3_Interpreter_FOUND)
   find_package(Python3 COMPONENTS Interpreter)
 endif()
 if(Python3_Interpreter_FOUND)
+  set(ANKAH_PYTHON_TEST_COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/process_support.py)
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_library(ankah-crawler-dns-fixture SHARED tests/crawler_dns_fixture.c)
     target_link_libraries(ankah-crawler-dns-fixture PRIVATE ${CMAKE_DL_LIBS})
@@ -373,55 +407,58 @@ if(Python3_Interpreter_FOUND)
   else()
     set(ANKAH_CRAWLER_DNS_FIXTURE "")
   endif()
-  add_test(NAME admission COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME admission COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/admission_test.py
     $<TARGET_FILE:ankah> ${ANKAH_CRAWLER_DNS_FIXTURE})
-  add_test(NAME cache COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME cache COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/cache_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME static COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME static COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/static_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR}/build_static_bundle.py
     ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME continuation COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME continuation COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/continuation_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME platform COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME links COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/link_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME platform COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/platform_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME tls_http2 COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME tls_http2 COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/tls_http2_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME dashboard COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME dashboard COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/dashboard_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME health COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME health COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/health_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR}/build_static_bundle.py
     ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME language_integration COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME language_integration COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/language_integration_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME upload COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME upload COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/upload_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME tus COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME tus COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/tus_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME shutdown COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME shutdown COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/shutdown_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME abuse_integration COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME abuse_integration COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/abuse_integration_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME dots_integration COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME dots_integration COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/dots_integration_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
-  add_test(NAME configuration COMMAND ${Python3_EXECUTABLE}
+  add_test(NAME configuration COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/configuration_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
   if(CMAKE_CROSSCOMPILING)
-    set_tests_properties(admission cache static continuation platform tls_http2 dashboard health
+    set_tests_properties(admission cache static continuation links platform tls_http2 dashboard health
       language_integration upload tus shutdown abuse_integration dots_integration configuration PROPERTIES
       ENVIRONMENT "ANKAH_TEST_RUNNER=${ANKAH_TEST_RUNNER};ANKAH_TEST_WINDOWS_PATHS=1")
   endif()
@@ -492,4 +529,33 @@ if(ANKAH_BUNDLED_RUNTIME_DEPS)
   install(FILES
     ${libuv_SOURCE_DIR}/LICENSE-extra
     DESTINATION notices RENAME libuv-LICENSE-extra.txt COMPONENT ankah_runtime)
+endif()
+
+if(NOT WIN32)
+  add_test(NAME virtual_hosts COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/virtual_host_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
+  set_tests_properties(virtual_hosts PROPERTIES TIMEOUT 180)
+endif()
+
+if(WIN32)
+  add_executable(ankah-windows-process tests/windows_process.c)
+  target_link_options(ankah-windows-process PRIVATE -static)
+  add_executable(ankah-private-file tests/private_file_test.c src/files.c)
+  target_include_directories(ankah-private-file PRIVATE include)
+  target_link_libraries(ankah-private-file PRIVATE advapi32)
+  foreach(target ankah ankah-session ankah-stats)
+    target_link_libraries(${target} PRIVATE advapi32)
+  endforeach()
+endif()
+
+add_executable(ankah-host-policy tests/host_policy_test.c src/host.c)
+target_include_directories(ankah-host-policy PRIVATE include)
+add_test(NAME host_policy COMMAND ankah-host-policy)
+
+if(NOT WIN32)
+  add_test(NAME gateway_real_deadlines COMMAND ${Python3_EXECUTABLE}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/virtual_host_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR} Gateway.real_upload_processing)
+  set_tests_properties(gateway_real_deadlines PROPERTIES TIMEOUT 140)
 endif()

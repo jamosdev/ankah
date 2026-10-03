@@ -15,5 +15,13 @@ void ankah_file_unmap(unsigned char *data, size_t size);
 /* Flushes temp_path and atomically replaces target_path with it. */
 int ankah_file_replace(const char *temp_path, const char *target_path,
                        const unsigned char *data, size_t size);
+#ifdef _WIN32
+/* Restrict a newly created, still empty file to its owner. */
+int ankah_file_private_descriptor(int descriptor);
+int ankah_file_private_check(const char *path);
+#endif
+#ifdef ANKAH_STORAGE_TEST
+void ankah_file_test_fail_parent_sync_once(const char *suffix);
+#endif
 
 #endif

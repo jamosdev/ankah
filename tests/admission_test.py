@@ -1,5 +1,6 @@
 """Check that unproved traffic cannot spend proved request capacity."""
 
+from contextlib import contextmanager
 import hashlib
 import http.client
 import http.server
@@ -14,8 +15,51 @@ import tempfile
 import threading
 import time
 
-from http2_client import Client as Http2Client
+from http2_client import Client as Http2Client, DATA
 from process_support import gateway_command
+
+
+class AdmissionHttp2Client(Http2Client):
+    """Keep small response samples without buffering arbitrary response bodies."""
+
+    def __init__(self, *args):
+        self.response_bodies = {}
+        super().__init__(*args)
+
+    def process_frame(self, kind, flags, stream_id, payload):
+        if kind == DATA:
+            body = self.response_bodies.get(stream_id, b"")
+            self.response_bodies[stream_id] = body + payload[:256 - len(body)]
+        return super().process_frame(kind, flags, stream_id, payload)
+
+    def diagnostic(self, stream_id):
+        return (self.response_status.get(stream_id),
+                self.response_headers.get(stream_id),
+                self.received.get(stream_id), self.response_bodies.get(stream_id))
+
+    def assert_ok(self, stream_id):
+        diagnostic = self.diagnostic(stream_id)
+        assert self.response_status.get(stream_id) == b"200", diagnostic
+        assert self.received.get(stream_id) == 2, diagnostic
+        assert self.response_bodies.get(stream_id) == b"ok", diagnostic
+
+    def assert_rejected(self, stream_id, status, body):
+        diagnostic = self.diagnostic(stream_id)
+        assert self.response_status.get(stream_id) == status, diagnostic
+        assert self.response_bodies.get(stream_id) == body, diagnostic
+
+
+def assert_ok(result):
+    assert result[0] == 200 and result[2] == b"ok", result
+
+
+def assert_crawler_busy(result, tls):
+    status, headers, body = result
+    assert status == 429 and headers.get("Retry-After") == "1", result
+    # TLS HTTP/1 currently uses the same body for both rejection causes.
+    # Its callers must stay within the initial burst even without any refill.
+    expected = b"Rate limit exceeded\n" if tls else b"Crawler concurrency exceeded\n"
+    assert body == expected, result
 
 
 def port():
@@ -35,14 +79,20 @@ def solve(challenge):
 
 
 def run_gateway(executable, root, app_port, tls=False):
+    root = pathlib.Path(tempfile.mkdtemp(dir=root))
     gate_port = port()
     secret = root / "secret"
     secret.write_text("a" * 64)
+    (root / "dashboard-token").write_text("b" * 64)
     options = ["--listen", f"127.0.0.1:{gate_port}",
                "--upstream", f"127.0.0.1:{app_port}",
                "--public-origin", f"{'https' if tls else 'http'}://localhost:{gate_port}",
                "--secret-file", str(secret), "--assets-dir", str(pathlib.Path(__file__).parent.parent),
-               "--allow-prefix", "/public", "--trusted-proxy", "127.0.0.1/32"]
+               "--allow-prefix", "/public", "--trusted-proxy", "127.0.0.1/32",
+               "--proxy-abuse-profile=off",
+               "--dashboard-token-file", str(root / "dashboard-token"),
+               "--session-state-file", str(root / "sessions"),
+               "--stats-file", str(root / "stats")]
     if tls:
         cert, key = root / "cert.pem", root / "key.pem"
         subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048",
@@ -58,7 +108,8 @@ def run_gateway(executable, root, app_port, tls=False):
     return gate_port, process
 
 
-def check_gateway(executable, root, app_port, tls):
+@contextmanager
+def gateway(executable, root, app_port, tls):
     gate_port, process = run_gateway(executable, root, app_port, tls)
     context = ssl._create_unverified_context() if tls else None
 
@@ -75,15 +126,6 @@ def check_gateway(executable, root, app_port, tls):
         client.close()
         return result
 
-    def known_crawler_can_enter(peer):
-        for _ in range(100):
-            result = request("/private", headers={"X-Forwarded-For": peer})
-            if result[0] == 200:
-                return
-            assert result[0] == 429, result
-            time.sleep(.05)
-        raise AssertionError("known crawler could not acquire the released slot")
-
     try:
         for _ in range(250):
             if process.poll() is not None:
@@ -96,6 +138,59 @@ def check_gateway(executable, root, app_port, tls):
         else:
             raise AssertionError("gateway did not start")
 
+        yield gate_port, request, context
+    except BaseException:
+        # Preserve the child exit status before cleanup can replace it.
+        status = process.poll()
+        if status is not None:
+            diagnostic = process.stderr.read(8192).decode(errors="replace")
+            print(f"gateway exited before cleanup: {status}; stderr={diagnostic!r}", file=sys.stderr)
+        else:
+            print("gateway still running at test failure", file=sys.stderr)
+        raise
+    finally:
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+        process.stderr.close()
+
+
+def known_crawler_can_enter(request, peer, tls):
+    # Each probe can spend a token even when the slot is busy. Together with
+    # the other requests in check_gateway, two calls use at most ten tokens.
+    for attempt in range(3):
+        result = request("/private", headers={"X-Forwarded-For": peer})
+        if result[0] == 200:
+            assert_ok(result)
+            return
+        assert_crawler_busy(result, tls)
+        if attempt < 2:
+            time.sleep(.25)
+    raise AssertionError(("known crawler could not acquire the released slot", result))
+
+
+def prove(request):
+    status, headers, page = request("/private")
+    assert status == 428, status
+    sid = re.search(rb"data-session='([^']+)'", page).group(1).decode()
+    challenge = re.search(rb"data-challenge='([^']+)'", page).group(1).decode()
+    answer = solve(challenge)
+    cookie = headers["Set-Cookie"].split(";", 1)[0]
+    assert request(f"/ankah/answer/{sid}?answer={answer}", "POST")[0] == 200
+    pass_status, pass_headers, _ = request(
+        f"/ankah/open?challenge={challenge}&answer={answer}", "POST")
+    assert pass_status == 200
+    pass_cookie = pass_headers["Set-Cookie"].split(";", 1)[0]
+    assert request("/private", headers={"Cookie": cookie})[0] == 200
+
+    return cookie, pass_cookie
+
+
+def check_google_crawlers(executable, root, app_port, tls):
+    with gateway(executable, root, app_port, tls) as (gate_port, request, _):
         hold_started.clear()
         hold_release.clear()
         first = []
@@ -106,15 +201,15 @@ def check_gateway(executable, root, app_port, tls):
 
         worker = threading.Thread(target=hold_crawler)
         worker.start()
-        assert hold_started.wait(5), "known crawler did not reach the application"
-        status, headers, _ = request("/private", headers={
-            "X-Forwarded-For": "192.178.4.2"})
-        assert status == 429, status
-        assert headers.get("Retry-After") == "1"
-        hold_release.set()
-        worker.join(5)
+        try:
+            assert hold_started.wait(5), "known crawler did not reach the application"
+            assert_crawler_busy(request("/private", headers={
+                "X-Forwarded-For": "192.178.4.2"}), tls)
+        finally:
+            hold_release.set()
+            worker.join(5)
         assert len(first) == 1 and first[0][0] == 200 and first[0][2] == b"ok", first
-        assert request("/private", headers={"X-Forwarded-For": "192.178.4.3"})[0] == 200
+        assert_ok(request("/private", headers={"X-Forwarded-For": "192.178.4.3"}))
         if tls:
             assert request("/public/ready", headers={
                 "X-Ankah-Internal-Crawler-Slot": "1"})[0] == 400
@@ -128,25 +223,12 @@ def check_gateway(executable, root, app_port, tls):
             finally:
                 h2.close()
 
-        for _ in range(45):
-            assert request("/public/scan", headers={"Host": "wrong.test"})[0] == 421
-        assert request("/public/scan")[0] == 200
-        if tls:
-            for _ in range(25):
-                assert request("/public/scan")[0] == 200, "TLS request was charged twice"
 
-        status, headers, page = request("/private")
-        assert status == 428, status
-        sid = re.search(rb"data-session='([^']+)'", page).group(1).decode()
-        challenge = re.search(rb"data-challenge='([^']+)'", page).group(1).decode()
-        answer = solve(challenge)
-        cookie = headers["Set-Cookie"].split(";", 1)[0]
-        assert request(f"/ankah/answer/{sid}?answer={answer}", "POST")[0] == 200
-        pass_status, pass_headers, _ = request(
-            f"/ankah/open?challenge={challenge}&answer={answer}", "POST")
-        assert pass_status == 200
-        pass_cookie = pass_headers["Set-Cookie"].split(";", 1)[0]
-        assert request("/private", headers={"Cookie": cookie})[0] == 200
+def check_proved_google_crawlers(executable, root, app_port, tls):
+    # This scenario can make eight crawler attempts over TLS. It needs its
+    # own burst, separate from the three attempts in check_google_crawlers.
+    with gateway(executable, root, app_port, tls) as (gate_port, request, _):
+        _, pass_cookie = prove(request)
 
         hold_started.clear()
         hold_release.clear()
@@ -160,29 +242,27 @@ def check_gateway(executable, root, app_port, tls):
         worker.start()
         try:
             assert hold_started.wait(5), "proved crawler did not reach the application"
-            status, _, _ = request("/private", headers={
-                "X-Forwarded-For": "192.178.4.6", "Cookie": pass_cookie})
-            assert status == 429, status
-            status, _, _ = request("/private", headers={"User-Agent": "bingbot"})
-            assert status == 429, status
+            assert_crawler_busy(request("/private", headers={
+                "X-Forwarded-For": "192.178.4.6", "Cookie": pass_cookie}), tls)
+            assert_crawler_busy(request("/private", headers={"User-Agent": "bingbot"}), tls)
             if tls:
-                h2 = Http2Client("127.0.0.1", gate_port)
+                h2 = AdmissionHttp2Client("127.0.0.1", gate_port)
                 try:
                     h2.request(1, "GET", "/private", f"localhost:{gate_port}",
                                headers={"user-agent": "bingbot"})
-                    h2.wait_for(lambda: 1 in h2.responses, 3,
+                    h2.wait_for(lambda: 1 in h2.ended, 3,
                                 "HTTP/2 Bing claim was not rejected at capacity")
-                    assert b"429" in b"".join(h2.response_headers[1]), h2.response_headers[1]
+                    h2.assert_rejected(1, b"429", b"Crawler concurrency exceeded\n")
                 finally:
                     h2.close()
-                h2 = Http2Client("127.0.0.1", gate_port)
+                h2 = AdmissionHttp2Client("127.0.0.1", gate_port)
                 try:
                     h2.request(1, "GET", "/private", f"localhost:{gate_port}",
                                headers={"x-forwarded-for": "192.178.4.8",
                                         "cookie": pass_cookie})
-                    h2.wait_for(lambda: 1 in h2.responses, 3,
+                    h2.wait_for(lambda: 1 in h2.ended, 3,
                                 "HTTP/2 proved crawler was not rejected at capacity")
-                    assert b"429" in b"".join(h2.response_headers[1]), h2.response_headers[1]
+                    h2.assert_rejected(1, b"429", b"Crawler concurrency exceeded\n")
                 finally:
                     h2.close()
         finally:
@@ -190,69 +270,96 @@ def check_gateway(executable, root, app_port, tls):
             worker.join(5)
         assert len(first) == 1 and first[0][0] == 200, first
         assert request("/private", headers={"User-Agent": "bingbot"})[0] == 428
-        assert request("/private", headers={
-            "User-Agent": "bingbot", "Cookie": pass_cookie})[0] == 200
-        assert request("/private", headers={"X-Forwarded-For": "192.178.4.7"})[0] == 200
+        assert_ok(request("/private", headers={
+            "User-Agent": "bingbot", "Cookie": pass_cookie}))
+        assert_ok(request("/private", headers={"X-Forwarded-For": "192.178.4.7"}))
 
-        if dns_fixture:
-            bing_headers = {"User-Agent": "bingbot",
-                            "X-Forwarded-For": "203.0.113.42"}
-            for _ in range(50):
-                bing_result = request("/private", headers=bing_headers)
-                if bing_result[0] != 429:
+
+def check_verified_bing(executable, root, app_port, tls):
+    with gateway(executable, root, app_port, tls) as (_, request, _):
+        _, pass_cookie = prove(request)
+        bing_headers = {"User-Agent": "bingbot",
+                        "X-Forwarded-For": "203.0.113.42"}
+        bing_result = request("/private", headers=bing_headers)
+        assert_ok(bing_result)
+        hold_started.clear()
+        hold_release.clear()
+        first = []
+
+        def hold_verified_bing():
+            first.append(request("/crawler-hold", headers={
+                **bing_headers, "Cookie": pass_cookie}))
+
+        worker = threading.Thread(target=hold_verified_bing)
+        worker.start()
+        try:
+            assert hold_started.wait(5), "verified Bing did not reach the application"
+            assert_crawler_busy(request("/private", headers={
+                "X-Forwarded-For": "192.178.4.9"}), tls)
+        finally:
+            hold_release.set()
+            worker.join(5)
+        assert len(first) == 1 and first[0][0] == 200, first
+
+        assert_ok(request("/private", headers=bing_headers))
+
+
+def check_verified_h2_bing(executable, root, app_port):
+    with gateway(executable, root, app_port, True) as (gate_port, request, _):
+        h2 = AdmissionHttp2Client("127.0.0.1", gate_port)
+        try:
+            # Exercise both a cold DNS verification and a cached classification.
+            for stream_id in (1, 3):
+                h2.request(stream_id, "GET", "/private", f"localhost:{gate_port}",
+                           headers={"user-agent": "bingbot",
+                                    "x-forwarded-for": "203.0.113.42"})
+                h2.wait_for(lambda: stream_id in h2.ended, 3,
+                            "verified HTTP/2 Bing request did not finish")
+                h2.assert_ok(stream_id)
+        finally:
+            h2.close()
+
+        hold_started.clear()
+        hold_release.clear()
+        h2 = AdmissionHttp2Client("127.0.0.1", gate_port)
+        try:
+            h2.request(1, "GET", "/crawler-hold", f"localhost:{gate_port}",
+                       headers={"user-agent": "bingbot",
+                                "x-forwarded-for": "203.0.113.42"})
+            h2.wait_for(lambda: hold_started.is_set() or 1 in h2.ended, 5,
+                        "HTTP/2 Bing did not reach the application")
+            assert hold_started.is_set(), h2.diagnostic(1)
+            assert_crawler_busy(request("/private", headers={
+                "X-Forwarded-For": "192.178.4.9"}), True)
+            h2.reset(1)
+            # Poll only for asynchronous slot release, not token-bucket refill.
+            # At most nine Google/Bing attempts share this fresh crawler budget.
+            for attempt in range(5):
+                result = request("/private", headers={
+                    "X-Forwarded-For": "192.178.4.10"})
+                if result[0] == 200:
+                    assert_ok(result)
                     break
-                time.sleep(.02)
-            assert bing_result[0] == 200, bing_result
-            hold_started.clear()
-            hold_release.clear()
-            first = []
+                assert_crawler_busy(result, True)
+                if attempt < 4:
+                    time.sleep(.25)
+            else:
+                raise AssertionError("reset HTTP/2 Bing stream kept crawler slot")
+        finally:
+            hold_release.set()
+            h2.close()
 
-            def hold_verified_bing():
-                first.append(request("/crawler-hold", headers={
-                    **bing_headers, "Cookie": pass_cookie}))
 
-            worker = threading.Thread(target=hold_verified_bing)
-            worker.start()
-            try:
-                assert hold_started.wait(5), "verified Bing did not reach the application"
-                assert request("/private", headers={
-                    "X-Forwarded-For": "192.178.4.9"})[0] == 429
-            finally:
-                hold_release.set()
-                worker.join(5)
-            assert len(first) == 1 and first[0][0] == 200, first
+def check_gateway(executable, root, app_port, tls):
+    with gateway(executable, root, app_port, tls) as (gate_port, request, context):
+        for _ in range(45):
+            assert request("/public/scan", headers={"Host": "wrong.test"})[0] == 421
+        assert request("/public/scan")[0] == 200
+        if tls:
+            for _ in range(25):
+                assert request("/public/scan")[0] == 200, "TLS request was charged twice"
 
-            if tls:
-                h2 = Http2Client("127.0.0.1", gate_port)
-                try:
-                    h2.request(1, "GET", "/private", f"localhost:{gate_port}",
-                               headers={"user-agent": "bingbot",
-                                        "x-forwarded-for": "203.0.113.42"})
-                    h2.wait_for(lambda: 1 in h2.ended, 3,
-                                "verified HTTP/2 Bing request did not finish")
-                    assert h2.received.get(1) == 2, h2.received
-                finally:
-                    h2.close()
-
-                hold_started.clear()
-                hold_release.clear()
-                h2 = Http2Client("127.0.0.1", gate_port)
-                try:
-                    h2.request(1, "GET", "/crawler-hold", f"localhost:{gate_port}",
-                               headers={"user-agent": "bingbot",
-                                        "x-forwarded-for": "203.0.113.42"})
-                    assert hold_started.wait(5), "HTTP/2 Bing did not reach the application"
-                    h2.reset(1)
-                    for _ in range(50):
-                        if request("/private", headers={
-                                "X-Forwarded-For": "192.178.4.10"})[0] == 200:
-                            break
-                        time.sleep(.02)
-                    else:
-                        raise AssertionError("reset HTTP/2 Bing stream kept crawler slot")
-                finally:
-                    hold_release.set()
-                    h2.close()
+        cookie, pass_cookie = prove(request)
 
         if tls:
             h2 = Http2Client("127.0.0.1", gate_port)
@@ -268,22 +375,25 @@ def check_gateway(executable, root, app_port, tls):
         limited = False
         for attempt in range(120):
             try:
-                status, headers, _ = request("/public/scan")
+                status, headers, body = request("/public/scan")
             except Exception as error:
                 raise AssertionError(f"anonymous request {attempt}: {error}") from error
             if status == 429:
                 limited = True
                 assert headers.get("Retry-After") == "1"
+                assert body == b"Rate limit exceeded\n", (status, headers, body)
                 break
         assert limited, "anonymous requests were not bounded"
-        known_crawler_can_enter("192.178.4.4")
+        assert_ok(request("/private", headers={"X-Forwarded-For": "192.178.4.4"}))
         assert request("/private", headers={"Cookie": cookie})[0] == 200
         assert request("/private", headers={"Cookie": pass_cookie})[0] == 200
         assert request("/public/scan", headers={"Cookie": cookie})[0] == 200
 
         def bounded(path, headers):
             for _ in range(20):
-                if request(path, headers=headers)[0] == 429:
+                result = request(path, headers=headers)
+                if result[0] == 429:
+                    assert result[2] == b"Rate limit exceeded\n", result
                     return
             raise AssertionError(f"{path} escaped anonymous capacity")
 
@@ -339,7 +449,7 @@ def check_gateway(executable, root, app_port, tls):
                           "X-Forwarded-For: 203.0.113.88\r\n"
                           "Content-Length: 1\r\n\r\n").encode())
             assert hold_started.wait(5), "unverified Bing did not reach the application"
-            known_crawler_can_enter("192.178.4.11")
+            known_crawler_can_enter(request, "192.178.4.11", tls)
         finally:
             sock.close()
         if tls:
@@ -352,17 +462,10 @@ def check_gateway(executable, root, app_port, tls):
                            headers={"user-agent": "bingbot",
                                     "x-forwarded-for": "203.0.113.89"})
                 assert hold_started.wait(5), "unverified HTTP/2 Bing did not reach the application"
-                known_crawler_can_enter("192.178.4.12")
+                known_crawler_can_enter(request, "192.178.4.12", tls)
             finally:
                 h2.reset(1)
                 h2.close()
-    finally:
-        process.terminate()
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            process.kill()
-            process.wait()
 
 
 def check_connection_capacity(executable, root, app_port, tls=False):
@@ -451,13 +554,13 @@ def check_connection_capacity(executable, root, app_port, tls=False):
         status, _, body = request("/ankah/unlock", headers={"User-Agent": "bingbot"})
         assert status == 503 and body == b"Anonymous connection capacity reached\n", (status, body)
         if tls:
-            h2 = Http2Client("127.0.0.1", gate_port)
+            h2 = AdmissionHttp2Client("127.0.0.1", gate_port)
             try:
                 h2.request(1, "GET", "/ankah/unlock", f"localhost:{gate_port}",
                            headers={"user-agent": "bingbot"})
-                h2.wait_for(lambda: 1 in h2.responses, 3,
+                h2.wait_for(lambda: 1 in h2.ended, 3,
                             "HTTP/2 Bing claim escaped anonymous connection capacity")
-                assert b"503" in b"".join(h2.response_headers[1]), h2.response_headers[1]
+                h2.assert_rejected(1, b"503", b"Anonymous connection capacity reached\n")
             finally:
                 h2.close()
     finally:
@@ -476,15 +579,15 @@ def check_h2_reused_capacity(executable, root, app_port):
     clients = []
 
     def h2_request(path, peer, expected):
-        client = Http2Client("127.0.0.1", gate_port)
+        client = AdmissionHttp2Client("127.0.0.1", gate_port)
         clients.append(client)
         client.request(1, "GET", path, f"localhost:{gate_port}",
                        headers={"x-forwarded-for": peer})
         client.wait_for(lambda: 1 in client.ended, 5, path)
         if expected == 503:
-            assert b"503" in b"".join(client.response_headers[1]), client.response_headers[1]
+            client.assert_rejected(1, b"503", b"Anonymous connection capacity reached\n")
         elif expected == 200:
-            assert client.received.get(1) == 2, client.received
+            client.assert_ok(1)
         return client
 
     try:
@@ -499,7 +602,7 @@ def check_h2_reused_capacity(executable, root, app_port):
         else:
             raise AssertionError("HTTP/2 capacity gateway did not start")
 
-        privileged = Http2Client("127.0.0.1", gate_port)
+        privileged = AdmissionHttp2Client("127.0.0.1", gate_port)
         clients.append(privileged)
         privileged.request(1, "GET", "/private", f"localhost:{gate_port}",
                            headers={"user-agent": "bingbot"})
@@ -511,7 +614,7 @@ def check_h2_reused_capacity(executable, root, app_port):
 
         hold_started.clear()
         hold_release.clear()
-        mixed = Http2Client("127.0.0.1", gate_port)
+        mixed = AdmissionHttp2Client("127.0.0.1", gate_port)
         clients.append(mixed)
         mixed.request(1, "GET", "/public/crawler-hold", f"localhost:{gate_port}",
                       headers={"x-forwarded-for": "203.0.113.81"})
@@ -522,20 +625,22 @@ def check_h2_reused_capacity(executable, root, app_port):
                            headers={"user-agent": "bingbot",
                                     "x-forwarded-for": "203.0.113.83"})
         privileged.wait_for(lambda: 3 in privileged.ended, 5, "reused Bing claim")
-        assert b"503" in b"".join(privileged.response_headers[3]), privileged.response_headers[3]
+        privileged.assert_rejected(3, b"503", b"Anonymous connection capacity reached\n")
 
         mixed.request(3, "GET", "/public/ready", f"localhost:{gate_port}",
                       headers={"x-forwarded-for": "192.178.4.20"})
         mixed.wait_for(lambda: 3 in mixed.ended, 5, "privileged mixed stream")
-        assert mixed.received.get(3) == 2, mixed.received
+        mixed.assert_ok(3)
         h2_request("/public/ready", "203.0.113.84", 503)
 
         hold_release.set()
         mixed.wait_for(lambda: 1 in mixed.ended, 5, "anonymous stream completion")
         for _ in range(50):
             client = h2_request("/public/ready", "203.0.113.85", 0)
-            if client.received.get(1) == 2:
+            if client.response_status.get(1) == b"200":
+                client.assert_ok(1)
                 break
+            client.assert_rejected(1, b"503", b"Anonymous connection capacity reached\n")
             client.close()
             clients.remove(client)
             time.sleep(.02)
@@ -588,8 +693,16 @@ def main():
     try:
         with tempfile.TemporaryDirectory() as temporary:
             root = pathlib.Path(temporary)
-            check_gateway(executable, root, app_port, False)
-            check_gateway(executable, root, app_port, True)
+            # Each scenario owns its rate buckets; unrelated contention checks
+            # must not spend the budget of a later successful crawler request.
+            for tls in (False, True):
+                check_google_crawlers(executable, root, app_port, tls)
+                check_proved_google_crawlers(executable, root, app_port, tls)
+                if dns_fixture:
+                    check_verified_bing(executable, root, app_port, tls)
+                check_gateway(executable, root, app_port, tls)
+            if dns_fixture:
+                check_verified_h2_bing(executable, root, app_port)
             check_connection_capacity(executable, root, app_port)
             check_connection_capacity(executable, root, app_port, True)
             check_h2_reused_capacity(executable, root, app_port)

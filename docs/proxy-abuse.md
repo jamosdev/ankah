@@ -1,6 +1,9 @@
 # Trusted proxy abuse actions
 
-Ankah can ask a configured trusted reverse proxy to block the client associated
+Ankah installs a ten-minute local denylist entry for the client IP when an
+abuse threshold is reached. Linked gateways receive the same block in capped
+batches and enforce it locally. Request rate buckets remain local. Ankah can
+also ask a configured trusted reverse proxy to block the client associated
 with an Ankah-generated response. Set `--trusted-proxy` to the direct proxy
 address or CIDR and select `--proxy-abuse-profile=off|conservative|strict`.
 The default profile is `conservative`. Without a trusted direct peer, Ankah

@@ -10,7 +10,7 @@ import tempfile
 import threading
 import time
 
-from process_support import gateway_command
+from process_support import gateway_command, start_gateway
 
 
 def free_port():
@@ -70,8 +70,8 @@ def main():
                 "--public-origin", f"http://localhost:{gate_port}",
                 "--secret-file", str(secret), "--assets-dir", root,
                 "--allow-prefix", "/upstream"]
-        process = subprocess.Popen(gateway_command(executable, [
-            *base, "--log-unknown-languages", str(language_log)]),
+        process = start_gateway(executable, [
+            *base, "--log-unknown-languages", str(language_log)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             wait_ready(gate_port)
@@ -112,8 +112,8 @@ def main():
         gate_port = free_port()
         base[1] = f"127.0.0.1:{gate_port}"
         base[5] = f"http://localhost:{gate_port}"
-        capped = subprocess.Popen(gateway_command(executable, [
-            *base, "--log-unknown-languages", str(language_log)]),
+        capped = start_gateway(executable, [
+            *base, "--log-unknown-languages", str(language_log)],
             stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
         try:
             wait_ready(gate_port)
