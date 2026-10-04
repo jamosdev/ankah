@@ -83,6 +83,20 @@ def main():
         check(headers["Cache-Control"] == "no-store", f"{path} cache control")
         return json.loads(body)
 
+    def fresh_idle_stats():
+        # A cached body may predate the last public response. Wait for a new
+        # generation with those connections drained, not for counters to agree.
+        previous = stats("/stats/live")
+        current = previous
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            current = stats("/stats/live")
+            if (current["sample_ms"] != previous["sample_ms"] and
+                    current["gauges"]["connections"] == 0):
+                return current
+            time.sleep(.01)
+        raise RuntimeError("statistics did not reach a fresh idle sample: " + json.dumps(current))
+
     with tempfile.TemporaryDirectory() as temp:
         secret = pathlib.Path(temp) / "secret"
         secret.write_text("a" * 64)
@@ -554,7 +568,7 @@ def main():
                   not mascot_file.exists(), "restore removes the override")
             check(request(public, "/ankah/mascot.png")[2] == default_mascot,
                   "restore changes the challenge image")
-            before_public_api = stats("/stats/live")
+            before_public_api = fresh_idle_stats()
             status, headers, _ = request(public, public_route + "stats/live")
             check(status == 401 and headers["WWW-Authenticate"].startswith("Bearer"),
                   "public statistics require a token")
@@ -567,9 +581,16 @@ def main():
                   "session can sign out through the public route")
             check(request(dashboard, "/stats/live", headers=session_auth)[0] == 401,
                   "signed-out session is revoked")
-            after_public_api = stats("/stats/live")
+            after_public_api = fresh_idle_stats()
+            check(after_public_api["sample_ms"] > before_public_api["sample_ms"],
+                  "public API counters are compared across fresh cache generations")
             check(after_public_api["cumulative"] == before_public_api["cumulative"],
-                  "public dashboard API traffic is excluded from statistics")
+                  "public dashboard API traffic is excluded from statistics: " + json.dumps({
+                      "before_sample": before_public_api["sample_ms"],
+                      "after_sample": after_public_api["sample_ms"],
+                      "delta": {name: after_public_api["cumulative"][index] - before_public_api["cumulative"][index]
+                                for name, index in field.items()
+                                if after_public_api["cumulative"][index] != before_public_api["cumulative"][index]}}))
             digest = hashlib.sha256((pathlib.Path(root) / "dashboard/dashboard.js")
                                     .read_bytes()).hexdigest()
             for path in ("/dashboard/dashboard.js", f"/ankah/assets/{digest}/dashboard.js"):

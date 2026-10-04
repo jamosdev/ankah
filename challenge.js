@@ -1,3 +1,28 @@
+/* Decoration must never hold up proof or navigation. */
+(async () => {
+  "use strict";
+  const {particles, particleConfig} = document.body.dataset;
+  if (!particles || !particleConfig || !document.getElementById("particles")) return;
+  const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+  if (motion.matches) return;
+  const library = new Promise((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = particles;
+    script.async = true;
+    script.onload = resolve;
+    script.onerror = reject;
+    document.head.appendChild(script);
+  });
+  const [, config] = await Promise.all([library, fetch(particleConfig).then((response) => {
+    if (!response.ok) throw new Error("Particle configuration unavailable");
+    return response.json();
+  })]);
+  if (motion.matches) return;
+  // Keep the original hover effect while leaving the form and QR help clickable.
+  config.interactivity.detect_on = "window";
+  window.particlesJS("particles", config);
+})().catch(() => { /* The challenge remains usable without its background. */ });
+
 /* Solve off the page thread when the browser supports the bundled module. */
 (() => {
   "use strict";

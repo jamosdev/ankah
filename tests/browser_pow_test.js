@@ -110,6 +110,60 @@ async function main() {
   for (let i = 0; i < 100 && !submitted; i++) await new Promise((resolve) => setTimeout(resolve, 10));
   assert(submitted && terminated, progress.textContent);
   assert.match(posted, /^\/ankah\/answer\/abc\?answer=\d+$/);
+
+  const preset = JSON.parse(fs.readFileSync(require("node:path").join(__dirname, "../particlejs.json")));
+  page.body.dataset.particles = "/particles.min.js";
+  page.body.dataset.particleConfig = "/particlejs.json";
+  const lookup = page.getElementById;
+  page.getElementById = (id) => id === "particles" ? {} : lookup(id);
+  page.createElement = (tag) => { assert.equal(tag, "script"); return {}; };
+  for (const mode of ["success", "reduced", "script-error", "config-error", "config-invalid",
+                      "script-stalled", "config-stalled", "init-error"]) {
+    submitted = false;
+    posted = "";
+    const scripts = [], configurations = [], initialized = [];
+    page.head = {appendChild(script) {
+      assert.equal(script.async, true);
+      scripts.push(script.src);
+      if (mode === "script-stalled") return;
+      queueMicrotask(() => mode === "script-error" ? script.onerror(new Error("missing")) : script.onload());
+    }};
+    vm.runInNewContext(controller, {
+      document: page, TextEncoder, Uint8Array, Number, Math, Error, Promise, setTimeout, clearTimeout,
+      performance: {now: () => Date.now()}, Worker: SuccessfulWorker, WebAssembly,
+      window: {
+        matchMedia(query) {
+          assert.equal(query, "(prefers-reduced-motion: reduce)");
+          return {matches: mode === "reduced"};
+        },
+        particlesJS(id, config) {
+          if (mode === "init-error") throw new Error("Canvas unavailable");
+          initialized.push([id, config]);
+        },
+      },
+      fetch: async (url) => {
+        if (url !== "/particlejs.json") { posted = url; return {ok: true}; }
+        configurations.push(url);
+        if (mode === "config-stalled") return new Promise(() => {});
+        return {ok: mode !== "config-error", json: async () => {
+          if (mode === "config-invalid") throw new Error("Invalid JSON");
+          return JSON.parse(JSON.stringify(preset));
+        }};
+      },
+    });
+    for (let i = 0; i < 100 && !submitted; i++) await new Promise((resolve) => setTimeout(resolve, 10));
+    assert(submitted, `${mode}: background delayed proof completion`);
+    assert.match(posted, /^\/ankah\/answer\/abc\?answer=\d+$/);
+    assert.equal(initialized.length, mode === "success" ? 1 : 0, mode);
+    assert.equal(scripts.length, mode === "reduced" ? 0 : 1, mode);
+    assert.equal(configurations.length, mode === "reduced" ? 0 : 1, mode);
+    if (initialized.length) {
+      assert.equal(initialized[0][0], "particles");
+      const expectedPreset = JSON.parse(JSON.stringify(preset));
+      expectedPreset.interactivity.detect_on = "window";
+      assert.deepEqual(initialized[0][1], expectedPreset);
+    }
+  }
 }
 
 main().catch((error) => { console.error(error); process.exitCode = 1; });

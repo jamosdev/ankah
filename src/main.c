@@ -3591,16 +3591,27 @@ static int render_challenge_text(ankah_language language, char *out, size_t capa
     return 0;
 }
 
+static const char challenge_style[] =
+    "<style>html,body{margin:0;min-height:100%;font:16px system-ui;background:#101929;color:#f4f7fb}"
+    "#particles{position:fixed;inset:0;z-index:0;pointer-events:none}#particles canvas{display:block}"
+    "main{position:relative;z-index:1;max-width:38rem;margin:5vh auto;padding:2rem;text-align:center;background:#18253b;border-radius:1rem}"
+    "img{height:auto}#mascot{display:block;width:min(72vw,300px);max-height:32vh;object-fit:contain;margin:0 auto 1.25rem}"
+    "#phone{width:100px}#qr{width:220px;background:white;padding:8px}"
+    "#phone-help{display:flex;align-items:center;justify-content:center;gap:1rem;flex-wrap:wrap}"
+    "button{padding:.7rem 1.5rem;font:inherit;cursor:pointer}</style>";
+
 static void render_gate(connection *c, ankah_session *session) {
     char body[8192], extra[512], action[ANKAH_MAX_TARGET * 6], hidden[128];
-    char illustration[160], challenge_js[160];
+    char illustration[160], challenge_js[160], particles_js[160], particle_config[160];
     char worker_js[160] = "", wasm_path[160] = "";
     char challenge_text[4096];
     ankah_language language = ankah_language_select(&c->request);
     int n;
     if (session->is_post) tally(c, ANKAH_STAT_posts_saved, 1);
     if (asset_path(6, illustration, sizeof(illustration)) != 0 ||
-        asset_path(3, challenge_js, sizeof(challenge_js)) != 0) {
+        asset_path(3, challenge_js, sizeof(challenge_js)) != 0 ||
+        asset_path(1, particles_js, sizeof(particles_js)) != 0 ||
+        asset_path(2, particle_config, sizeof(particle_config)) != 0) {
         close_connection(c);
         return;
     }
@@ -3629,14 +3640,9 @@ static void render_gate(connection *c, ankah_session *session) {
     n = snprintf(body, sizeof(body),
         "<!doctype html><html lang=%s><meta charset=utf-8>"
         "<meta name=viewport content='width=device-width,initial-scale=1'>"
-        "<title>%s</title>"
-        "<style>html,body{margin:0;min-height:100%%;font:16px system-ui;background:#101929;color:#f4f7fb}"
-        "main{max-width:38rem;margin:5vh auto;padding:2rem;text-align:center;background:#18253b;border-radius:1rem}"
-        "img{height:auto}#mascot{display:block;width:min(72vw,300px);max-height:32vh;object-fit:contain;margin:0 auto 1.25rem}"
-        "#phone{width:100px}#qr{width:220px;background:white;padding:8px}"
-        "#phone-help{display:flex;align-items:center;justify-content:center;gap:1rem;flex-wrap:wrap}"
-        "button{padding:.7rem 1.5rem;font:inherit;cursor:pointer}"
-        "</style><body data-challenge='%s' data-session='%s' data-worker='%s' data-wasm='%s'>"
+        "<title>%s</title>%s"
+        "<body data-challenge='%s' data-session='%s' data-worker='%s' data-wasm='%s' "
+        "data-particles='%s' data-particle-config='%s'><div id=particles aria-hidden=true></div>"
         "<main><img id=mascot src='/ankah/mascot.png' alt='%s'><h1>%s</h1><p>%s</p>"
         "<output id=progress>%s</output>"
         "<section id=phone-panel><h2>%s</h2>"
@@ -3647,7 +3653,8 @@ static void render_gate(connection *c, ankah_session *session) {
         "</main>%s<script src='%s'></script></body></html>",
         ankah_language_tag(language),
         ankah_language_message(language, "Checking your browser"),
-        session->challenge, session->id, worker_js, wasm_path,
+        challenge_style, session->challenge, session->id, worker_js, wasm_path,
+        particles_js, particle_config,
         ankah_language_message(language, "Site mascot"),
         ankah_language_message(language, "Checking your browser"),
         ankah_language_message(language, "Solving a short proof of work."),
@@ -3816,7 +3823,8 @@ static void handle_internal(connection *c) {
                                                     (uint64_t)time(NULL), host);
         ankah_session reconstructed = {0};
         char body[8192], challenge_text[4096];
-        char script[160], worker_js[160] = "", wasm_path[160] = "";
+        char script[160], particles_js[160], particle_config[160];
+        char worker_js[160] = "", wasm_path[160] = "";
         ankah_language language = ankah_language_select(&c->request);
         int n;
         if (!session && (!c->selected_host || c->selected_host->primary) &&
@@ -3829,7 +3837,9 @@ static void handle_internal(connection *c) {
                 session = &reconstructed;
             }
         }
-        if (!session || asset_path(3, script, sizeof(script)) != 0) {
+        if (!session || asset_path(3, script, sizeof(script)) != 0 ||
+            asset_path(1, particles_js, sizeof(particles_js)) != 0 ||
+            asset_path(2, particle_config, sizeof(particle_config)) != 0) {
             respond(c, 404, "Not Found", "text/plain", "Challenge expired\n", NULL); return;
         }
         tally(c, ANKAH_STAT_qr_scans, 1);
@@ -3857,13 +3867,15 @@ static void handle_internal(connection *c) {
         n = snprintf(body, sizeof(body),
             "<!doctype html><html lang=%s><meta charset=utf-8>"
             "<meta name=viewport content='width=device-width,initial-scale=1'>"
-            "<title>%s</title><body data-challenge='%s' data-session='%s' "
-            "data-worker='%s' data-wasm='%s' data-mobile=1>"
+            "<title>%s</title>%s<body data-challenge='%s' data-session='%s' "
+            "data-worker='%s' data-wasm='%s' data-mobile=1 data-particles='%s' "
+            "data-particle-config='%s'><div id=particles aria-hidden=true></div>"
             "<main><h1>%s</h1><output id=progress>%s</output>"
             "<p>%s</p></main>%s<script src='%s'></script></body></html>",
             ankah_language_tag(language),
             ankah_language_message(language, "Solve challenge"),
-            session->challenge, session->id, worker_js, wasm_path,
+            challenge_style, session->challenge, session->id, worker_js, wasm_path,
+            particles_js, particle_config,
             ankah_language_message(language, "Solve challenge"),
             ankah_language_message(language, "Starting..."),
             ankah_language_message(language,
@@ -3873,7 +3885,7 @@ static void handle_internal(connection *c) {
         respond(c, 200, "OK", "text/html; charset=utf-8", body,
                 "Content-Security-Policy: default-src 'none'; "
                 "script-src 'self' 'wasm-unsafe-eval'; "
-                "worker-src 'self'; connect-src 'self'; frame-ancestors 'none'\r\n");
+                "worker-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; frame-ancestors 'none'\r\n");
         return;
     }
     if (prefix(target, "/ankah/answer/") && strcmp(c->request.method, "POST") == 0) {

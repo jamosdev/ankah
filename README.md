@@ -177,6 +177,10 @@ cookie, so a browser that was already allowed must solve the new challenge
 before continuing. `/ankah/unlock?return=/ankah/unlock` repeats the proof of
 work on every visit, which is useful for testing the solvers.
 
+Active challenge pages include the original particle background on every host.
+It respects reduced motion and loads independently of the solver. See
+[challenge backgrounds and browser verification](docs/browser-challenges.md).
+
 Ankah can also serve packaged application static files directly. The build
 helper detects common Python web app and frontend directories, then writes a
 content addressed bundle for Ankah to load at startup. See

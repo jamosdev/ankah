@@ -213,6 +213,36 @@ class BrowserHosts(unittest.TestCase):
             self.assertEqual(result[1]['cache-control'], 'private, no-cache')
             self.assertEqual(self.request(host='status.test', **options)[0], 200)
 
+    def test_particle_assets_on_every_challenge_host(self):
+        # Fresh process with the dashboard disabled proves decorative assets are
+        # public challenge resources, independent of dashboard authentication.
+        self.config = [value for value in self.config if not value.startswith(
+            ('dashboard-token-file=', 'no-stats-file='))] + ['no-dashboard=true']
+        self.restart()
+        for host, protocol, language in [('status.test', 'h1', 'en'),
+                                         ('submit.test', 'h2', 'ja'),
+                                         ('other.test', 'h1', 'es')]:
+            options = dict(host=host, protocol=protocol, headers={'Accept-Language': language})
+            status, _, body = self.request('/ankah/unlock', **options)
+            self.assertEqual(status, 428, (status, body[:256]))
+            sid = re.search(rb"data-session='([a-f0-9]{32})'", body).group(1).decode()
+            phone = self.request('/ankah/solve/' + sid, **options)
+            self.assertEqual(phone[0], 200)
+            for page in (body, phone[2]):
+                self.assertIn(b'<div id=particles aria-hidden=true>', page)
+                for attribute, filename, content_type in [
+                        ('data-particles', 'particles.min.js', 'application/javascript'),
+                        ('data-particle-config', 'particlejs.json', 'application/json')]:
+                    asset = re.search((attribute + "='([^']+)'").encode(), page).group(1).decode()
+                    self.assertRegex(asset, r'^/ankah/assets/[a-f0-9]{64}/' + re.escape(filename) + '$')
+                    result = self.request(asset, **options)
+                    self.assertEqual(result[0], 200)
+                    self.assertTrue(result[1]['content-type'].startswith(content_type))
+                    self.assertEqual(result[1]['cache-control'], 'public, max-age=31536000, immutable')
+                    self.assertEqual(hashlib.sha256(result[2]).hexdigest(), asset.split('/')[3])
+            self.assertIn("style-src 'unsafe-inline'", phone[1]['content-security-policy'])
+        self.assertEqual(self.records, [])
+
     def test_cross_host_and_restart_binding(self):
         sid, challenge, cookie = self.challenge()
         passed, _ = self.complete(sid, challenge, cookie)
