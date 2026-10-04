@@ -420,10 +420,17 @@
       canvas.getContext('2d').drawImage(image, 0, 0, canvas.width, canvas.height);
       const png = await new Promise((resolve) => canvas.toBlob(resolve, "image/png"));
       if (!png) throw new Error("invalid PNG");
-      if (png.size > 4 * 1024 * 1024) throw new Error("large PNG");
+      let upload = png;
+      if (file.type === "image/png" && scale === 1 && file.size < png.size) {
+        const signature = new Uint8Array(await file.slice(0, 8).arrayBuffer());
+        const pngSignature = [137, 80, 78, 71, 13, 10, 26, 10];
+        if (signature.length === pngSignature.length &&
+            pngSignature.every((value, index) => signature[index] === value)) upload = file;
+      }
+      if (upload.size > 4 * 1024 * 1024) throw new Error("large PNG");
       if (selection !== mascotSelection) return;
-      pendingMascot = png;
-      previewMascot(png);
+      pendingMascot = upload;
+      previewMascot(upload);
       $("mascot-save").disabled = false;
       mascotStatus(text("mascot_ready"));
     } catch (error) {

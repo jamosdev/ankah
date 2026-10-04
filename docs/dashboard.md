@@ -176,6 +176,9 @@ file is unreadable or invalid, Ankah logs a warning and shows the bundled
 image. A failed save leaves the current image in use and shows an error in the
 dashboard. Files over 20 MiB cannot be selected; the browser scales the image
 to at most 1024 pixels on its longest side and uploads a PNG of at most 4 MiB.
+For PNG images already within that dimension limit, the browser keeps the
+original file when it is smaller than the re-encoded PNG. This preserves
+existing palette optimization and interlacing.
 
 The page files load from the `dashboard` directory inside `--assets-dir` when
 the dashboard is enabled, and Ankah refuses to start if they are missing. The
