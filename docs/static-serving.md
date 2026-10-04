@@ -35,6 +35,20 @@ python3 build_static_bundle.py --project-root /app --source dist \
 With a root mount, `index.html` is also available at `/`. Other URLs must
 match a packaged file exactly; this does not add a catch-all SPA fallback.
 
+## Requiring proof for a bundle
+
+Use `--static-challenge true` (configuration `static-challenge=true`, environment
+`ANKAH_STATIC_CHALLENGE=true`) to require solved proof for every packaged file.
+The default is false. This takes precedence over allow-prefix and crawler
+exemptions. Authorization runs before ETag, encoding and range handling, and
+protected responses use `Cache-Control: private, no-cache`. Other static-serving
+semantics and the shared cache bound remain in place. HEAD clients can unlock
+using GET first; unsupported methods do not save bodies for replay.
+
+Each additional virtual host can configure its own bundle and static-challenge
+policy. See [virtual hosts](virtual-hosts.md). These bundles use exact matching;
+SPA fallback is a primary-host feature.
+
 ## Optional SPA fallback
 
 Ankah treats single-page applications as an explicit deployment choice. To

@@ -2,9 +2,11 @@
 
 The global configuration remains the primary host. Add `virtual-host=FILE`
 for each additional host. Paths in each key/value file resolve relative to that
-file. Additional hosts have no static bundle, health/dashboard routes, challenge,
-crawler admission or continuation handling. They connect directly to the selected
-upstream once; client retries must authenticate with the backend again.
+file. Each host serves its own challenge endpoints and optional static bundle. The
+configured public dashboard route is available on every host and controls the
+same gateway process. Health routes and POST continuation remain primary-host
+features. Exact upstream routes connect once; client retries must authenticate
+with the backend again.
 
 ```ini
 public-origin=https://submit.example
@@ -19,7 +21,9 @@ upload-timeout-ms=105000
 response-timeout-ms=115000
 ```
 
-All fields are required. `route` may repeat with distinct identifiers and exact
+Origin and certificate fields are required. A host needs exact upstream routes,
+a static bundle, or both. Upstream and limit fields are required when routes are
+present. A static-only host does not need an upstream. `route` may repeat with distinct identifiers and exact
 method/path pairs. Route identifiers contain letters, digits, underscores or
 hyphens. Limits are positive integer bytes, transactions or milliseconds. Unknown
 keys, duplicate fields/hosts/routes and invalid limits fail startup. No route
@@ -52,6 +56,47 @@ terminator. Trailers and ambiguous framing are rejected. Authorization,
 Idempotency-Key, Content-Type, body bytes, backend status/body and Retry-After
 pass through. Early backend rejection stops upload forwarding and remains final.
 No exact-route request is saved for challenge replay or receipt caching.
+
+## Browser pages
+
+Add a build-time bundle to an additional host using paths relative to its file:
+
+```ini
+static-bundle=landing-bundle
+static-challenge=true
+```
+
+Build with `build_static_bundle.py --url-prefix /` to serve `index.html` at `/`.
+Additional-host bundles use exact file matching and reject SPA fallback bundles.
+`static-challenge` defaults to false. When true, a valid host-bound proof is
+required before any representation, range or conditional response is served;
+protected files use `Cache-Control: private, no-cache`. Only GET and HEAD serve
+files. Other methods return 405 without saving a body for continuation. The
+primary host's allow-prefix and download-throttle settings do not apply here.
+Unknown targets return 404 without connecting to either upstream.
+
+`/ankah/` and the configured dashboard prefix are reserved on every host. Exact
+routes cannot overlap those paths or packaged file URLs. The literal upstream
+route always keeps its method/path policy, including rejection of queries.
+Browser requests do not consume exact-route concurrency slots or use their
+submission deadlines. Gateway-wide connection, stream, queue and admission
+bounds still apply.
+
+Visit `/ankah/unlock` on any host to issue fresh proof, even with a solved cookie.
+Use `/ankah/unlock?return=/ankah/unlock` for repeated solver testing. Challenge
+assets, QR solve pages, command-line instructions and redirects use the selected
+host. Cookies omit Domain and proof/session checks reject another host's cookie
+even if a client manually copies it. Session snapshots retain host identity;
+reordering virtual-host declarations does not change session ownership. Gateway
+links synchronize only primary-host sessions; additional-host challenges are local.
+
+The dashboard keeps one token, authenticator, statistics store and set of controls
+across hosts. A setting change or runtime disable affects the complete process.
+Browser credentials remain in each origin's session storage. Existing public
+route, private listener and no-dashboard options apply globally; a private-only
+listener does not create a public route. Additional-host dashboard pages follow
+normal challenge admission, while their APIs keep existing bearer/TOTP checks.
+A primary-host allow-prefix exemption does not exempt another host's pages.
 
 Global optional ceilings: `max-connections` (up to 256), `max-h2-streams` (up to
 256 total), `upload-queue-bytes` (32768 through 524288 per HTTP/2 upload),

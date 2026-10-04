@@ -42,6 +42,11 @@ continuations cannot use the token twice. If the original node or its link is
 unavailable, the continuation returns `503` with `Retry-After: 1`; the token
 remains available for retry. The nodes do not replicate unsolved POST bodies.
 
+Links continue to represent the primary host only in a multi-host gateway.
+Additional-host browser sessions are neither sent to peers nor accepted through
+the primary host's link. Their QR and completion requests must reach the local
+gateway that issued the session.
+
 ## Session files
 
 Session persistence is on by default. The default basename is
@@ -79,3 +84,12 @@ while both snapshot slots are durably refreshed and the journal is reset. If a
 snapshot slot cannot be read or validated, compaction waits until a durable
 replacement of that slot succeeds. Persistent storage failures continue to
 return retryable `503` responses.
+
+Snapshot version 2 stores each session's configured host authority. Version 1
+snapshots restore into the configured primary host only; keep the original
+primary origin during migration. Version 2 preserves secondary-host ownership
+across host declaration reordering. Old binaries cannot read version 2 snapshots.
+For a binary rollback, preserve the current snapshots and consumption journal;
+do not restore stale saved POSTs. Use a fresh session basename with the older
+binary and require clients to unlock again. Additional-host exact submissions
+never enter these files.

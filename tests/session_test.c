@@ -130,8 +130,11 @@ int main(void) {
         assert(ankah_file_replace("ankah-session-test.tmp", "ankah-session-test.1",
                                   image, image_size) == 0);
         free(image);
-        assert(ankah_session_restore("ankah-session-test", issued + 2) == 0);
+        assert(ankah_session_restore("ankah-session-test", issued + 2, "example.test") == 0);
         session = ankah_session_find(id, issued + 2);
+        assert(ankah_session_find_host(id, issued + 2, "localhost") == session);
+        assert(!ankah_session_find_host(id, issued + 2, "other.test"));
+        assert(!ankah_session_accept_solved(id, issued + 2, "/", 0, "other.test"));
         assert(session && session->saved_request &&
                memcmp(session->body, "data", 4) == 0);
         assert(ankah_session_reserve_post(session, token, issued + 2) == 0);
@@ -142,7 +145,7 @@ int main(void) {
         assert(fprintf(journal, "%s\n", id) == 33);
         assert(fclose(journal) == 0);
         ankah_session_discard(session);
-        assert(ankah_session_restore("ankah-session-test", issued + 2) == 0);
+        assert(ankah_session_restore("ankah-session-test", issued + 2, "example.test") == 0);
         session = ankah_session_find(id, issued + 2);
         assert(session && !session->saved_request);
         remove("ankah-session-test.1");

@@ -14,6 +14,7 @@ typedef struct ankah_post_payload ankah_post_payload;
 typedef struct ankah_session_snapshot ankah_session_snapshot;
 
 typedef struct {
+    char host[256];
     char id[33];
     char token[33];
     char challenge[ANKAH_CHALLENGE_TEXT_MAX];
@@ -46,8 +47,9 @@ ankah_session *ankah_session_new_with_proof(const unsigned char secret[ANKAH_SEC
                                             const ankah_request *request,
                                             const char *peer_ip, int proved);
 ankah_session *ankah_session_find(const char *id, uint64_t now);
+ankah_session *ankah_session_find_host(const char *id, uint64_t now, const char *host);
 ankah_session *ankah_session_accept_solved(const char *id, uint64_t now,
-                                            const char *target, int is_post);
+                                            const char *target, int is_post, const char *host);
 void ankah_session_discard(ankah_session *session);
 int ankah_session_append(ankah_session *session, const void *data, size_t size);
 int ankah_session_solve(ankah_session *session, uint64_t now);
@@ -73,7 +75,7 @@ int ankah_session_snapshot_saved_ids(const unsigned char *data, size_t size,
                                      size_t *count);
 void ankah_session_discard_saved_posts(void);
 /* Returns -2 when the consumption journal is malformed or unreadable. */
-int ankah_session_restore(const char *path, uint64_t now);
+int ankah_session_restore(const char *path, uint64_t now, const char *primary_host);
 void ankah_session_each_solved(uint64_t now,
                                void (*visit)(const ankah_session *, void *), void *owner);
 /* Expires stale sessions as a side effect, like ankah_session_find. */

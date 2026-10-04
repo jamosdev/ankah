@@ -157,7 +157,8 @@ typedef struct {
 struct connection {
     uv_tcp_t client;
     union { uv_tcp_t tcp; uv_pipe_t pipe; } upstream;
-    ankah_host *host;
+    ankah_host *host; /* Exact streaming route only. */
+    ankah_host *selected_host;
     unsigned int route_id;
     unsigned int bridge_port;
     uint64_t connect_deadline_ns;
@@ -367,6 +368,7 @@ typedef struct {
     static_asset dashboard_assets[DASHBOARD_ASSET_COUNT];
     static_asset dashboard_pages[ANKAH_LANGUAGE_COUNT];
     ankah_static_bundle static_bundle;
+    int static_challenge;
     size_t static_cache_limit, static_cache_used;
     size_t max_upload;
     cache_blob *cache_first, *cache_last;
@@ -425,6 +427,7 @@ static void close_connection(connection *c);
 static void send_asset_chunk(connection *c);
 static size_t send_asset_chunk_limit(connection *c, size_t limit);
 static void handle_challenge(connection *c);
+static int request_proved(const ankah_request *request, const char *host);
 static void throttle_release(connection *c);
 static void send_replay_chunk(connection *c);
 static int queue_bytes(connection *c, uv_stream_t *destination,
@@ -624,10 +627,28 @@ static int request_session_id(const ankah_request *request, char id[33]) {
     return 0;
 }
 
-static ankah_session *request_session(const ankah_request *request) {
+static const char *connection_origin(const connection *c) {
+    return c->selected_host ? c->selected_host->origin : config.public_origin;
+}
+
+static const char *connection_host(const connection *c) {
+    return c->selected_host ? c->selected_host->authority : config.public_host;
+}
+
+static const ankah_static_bundle *connection_bundle(const connection *c) {
+    return c->selected_host && !c->selected_host->primary ?
+        &c->selected_host->bundle : &config.static_bundle;
+}
+
+static int connection_static_challenge(const connection *c) {
+    return c->selected_host && !c->selected_host->primary ?
+        c->selected_host->static_challenge : config.static_challenge;
+}
+
+static ankah_session *request_session(const ankah_request *request, const char *host) {
     char id[33];
     if (request_session_id(request, id) != 0) return NULL;
-    return ankah_session_find(id, (uint64_t)time(NULL));
+    return ankah_session_find_host(id, (uint64_t)time(NULL), host);
 }
 
 static int html_escape(const char *source, char *out, size_t capacity) {
@@ -671,22 +692,22 @@ static int valid_return_path(const char *path) {
     return 1;
 }
 
-static void referer_return_path(const ankah_request *request, char *out, size_t capacity) {
-    const char *referer = ankah_header_value(request, "Referer");
-    size_t origin = strlen(config.public_origin);
+static void referer_return_path(const connection *c, char *out, size_t capacity) {
+    const char *referer = ankah_header_value(&c->request, "Referer");
+    size_t origin = strlen(connection_origin(c));
     const char *path;
     strcpy(out, "/");
-    if (!referer || !starts_ascii(referer, config.public_origin) ||
+    if (!referer || !starts_ascii(referer, connection_origin(c)) ||
         referer[origin] != '/') return;
     path = referer + origin;
     if (valid_return_path(path) && strlen(path) < capacity) strcpy(out, path);
 }
 
-static int unlock_url(const char *return_path, char *out, size_t capacity) {
+static int unlock_url(const connection *c, const char *return_path, char *out, size_t capacity) {
     int length = strcmp(return_path, "/") == 0 ?
-        snprintf(out, capacity, "%s" UNLOCK_PATH, config.public_origin) :
+        snprintf(out, capacity, "%s" UNLOCK_PATH, connection_origin(c)) :
         snprintf(out, capacity, "%s" UNLOCK_PATH "?return=%s",
-                 config.public_origin, return_path);
+                 connection_origin(c), return_path);
     return length < 0 || (size_t)length >= capacity ? -1 : 0;
 }
 
@@ -1271,6 +1292,14 @@ static int host_option(const char *name, const char *value, const option_context
         h->routes[h->route_count++] = r;
         return 0;
     }
+    if (!strcmp(name, "static-bundle")) {
+        if (h->static_directory[0] || !value[0]) return -1;
+        return copy_path(h->static_directory, sizeof(h->static_directory), value, context);
+    }
+    if (!strcmp(name, "static-challenge")) {
+        if (h->static_challenge_seen++) return -1;
+        return boolean_value(value, &h->static_challenge);
+    }
     if (decimal_u64(value, &n) || !n || n > 1073741824) return -1;
 #define LIMIT(KEY, FIELD, MAXIMUM) if (!strcmp(name, KEY)) { \
     if (h->FIELD || n > MAXIMUM) { return -1; } h->FIELD = n; return 0; }
@@ -1371,6 +1400,8 @@ static int apply_option(const char *name, const char *value,
     } else if (strcmp(name, "static-bundle") == 0) {
         if (copy_path(config.static_dir, sizeof(config.static_dir), value, context) != 0)
             return -1;
+    } else if (strcmp(name, "static-challenge") == 0) {
+        return boolean_value(value, &config.static_challenge);
     } else if (strcmp(name, "static-cache-mb") == 0) {
         uint64_t megabytes;
         if (decimal_u64(value, &megabytes) != 0 ||
@@ -1610,6 +1641,7 @@ static int apply_environment(option_state *state) {
         {"ANKAH_ASSETS_DIR", "assets-dir"},
         {"ANKAH_MASCOT_FILE", "mascot-file"},
         {"ANKAH_STATIC_BUNDLE", "static-bundle"},
+        {"ANKAH_STATIC_CHALLENGE", "static-challenge"},
         {"ANKAH_STATIC_CACHE_MB", "static-cache-mb"},
         {"ANKAH_MAX_UPLOAD_MB", "max-upload-mb"},
         {"ANKAH_STATIC_THROTTLE_PREFIX", "static-throttle-prefix"},
@@ -1672,23 +1704,26 @@ static int finish_configuration(void) {
         unsigned int i, j;
         if (config.http3_enabled || !config.tls_certificate[0] ||
             ankah_host_origin(&config.hosts[0], config.public_origin)) return -1;
+        config.hosts[0].primary = 1;
         strcpy(config.hosts[0].certificate, config.tls_certificate);
         strcpy(config.hosts[0].key, config.tls_key);
         for (i = 1; i < config.host_count; ++i) {
             ankah_host *h = &config.hosts[i];
             char ip[64];
             int port;
-            if (!h->origin[0] || !h->certificate[0] || !h->key[0] || !h->route_count ||
-                !h->body_limit || !h->concurrency || !h->connect_ms ||
-                !h->upload_ms || h->response_ms < h->upload_ms) return -1;
-            if (prefix(h->upstream, "unix:")) {
+            if (!h->origin[0] || !h->certificate[0] || !h->key[0] ||
+                (!h->route_count && !h->static_directory[0]) ||
+                (h->static_challenge && !h->static_directory[0])) return -1;
+            if (h->route_count && (!h->body_limit || !h->concurrency || !h->connect_ms ||
+                !h->upload_ms || h->response_ms < h->upload_ms)) return -1;
+            if (h->route_count && prefix(h->upstream, "unix:")) {
 #ifdef _WIN32
                 return -1;
 #else
                 if (h->upstream[5] != '/' || !h->upstream[6] || strlen(h->upstream + 5) >= 108)
                     return -1;
 #endif
-            } else if (parse_address(h->upstream, ip, sizeof(ip), &port)) return -1;
+            } else if (h->route_count && parse_address(h->upstream, ip, sizeof(ip), &port)) return -1;
             for (j = 0; j < i; ++j)
                 if (!strcmp(h->name, config.hosts[j].name)) return -1;
         }
@@ -1794,6 +1829,22 @@ static int finish_configuration(void) {
         strcmp(config.static_bundle.prefix, "/") != 0 &&
         (prefix(config.dashboard_public_route, config.static_bundle.prefix) ||
          prefix(config.static_bundle.prefix, config.dashboard_public_route))) return -1;
+    if (config.static_challenge && !config.static_dir[0]) return -1;
+    {
+        unsigned int i, j;
+        for (i = 0; i < config.host_count; ++i) {
+            ankah_host *h = &config.hosts[i];
+            strcpy(h->dashboard_route, config.dashboard_public_route);
+            if (h->static_directory[0] &&
+                (ankah_static_load(&h->bundle, h->static_directory) || h->bundle.fallback_url))
+                return -1;
+            if (h->dashboard_route[0] && h->bundle.prefix && strcmp(h->bundle.prefix, "/") &&
+                (prefix(h->dashboard_route, h->bundle.prefix) ||
+                 prefix(h->bundle.prefix, h->dashboard_route))) return -1;
+            for (j = 0; j < h->route_count; ++j)
+                if (ankah_host_local_path(h, h->routes[j].path)) return -1;
+        }
+    }
     if (config.throttle_prefix_count) {
         unsigned int j;
         for (j = 0; j < config.throttle_prefix_count; ++j)
@@ -2527,9 +2578,9 @@ static int optional_header_is(const ankah_request *request, const char *name,
 static int spa_navigation(const connection *c, const char *path) {
     const char *segment, *p;
     size_t length;
-    if (!config.static_bundle.fallback_url ||
-        strncmp(path, config.static_bundle.prefix,
-                strlen(config.static_bundle.prefix)) != 0 ||
+    if (!connection_bundle(c)->fallback_url ||
+        strncmp(path, connection_bundle(c)->prefix,
+                strlen(connection_bundle(c)->prefix)) != 0 ||
         (strcmp(c->request.method, "GET") != 0 &&
          strcmp(c->request.method, "HEAD") != 0) ||
         c->request.has_body || c->request.websocket ||
@@ -2667,9 +2718,11 @@ static const char *pass_cookie_value(const ankah_request *request,
     return out;
 }
 
-static int request_throttle_identity(const ankah_request *request,
+static int request_throttle_identity(const connection *c,
                                      char out[ANKAH_CLIENT_ID_TEXT_SIZE]) {
-    ankah_session *session = request_session(request);
+    const ankah_request *request = &c->request;
+    const char *host = connection_host(c);
+    ankah_session *session = request_session(request, host);
     char pass[ANKAH_PASS_TEXT_MAX];
     uint64_t now = (uint64_t)time(NULL);
     if (ankah_session_solved(session, now)) {
@@ -2677,7 +2730,7 @@ static int request_throttle_identity(const ankah_request *request,
         return 0;
     }
     if (!pass_cookie_value(request, pass)) return -1;
-    return ankah_check_pass_identity(config.secret, config.public_host, now, pass, out);
+    return ankah_check_pass_identity(config.secret, host, now, pass, out);
 }
 
 static int throttle_path_matches(const char *path) {
@@ -2978,7 +3031,7 @@ static int serve_static_entry(connection *c, const ankah_static_entry *entry,
                            "Content-Range: bytes */%zu\r\n", variant->size);
     } else written = 0;
     if (written < 0 || (size_t)written >= sizeof(range_field)) goto failed;
-    cache_control = fallback ? "private, no-cache" :
+    cache_control = (fallback || connection_static_challenge(c)) ? "private, no-cache" :
         entry->immutable ? "public, max-age=31536000, immutable" :
                            "public, max-age=60";
     vary = fallback ? "Accept, Sec-Fetch-Mode, Sec-Fetch-Dest, Accept-Encoding" :
@@ -3049,21 +3102,30 @@ static int static_route(const connection *c) {
     if (config.dashboard &&
         (dashboard_public_target(c->request.target) || dashboard_public_bare_path(c)))
         return 0;
-    if (!config.static_bundle.prefix || static_request_path(c, path) != 0) return 0;
-    return ankah_static_find(&config.static_bundle, path) ||
+    if (!connection_bundle(c)->prefix || static_request_path(c, path) != 0) return 0;
+    return ankah_static_find(connection_bundle(c), path) ||
            (!spa_navigation(c, path) &&
-            ankah_static_in_namespace(&config.static_bundle, path));
+            ankah_static_in_namespace(connection_bundle(c), path));
 }
 
 static int serve_static_if_matched(connection *c) {
     const ankah_static_entry *entry;
     char path[ANKAH_MAX_TARGET];
     if (!static_route(c) || static_request_path(c, path) != 0) return 0;
-    entry = ankah_static_find(&config.static_bundle, path);
+    entry = ankah_static_find(connection_bundle(c), path);
     if (entry) {
-        if (throttle_path_matches(path)) {
+        if (strcmp(c->request.method, "GET") && strcmp(c->request.method, "HEAD")) {
+            respond(c, 405, "Method Not Allowed", "text/plain", "Method not allowed\n", "Allow: GET, HEAD\r\n");
+            return 1;
+        }
+        if (connection_static_challenge(c) &&
+            !request_proved(&c->request, connection_host(c))) {
+            handle_challenge(c);
+            return 1;
+        }
+        if ((!c->selected_host || c->selected_host->primary) && throttle_path_matches(path)) {
             char identity[ANKAH_CLIENT_ID_TEXT_SIZE];
-            if (request_throttle_identity(&c->request, identity) != 0) {
+            if (request_throttle_identity(c, identity) != 0) {
                 handle_challenge(c);
                 return 1;
             }
@@ -3079,12 +3141,12 @@ static int serve_static_if_matched(connection *c) {
 static int spa_route(const connection *c) {
     char path[ANKAH_MAX_TARGET];
     return static_request_path(c, path) == 0 && spa_navigation(c, path) &&
-           ankah_static_fallback(&config.static_bundle) != NULL;
+           ankah_static_fallback(connection_bundle(c)) != NULL;
 }
 
 static int serve_spa_fallback(connection *c) {
     if (!spa_route(c)) return 0;
-    return serve_static_entry(c, ankah_static_fallback(&config.static_bundle), 1, NULL);
+    return serve_static_entry(c, ankah_static_fallback(connection_bundle(c)), 1, NULL);
 }
 
 static void respond(connection *c, int status, const char *reason,
@@ -3196,16 +3258,16 @@ static int admit_request(connection *c) {
     return 0;
 }
 
-static int cookie_valid(const ankah_request *request) {
+static int cookie_valid(const ankah_request *request, const char *host) {
     char pass[ANKAH_PASS_TEXT_MAX];
     if (!pass_cookie_value(request, pass)) return 0;
-    return ankah_check_pass(config.secret, config.public_host,
+    return ankah_check_pass(config.secret, host,
                             (uint64_t)time(NULL), pass) == 0;
 }
 
-static int request_proved(const ankah_request *request) {
-    return ankah_session_solved(request_session(request), (uint64_t)time(NULL)) ||
-           cookie_valid(request);
+static int request_proved(const ankah_request *request, const char *host) {
+    return ankah_session_solved(request_session(request, host), (uint64_t)time(NULL)) ||
+           cookie_valid(request, host);
 }
 
 static int claims_bingbot(const ankah_request *request) {
@@ -3240,11 +3302,22 @@ static int frontend_admit(const ankah_request *request, const char *host,
     if (config.host_count) {
         int index = ankah_host_find(config.hosts, config.host_count, host);
         if (index < 0) return -index;
-        if (index > 0) { *kind = 1; *proved = 0; *crawler = 0; *bing_claim = 0; return 0; }
+        if (index > 0) {
+            unsigned int route;
+            int validation = ankah_host_request(&config.hosts[index], request, host,
+                                                 ankah_header_value(request, "Host") == NULL, &route);
+            if (validation) return validation;
+            if (route != ANKAH_LOCAL_ROUTE) {
+                *kind = 1; *proved = 0; *crawler = 0; *bing_claim = 0;
+                return status;
+            }
+        }
+        host = config.hosts[index].authority;
     } else if (!status && (!host || !same_ascii(host, config.public_host))) status = 421;
+    if (!config.host_count) host = config.public_host;
     if (!status && gateway_blocked(resolved)) status = 403;
     if (!status) {
-        *proved = request_proved(request);
+        *proved = request_proved(request, host);
         *crawler = ankah_google_crawler_is_known(resolved);
         *bing_claim = !*crawler && claims_bingbot(request);
         if (*crawler) *proved = 1;
@@ -3268,11 +3341,12 @@ static int frontend_admit(const ankah_request *request, const char *host,
     return status;
 }
 
-static int allowed(const ankah_request *request, int proved, int crawler) {
+static int allowed(const connection *c, int proved, int crawler) {
     unsigned int i;
     if (proved || crawler) return 1;
+    if (c->selected_host && !c->selected_host->primary) return 0;
     for (i = 0; i < config.allow_count; ++i) {
-        if (prefix(request->target, config.allow[i])) return 1;
+        if (prefix(c->request.target, config.allow[i])) return 1;
     }
     return 0;
 }
@@ -3362,7 +3436,7 @@ static int parse_answer(const char *target, char *challenge, size_t capacity,
     return decimal_u64(answer, counter);
 }
 
-static int render_script(const char *challenge, ankah_language language,
+static int render_script(const connection *c, const char *challenge, ankah_language language,
                          char *out, size_t capacity) {
     const char *source = (const char *)config.assets[5].data;
     char solver_path[160], solver_url[512];
@@ -3371,7 +3445,7 @@ static int render_script(const char *challenge, ankah_language language,
     int length;
     if (asset_path(4, solver_path, sizeof(solver_path)) != 0) return -1;
     length = snprintf(solver_url, sizeof(solver_url), "%s%s",
-                      config.public_origin, solver_path);
+                      connection_origin(c), solver_path);
     if (length < 0 || (size_t)length >= sizeof(solver_url)) return -1;
     while (*source) {
         amount = 1;
@@ -3380,7 +3454,7 @@ static int render_script(const char *challenge, ankah_language language,
             replacement = solver_url;
             amount = strlen("@ANKAH_SOLVER_URL@");
         } else if (prefix(source, "@ANKAH_ORIGIN@")) {
-            replacement = config.public_origin;
+            replacement = connection_origin(c);
             amount = strlen("@ANKAH_ORIGIN@");
         } else if (prefix(source, "@ANKAH_CHALLENGE@")) {
             replacement = challenge;
@@ -3404,7 +3478,7 @@ static int command_line_client(const ankah_request *request) {
     return agent && (prefix(agent, "curl/") || prefix(agent, "Wget/"));
 }
 
-static int curl_instructions(ankah_language language, const char *message, const char *challenge,
+static int curl_instructions(const connection *c, ankah_language language, const char *message, const char *challenge,
                              char *out, size_t capacity) {
     int length = snprintf(out, capacity,
                           "%s%s%s"
@@ -3412,7 +3486,7 @@ static int curl_instructions(ankah_language language, const char *message, const
                           "Windows: curl.exe -fsSL -o ankah.cmd '%s/ankah/challenge/%s' && ankah.cmd\n",
                           ankah_language_message(language, message), *message ? "\n" : "",
                           ankah_language_message(language, "Ankah challenge required.\n"),
-                          config.public_origin, challenge, config.public_origin, challenge);
+                          connection_origin(c), challenge, connection_origin(c), challenge);
     return length < 0 || (size_t)length >= capacity ? -1 : 0;
 }
 
@@ -3421,12 +3495,12 @@ static void respond_curl_challenge(connection *c, int status, const char *reason
     char challenge[ANKAH_CHALLENGE_TEXT_MAX], body[4096], extra[512] = "";
     ankah_language language = ankah_language_select(&c->request);
     int length;
-    if (ankah_issue_challenge(config.secret, config.public_host,
+    if (ankah_issue_challenge(config.secret, connection_host(c),
                               (uint64_t)time(NULL), 18, challenge) != 0) {
         respond(c, 503, "Unavailable", "text/plain", "Challenge unavailable\n", NULL);
         return;
     }
-    if (curl_instructions(language, message, challenge, body, sizeof(body)) != 0) {
+    if (curl_instructions(c, language, message, challenge, body, sizeof(body)) != 0) {
         close_connection(c); return;
     }
     if (redirect) {
@@ -3443,7 +3517,7 @@ static void respond_curl_challenge(connection *c, int status, const char *reason
 static void respond_unlock_required(connection *c, int status, const char *reason,
                                     const char *message, const char *extra) {
     char return_path[MAX_RETURN_PATH + 1];
-    char link[sizeof(config.public_origin) + ANKAH_MAX_TARGET];
+    char link[256 + ANKAH_MAX_TARGET];
     char escaped[sizeof(link) * 6];
     char body[sizeof(escaped) + 1024];
     char headers[512];
@@ -3454,8 +3528,8 @@ static void respond_unlock_required(connection *c, int status, const char *reaso
         respond_curl_challenge(c, status, reason, message, 0);
         return;
     }
-    referer_return_path(&c->request, return_path, sizeof(return_path));
-    if (unlock_url(return_path, link, sizeof(link)) != 0) { close_connection(c); return; }
+    referer_return_path(c, return_path, sizeof(return_path));
+    if (unlock_url(c, return_path, link, sizeof(link)) != 0) { close_connection(c); return; }
     if (!accepts_html(&c->request)) {
         length = snprintf(body, sizeof(body), "%s\n%s%s\n", message,
                           ankah_language_message(language, "Unlock: "), link);
@@ -3592,7 +3666,7 @@ static void render_gate(connection *c, ankah_session *session) {
         "script-src 'self' 'wasm-unsafe-eval'; "
         "worker-src 'self'; style-src 'unsafe-inline'; connect-src 'self'; "
         "form-action 'self'; frame-ancestors 'none'\r\n",
-        session->id, prefix(config.public_origin, "https://") ? "; Secure" : "");
+        session->id, prefix(connection_origin(c), "https://") ? "; Secure" : "");
     if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
     respond(c, 428, "Precondition Required", "text/html; charset=utf-8", body, extra);
 }
@@ -3609,7 +3683,7 @@ static void handle_challenge(connection *c) {
             return;
         }
         ankah_session *session = ankah_session_new_with_proof(config.secret,
-            config.public_host, (uint64_t)time(NULL), &c->request, c->peer_ip, c->proved);
+            connection_host(c), (uint64_t)time(NULL), &c->request, c->peer_ip, c->proved);
         size_t end = header_end(c->initial, c->initial_size);
         if (!session) {
             tally(c, ANKAH_STAT_challenge_session_rejected, 1);
@@ -3651,7 +3725,7 @@ static void handle_unlock(connection *c) {
         respond_curl_challenge(c, 302, "Found", "", 1);
         return;
     }
-    session = ankah_session_new_with_proof(config.secret, config.public_host,
+    session = ankah_session_new_with_proof(config.secret, connection_host(c),
                                 (uint64_t)time(NULL), &c->request, c->peer_ip, c->proved);
     if (!session) {
         tally(c, ANKAH_STAT_challenge_session_rejected, 1);
@@ -3693,7 +3767,7 @@ static void serve_mascot(connection *c, int dashboard) {
 
 static void handle_internal(connection *c) {
     const char *target = c->request.target;
-    const char *host = config.public_host;
+    const char *host = connection_host(c);
     if (strcmp(target, "/ankah/mascot.png") == 0 &&
         (strcmp(c->request.method, "GET") == 0 ||
          strcmp(c->request.method, "HEAD") == 0)) {
@@ -3715,17 +3789,21 @@ static void handle_internal(connection *c) {
             respond(c, 404, "Not Found", "text/plain", "Unknown code\n", NULL); return;
         }
         memcpy(key, id, 32); key[32] = 0;
-        session = ankah_session_find(key, (uint64_t)time(NULL));
+        session = ankah_session_find_host(key, (uint64_t)time(NULL), host);
+        if (!session && ((c->selected_host && !c->selected_host->primary) ||
+                         ankah_session_find(key, (uint64_t)time(NULL)))) {
+            respond(c, 404, "Not Found", "text/plain", "Unknown code\n", NULL); return;
+        }
         if (!session) {
             char challenge[ANKAH_CHALLENGE_TEXT_MAX];
-            if (ankah_challenge_for_session(config.secret, config.public_host,
+            if (ankah_challenge_for_session(config.secret, connection_host(c),
                     (uint64_t)time(NULL), key, challenge) != 0) {
                 respond(c, 404, "Not Found", "text/plain", "Unknown code\n", NULL);
                 return;
             }
         }
         if (snprintf(url, sizeof(url), "%s/ankah/solve/%s",
-                                 config.public_origin, key) >= (int)sizeof(url) ||
+                                 connection_origin(c), key) >= (int)sizeof(url) ||
             ankah_qr_png(url, &png, &size) != 0) {
             respond(c, 404, "Not Found", "text/plain", "Unknown code\n", NULL); return;
         }
@@ -3734,17 +3812,18 @@ static void handle_internal(connection *c) {
         return;
     }
     if (prefix(target, "/ankah/solve/") && strcmp(c->request.method, "GET") == 0) {
-        ankah_session *session = ankah_session_find(target + strlen("/ankah/solve/"),
-                                                    (uint64_t)time(NULL));
+        ankah_session *session = ankah_session_find_host(target + strlen("/ankah/solve/"),
+                                                    (uint64_t)time(NULL), host);
         ankah_session reconstructed = {0};
         char body[8192], challenge_text[4096];
         char script[160], worker_js[160] = "", wasm_path[160] = "";
         ankah_language language = ankah_language_select(&c->request);
         int n;
-        if (!session) {
+        if (!session && (!c->selected_host || c->selected_host->primary) &&
+            !ankah_session_find(target + strlen("/ankah/solve/"), (uint64_t)time(NULL))) {
             const char *id = target + strlen("/ankah/solve/");
             if (strlen(id) == 32 && ankah_challenge_for_session(config.secret,
-                    config.public_host, (uint64_t)time(NULL), id,
+                    connection_host(c), (uint64_t)time(NULL), id,
                     reconstructed.challenge) == 0) {
                 strcpy(reconstructed.id, id);
                 session = &reconstructed;
@@ -3809,8 +3888,9 @@ static void handle_internal(connection *c) {
             respond(c, 400, "Bad Request", "text/plain", "Invalid answer\n", NULL); return;
         }
         memcpy(key, target + strlen("/ankah/answer/"), 32); key[32] = 0;
-        session = ankah_session_find(key, (uint64_t)time(NULL));
-        if (!session) {
+        session = ankah_session_find_host(key, (uint64_t)time(NULL), host);
+        if (!session && (!c->selected_host || c->selected_host->primary) &&
+            !ankah_session_find(key, (uint64_t)time(NULL))) {
             char reconstructed[ANKAH_CHALLENGE_TEXT_MAX];
             if (ankah_challenge_for_session(config.secret, host,
                     (uint64_t)time(NULL), key, reconstructed) == 0 &&
@@ -3818,7 +3898,7 @@ static void handle_internal(connection *c) {
                 ankah_check_answer(config.secret, host, (uint64_t)time(NULL),
                                    reconstructed, counter) == 0)
                 session = ankah_session_accept_solved(key, (uint64_t)time(NULL),
-                                                       NULL, 0);
+                                                       NULL, 0, host);
         }
         if (decimal_u64(answer + 8, &counter) != 0 || !session ||
             (!session->challenge[0] &&
@@ -3838,12 +3918,18 @@ static void handle_internal(connection *c) {
         return;
     }
     if (prefix(target, "/ankah/finish/") && strcmp(c->request.method, "GET") == 0) {
-        ankah_session *session = ankah_session_find(target + strlen("/ankah/finish/"),
-                                                    (uint64_t)time(NULL));
-        char extra[sizeof(config.public_origin) + ANKAH_MAX_TARGET + 320];
+        const char *id = target + strlen("/ankah/finish/");
+        char key[33];
+        ankah_session *session = NULL;
+        char extra[256 + ANKAH_MAX_TARGET + 320];
         char pass[ANKAH_PASS_TEXT_MAX];
         int n;
-        if (!session || session != request_session(&c->request) || session->is_post ||
+        /* Browsers append an empty query when submitting the GET finish form. */
+        if (strcspn(id, "?") == 32 && (!id[32] || (id[32] == '?' && !id[33]))) {
+            memcpy(key, id, 32); key[32] = 0;
+            session = ankah_session_find_host(key, (uint64_t)time(NULL), host);
+        }
+        if (!session || session != request_session(&c->request, connection_host(c)) || session->is_post ||
             !ankah_session_solved(session, (uint64_t)time(NULL))) {
             respond(c, 403, "Forbidden", "text/plain", "Challenge not passed\n", NULL); return;
         }
@@ -3854,18 +3940,18 @@ static void handle_internal(connection *c) {
         }
         if (session->target[1] == '/' || session->target[1] == '\\')
             n = snprintf(extra, sizeof(extra), "Location: %s%s\r\n",
-                         config.public_origin, session->target);
+                         connection_origin(c), session->target);
         else
             n = snprintf(extra, sizeof(extra), "Location: %s\r\n", session->target);
         if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
-        if (ankah_issue_pass(config.secret, config.public_host,
+        if (ankah_issue_pass(config.secret, connection_host(c),
                              (uint64_t)time(NULL) + 43200, pass) != 0) {
             close_connection(c); return;
         }
         n += snprintf(extra + n, sizeof(extra) - (size_t)n,
                       "Set-Cookie: ankah_pass=%s; Max-Age=43200; Path=/; "
                       "HttpOnly; SameSite=Lax%s\r\n", pass,
-                      config.public_https ? "; Secure" : "");
+                      prefix(connection_origin(c), "https://") ? "; Secure" : "");
         if (n < 0 || (size_t)n >= sizeof(extra)) { close_connection(c); return; }
         tally(c, ANKAH_STAT_passes_issued, 1);
         respond(c, 303, "See Other", "text/plain", "Continuing\n", extra);
@@ -3883,7 +3969,7 @@ static void handle_internal(connection *c) {
         char script[8192];
         if (strlen(challenge) >= ANKAH_CHALLENGE_TEXT_MAX ||
             strspn(challenge, "0123456789abcdef.") != strlen(challenge) ||
-            render_script(challenge, ankah_language_select(&c->request),
+            render_script(c, challenge, ankah_language_select(&c->request),
                           script, sizeof(script)) != 0) {
             respond(c, 400, "Bad Request", "text/plain", "Invalid challenge\n", NULL);
             return;
@@ -3900,7 +3986,7 @@ static void handle_internal(connection *c) {
             respond(c, 400, "Bad Request", "text/plain", "Invalid challenge\n", NULL);
             return;
         }
-        if (curl_instructions(ankah_language_select(&c->request), "",
+        if (curl_instructions(c, ankah_language_select(&c->request), "",
                               challenge, body, sizeof(body)) != 0) {
             close_connection(c); return;
         }
@@ -3922,7 +4008,7 @@ static void handle_internal(connection *c) {
         tally(c, ANKAH_STAT_passes_issued, 1);
         length = snprintf(header, sizeof(header),
                           "Set-Cookie: ankah_pass=%s; Max-Age=43200; Path=/; HttpOnly; SameSite=Lax%s\r\n",
-                          pass, prefix(config.public_origin, "https://") ? "; Secure" : "");
+                          pass, prefix(connection_origin(c), "https://") ? "; Secure" : "");
         if (length < 0 || (size_t)length >= sizeof(header)) { close_connection(c); return; }
         respond(c, 200, "OK", "text/plain", "Challenge passed. Retry your request.\n", header);
         return;
@@ -4258,7 +4344,7 @@ static void start_remote_continue(connection *c, const char id[33],
 }
 
 static void finish_continue(connection *c) {
-    ankah_session *session = request_session(&c->request);
+    ankah_session *session = request_session(&c->request, connection_host(c));
     consume_job *job;
     char id[33];
     char token[33];
@@ -4317,8 +4403,8 @@ static void finish_continue(connection *c) {
 }
 
 static void finish_continue_after_ack(connection *c, int result) {
-    ankah_session *session = ankah_session_find(c->continue_session_id,
-                                                (uint64_t)time(NULL));
+    ankah_session *session = ankah_session_find_host(c->continue_session_id,
+                                                (uint64_t)time(NULL), connection_host(c));
     ankah_request *saved = NULL;
     unsigned char *body = NULL;
     ankah_post_payload *payload = NULL;
@@ -4367,7 +4453,7 @@ static void peer_consume_failure(ankah_link_connection *link_connection,
 }
 
 static void finish_peer_consume(consume_job *job, int result) {
-    ankah_session *session = ankah_session_find(job->id, (uint64_t)time(NULL));
+    ankah_session *session = ankah_session_find_host(job->id, (uint64_t)time(NULL), config.public_host);
     ankah_request *saved = NULL;
     unsigned char *body = NULL, *message = NULL;
     ankah_post_payload *payload = NULL;
@@ -5428,7 +5514,7 @@ static int continuation_route(const connection *c) {
     if (strcmp(c->request.method, "POST") != 0) return 0;
     if (!type || !prefix(type, "application/x-www-form-urlencoded") ||
         c->request.content_length != 47) return 0;
-    session = request_session(&c->request);
+    session = request_session(&c->request, connection_host(c));
     if (session && session->is_post &&
         strcmp(c->request.target, session->target) == 0 &&
         ankah_session_solved(session, (uint64_t)time(NULL))) return 1;
@@ -5443,15 +5529,15 @@ static request_route route_request(const connection *c) {
         (dashboard_public_bare_path(c) ||
          dashboard_public_target(c->request.target)))
         return ROUTE_DASHBOARD_GONE;
-    if (health_route(c)) return ROUTE_HEALTH;
-    if (continuation_route(c)) return ROUTE_CONTINUATION;
+    if ((!c->selected_host || c->selected_host->primary) && health_route(c)) return ROUTE_HEALTH;
+    if ((!c->selected_host || c->selected_host->primary) && continuation_route(c)) return ROUTE_CONTINUATION;
     if (dashboard_public_api(c)) return ROUTE_DASHBOARD_API;
     if (prefix(c->request.target, "/ankah/")) return ROUTE_INTERNAL;
     if (static_route(c)) return ROUTE_STATIC;
-    if (!allowed(&c->request, c->proved, c->crawler)) return ROUTE_CHALLENGE;
+    if (!allowed(c, c->proved, c->crawler)) return ROUTE_CHALLENGE;
     if (dashboard_public_bare_path(c)) return ROUTE_DASHBOARD_REDIRECT;
     if (dashboard_public_target(c->request.target)) return ROUTE_DASHBOARD_ASSET;
-    if (spa_route(c)) return ROUTE_SPA;
+    if ((!c->selected_host || c->selected_host->primary) && spa_route(c)) return ROUTE_SPA;
     return ROUTE_UPSTREAM;
 }
 
@@ -5523,7 +5609,8 @@ static void handle_initial(connection *c) {
                     "text/plain", "Request rejected\n", NULL);
             return;
         }
-        if (host_index > 0) {
+        c->selected_host = &config.hosts[host_index];
+        if (host_index > 0 && route_id != ANKAH_LOCAL_ROUTE) {
             c->host = &config.hosts[host_index];
             c->route_id = route_id;
             registry_unlink(c);
@@ -5600,7 +5687,7 @@ static void handle_initial(connection *c) {
         respond(c, 400, "Bad Request", "text/plain", "Invalid admission information\n", NULL);
         return;
     }
-    if (!preadmitted) c->proved = c->crawler || request_proved(&c->request);
+    if (!preadmitted) c->proved = c->crawler || request_proved(&c->request, connection_host(c));
     if (!preadmitted) {
         int crawler_result = classify_crawler(c, 0);
         if (crawler_result) return;
@@ -5656,6 +5743,12 @@ static void handle_initial(connection *c) {
         return;
     }
     route = route_request(c);
+    if (route == ROUTE_CHALLENGE && c->selected_host && !c->selected_host->primary &&
+        strcmp(c->request.method, "GET") && strcmp(c->request.method, "HEAD")) {
+        respond(c, 405, "Method Not Allowed", "text/plain", "Method not allowed\n",
+                "Allow: GET, HEAD\r\n");
+        return;
+    }
     if (route == ROUTE_DASHBOARD_API) c->dashboard_api = 1;
     if (route == ROUTE_CHALLENGE && c->trusted_direct_peer) {
         abuse_event(c, ANKAH_ABUSE_SCAN, c->request.target);
@@ -6357,7 +6450,8 @@ static void send_solved_to(const ankah_session *session,
     unsigned char message[32 + 1 + 2 + ANKAH_MAX_TARGET];
     size_t length;
     int type;
-    if (!session || !ankah_session_solved(session, (uint64_t)time(NULL))) return;
+    if (!session || strcmp(session->host, config.public_host) ||
+        !ankah_session_solved(session, (uint64_t)time(NULL))) return;
     memcpy(message, session->id, 32);
     if (session->target[0]) {
         length = strlen(session->target);
@@ -6459,7 +6553,7 @@ static void on_peer_consume_request(const unsigned char *data, size_t size,
     memcpy(id, data + 8, 32); id[32] = 0;
     memcpy(token, data + 40, 32); token[32] = 0;
     memcpy(target, data + 74, target_size); target[target_size] = 0;
-    session = ankah_session_find(id, (uint64_t)time(NULL));
+    session = ankah_session_find_host(id, (uint64_t)time(NULL), config.public_host);
     if (!session) return;
     if (!session->saved_request) {
         if (session->peer_ip[0]) peer_consume_failure(connection, request_id, 2);
@@ -6535,11 +6629,11 @@ static void on_link_message(int type, const unsigned char *data, size_t size,
     }
     if (type == ANKAH_LINK_SOLVED && size == 32) {
         memcpy(id, data, 32); id[32] = 0;
-        session = ankah_session_find(id, now);
+        session = ankah_session_find_host(id, now, config.public_host);
         if (session) {
             if (!ankah_session_solved(session, now) &&
                 ankah_session_solve(session, now) != 0) return;
-        } else session = ankah_session_accept_solved(id, now, NULL, 0);
+        } else session = ankah_session_accept_solved(id, now, NULL, 0, config.public_host);
         if (session && session->target[0]) send_solved_to(session, connection);
         return;
     }
@@ -6552,7 +6646,7 @@ static void on_link_message(int type, const unsigned char *data, size_t size,
         target[length] = 0;
         if (!valid_return_path(target)) return;
         memcpy(id, data, 32); id[32] = 0;
-        (void)ankah_session_accept_solved(id, now, target, data[32]);
+        (void)ankah_session_accept_solved(id, now, target, data[32], config.public_host);
         return;
     }
     if (type == ANKAH_LINK_BLOCKS && size >= 1 &&
@@ -6730,7 +6824,7 @@ int main(int argc, char **argv) {
                         "[--listen ip:port] [--upstream ip:port] "
                         "[--ankah-link host[:port]] [--ankah-link-listen ip:port] "
                         "[--allow-prefix /path] [--max-upload-mb n] "
-                        "[--static-bundle dir] [--static-cache-mb n] "
+                        "[--static-bundle dir] [--static-challenge true|false] [--static-cache-mb n] "
                         "[--mascot-file path] "
                         "[--static-throttle-prefix /path/] "
                         "[--static-throttle-global-connections n] "
@@ -6769,7 +6863,7 @@ int main(int argc, char **argv) {
     config.loop = uv_default_loop();
     if (config.session_state_path[0]) {
         int restored = ankah_session_restore(config.session_state_path,
-                                             (uint64_t)time(NULL));
+                                             (uint64_t)time(NULL), config.public_host);
         if (restored == -2)
             fprintf(stderr, "Ankah consumption journal was unavailable or invalid: %s\n",
                     config.session_state_path);

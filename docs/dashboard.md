@@ -4,6 +4,12 @@ Ankah collects traffic statistics and serves the dashboard at
 `/ankah-admin/` on the public listener by default. For a site with
 `--public-origin https://example.test`, open
 `https://example.test/ankah-admin/`. Ankah logs the public route at startup.
+With virtual hosts, that public prefix is available on every configured host.
+All hosts expose the same process-wide credentials, statistics, mascot and
+controls; disabling the dashboard affects all of them. Browser session storage
+remains local to each origin. Startup disable and private-only listener settings
+still apply globally. See [virtual hosts](virtual-hosts.md).
+
 Dashboard API requests require a token or authenticator session. The page may
 still require a normal challenge before sign-in.
 

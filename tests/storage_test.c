@@ -373,7 +373,7 @@ static void test_journal_sync_failure(const char *base, uint64_t now) {
     assert(file);
     assert(fprintf(file, "%s\n", id_a) == 33);
     assert(fclose(file) == 0);
-    assert(ankah_session_restore(base, now) == 0);
+    assert(ankah_session_restore(base, now, "example.test") == 0);
     assert(ankah_session_find(id_b, now)->saved_request != NULL);
     assert(ankah_session_find(id_a, now)->saved_request == NULL);
     ankah_session_discard(a);
@@ -392,7 +392,7 @@ static void test_malformed_repair(const char *base, uint64_t now) {
     assert(file);
     assert(fwrite("x", 1, 1, file) == 1);
     assert(fclose(file) == 0);
-    assert(ankah_session_restore(base, now) == -2);
+    assert(ankah_session_restore(base, now, "example.test") == -2);
     assert(!ankah_session_find(id, now)->saved_request);
     start_writer(base);
     ankah_disk_session_state_get(&state);

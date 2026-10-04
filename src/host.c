@@ -75,6 +75,17 @@ static int nominated(const char *value, const char *name) {
     }
     return 0;
 }
+int ankah_host_local_path(const ankah_host *host, const char *target) {
+    char path[ANKAH_MAX_TARGET];
+    size_t n = strcspn(target, "?"), dashboard = strlen(host->dashboard_route);
+    if (n >= sizeof(path)) return 0;
+    memcpy(path, target, n); path[n] = 0;
+    if (!strncmp(path, "/ankah/", 7)) return 1;
+    if (dashboard && (!strncmp(path, host->dashboard_route, dashboard) ||
+        (n + 1 == dashboard && !memcmp(path, host->dashboard_route, n)))) return 1;
+    return ankah_static_find(&host->bundle, path) != NULL;
+}
+
 int ankah_host_request(const ankah_host *host, const ankah_request *request,
                        const char *authority, int h2, unsigned int *route) {
     static const char *const sensitive[] = {
@@ -84,6 +95,7 @@ int ankah_host_request(const ankah_host *host, const ankah_request *request,
     unsigned int seen[7] = {0}, i, j, port;
     char name[256];
     int path_found = 0;
+    *route = ANKAH_LOCAL_ROUTE;
     if (ankah_authority(authority, 443, name, &port)) return 400;
     if (strcmp(name, host->name) || port != host->port) return 421;
     for (i = 0; i < request->count; ++i) {
@@ -105,7 +117,7 @@ int ankah_host_request(const ankah_host *host, const ankah_request *request,
                                   equal(header->name, "Upgrade"))) return 400;
     }
     if (!h2 && seen[0] != 1) return 400;
-    if (!host->route_count) return 0;
+    if (host->primary) return 0;
     for (i = 0; i < host->route_count; ++i) {
         if (strcmp(request->target, host->routes[i].path)) continue;
         path_found = 1;
@@ -114,7 +126,8 @@ int ankah_host_request(const ankah_host *host, const ankah_request *request,
             return request->content_length > host->body_limit ? 413 : 0;
         }
     }
-    return path_found ? 405 : 404;
+    if (path_found) return 405;
+    return ankah_host_local_path(host, request->target) ? 0 : 404;
 }
 
 static size_t queue_limit[2], queue_used[2], queue_high[2];

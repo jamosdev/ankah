@@ -102,6 +102,7 @@ struct h2_stream {
     int has_content_length;
     int chunked_bridge;
     int host_index;
+    int exact_route;
     int host_reserved;
     int stream_counted;
     uint64_t header_deadline_ns, response_deadline_ns;
@@ -159,6 +160,7 @@ struct front_connection {
     int timer_initialized;
     int handshake_complete;
     int selected_host;
+    int exact_route;
     int host_reserved;
     int saw_sni;
     uint64_t response_deadline_ns;
@@ -418,9 +420,10 @@ static tls_credentials *credentials_load(void) {
 }
 
 static int validate_host(front_connection *front, const ankah_request *request,
-                          const char *authority, int h2) {
-    unsigned int route = 0, i;
-    int index;
+                          const char *authority, int h2, int *exact) {
+    unsigned int route = ANKAH_LOCAL_ROUTE, i;
+    int index, status;
+    *exact = 0;
     if (!frontend.options.host_count) return 0;
     index = ankah_host_find(frontend.options.hosts, frontend.options.host_count, authority);
     if (index < 0) return -index;
@@ -428,7 +431,9 @@ static int validate_host(front_connection *front, const ankah_request *request,
     for (i = 0; i < request->count; ++i)
         if (strlen(request->headers[i].name) >= 17 &&
             same_ascii_part(request->headers[i].name, 17, "x-ankah-internal-", 17)) return 400;
-    return ankah_host_request(&frontend.options.hosts[index], request, authority, h2, &route);
+    status = ankah_host_request(&frontend.options.hosts[index], request, authority, h2, &route);
+    if (!status) *exact = route != ANKAH_LOCAL_ROUTE;
+    return status;
 }
 
 static int reload_credentials(void) {
@@ -888,13 +893,13 @@ static int send_h1_header(front_connection *front) {
         ankah_stats_add(ANKAH_STAT_responses_4xx, 1);
         return h1_local_response(front, 400, NULL);
     }
-    status = validate_host(front, &parsed, ankah_header_value(&parsed, "Host"), 0);
+    status = validate_host(front, &parsed, ankah_header_value(&parsed, "Host"), 0, &front->exact_route);
     if (status) return h1_local_response(front, status, &parsed);
     status = frontend.options.admit(&parsed, ankah_header_value(&parsed, "Host"),
                                     front->peer_ip, &rate_class, &proved, &crawler,
                                     &bing_claim);
     if (status) return h1_local_response(front, status, &parsed);
-    if (frontend.options.host_count && front->selected_host > 0) {
+    if (front->exact_route) {
         ankah_host *host = &frontend.options.hosts[front->selected_host];
         if (host->active >= host->concurrency) return h1_local_response(front, 503, &parsed);
         ++host->active;
@@ -955,7 +960,7 @@ static int send_h1_header(front_connection *front) {
     free(request);
     front->h1_header_sent = 1;
     front->h1_header_size = 0;
-    if (frontend.options.host_count && front->selected_host > 0) {
+    if (front->exact_route) {
         front->response_deadline_ns = uv_hrtime() +
             (frontend.options.hosts[front->selected_host].response_ms +
              frontend.options.hosts[front->selected_host].connect_ms) * UINT64_C(1000000);
@@ -1625,7 +1630,7 @@ static void on_h2_core_connected(uv_connect_t *request, int status) {
         return;
     }
     stream->core_connected = 1;
-    if (stream->host_index) {
+    if (stream->exact_route) {
         stream->response_deadline_ns = uv_hrtime() +
             (frontend.options.hosts[stream->host_index].response_ms +
              frontend.options.hosts[stream->host_index].connect_ms) * UINT64_C(1000000);
@@ -1741,8 +1746,8 @@ static void h2_dispatch(h2_stream *stream) {
         h2_request_failure(stream, 400, "Invalid HTTP/2 request\n");
         return;
     }
-    if (!stream->host_index) ankah_language_log_request(&stream->request);
-    if (stream->host_index || (stream->has_content_length && stream->declared_length > H2_MAX_BODY)) {
+    if (!stream->exact_route) ankah_language_log_request(&stream->request);
+    if (stream->exact_route || (stream->has_content_length && stream->declared_length > H2_MAX_BODY)) {
         stream->long_timeout = 1;
         ++front->h2_long_streams;
         refresh_timeout(front);
@@ -1801,7 +1806,7 @@ static int h2_on_frame_recv(nghttp2_session *session,
     int request_end;
     (void)session;
     if (!stream) return 0;
-    if (stream->host_index && frame->hd.type == NGHTTP2_HEADERS &&
+    if (stream->exact_route && frame->hd.type == NGHTTP2_HEADERS &&
         frame->headers.cat != NGHTTP2_HCAT_REQUEST) {
         h2_request_failure(stream, 400, "Request trailers are not supported\n");
         return 0;
@@ -1826,10 +1831,10 @@ static int h2_on_frame_recv(nghttp2_session *session,
             int rate_class = 0, proved = 0, crawler = 0, bing_claim = 0;
             int status;
             stream->request.content_length = stream->declared_length;
-            status = validate_host(front, &stream->request, stream->authority, 1);
+            status = validate_host(front, &stream->request, stream->authority, 1, &stream->exact_route);
             if (!status && frontend.options.host_count) {
                 stream->host_index = front->selected_host;
-                stream->chunked_bridge = stream->host_index && !stream->has_content_length;
+                stream->chunked_bridge = stream->exact_route && !stream->has_content_length;
             }
             if (!status) status = frontend.options.admit(&stream->request,
                 stream->authority, front->peer_ip, &rate_class, &proved,
@@ -1840,7 +1845,7 @@ static int h2_on_frame_recv(nghttp2_session *session,
                     status == 421 ? "Unexpected Host\n" : "Invalid forwarding information\n");
                 return 0;
             }
-            if (stream->host_index) {
+            if (stream->exact_route) {
                 ankah_host *host = &frontend.options.hosts[stream->host_index];
                 if (host->active >= host->concurrency) {
                     h2_request_failure(stream, 503, "Route capacity reached\n");
@@ -1908,7 +1913,7 @@ static int h2_on_data(nghttp2_session *session, uint8_t flags, int32_t stream_id
         return 0;
     }
     if (stream->has_content_length || stream->chunked_bridge) {
-        if (stream->host_index && (stream->request_received > frontend.options.hosts[stream->host_index].body_limit ||
+        if (stream->exact_route && (stream->request_received > frontend.options.hosts[stream->host_index].body_limit ||
             size > frontend.options.hosts[stream->host_index].body_limit - stream->request_received)) {
             nghttp2_session_consume_connection(front->h2, size);
             h2_request_failure(stream, 413, "Request body too large\n");

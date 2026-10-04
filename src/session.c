@@ -103,12 +103,18 @@ ankah_session *ankah_session_find(const char *id, uint64_t now) {
     return NULL;
 }
 
+ankah_session *ankah_session_find_host(const char *id, uint64_t now, const char *host) {
+    ankah_session *session = ankah_session_find(id, now);
+    return session && host && !strcmp(session->host, host) ? session : NULL;
+}
+
 ankah_session *ankah_session_accept_solved(const char *id, uint64_t now,
-                                            const char *target, int is_post) {
+                                            const char *target, int is_post, const char *host) {
     ankah_session *session;
     uint64_t issued = 0;
     size_t i;
-    if (!id || strlen(id) != 32 || (target && strlen(target) >= ANKAH_MAX_TARGET))
+    if (!host || !*host || strlen(host) >= sizeof(session->host) ||
+        !id || strlen(id) != 32 || (target && strlen(target) >= ANKAH_MAX_TARGET))
         return NULL;
     for (i = 0; i < 32; ++i) {
         int digit;
@@ -119,6 +125,7 @@ ankah_session *ankah_session_accept_solved(const char *id, uint64_t now,
     }
     if (issued > now + 30 || now > issued + 1800) return NULL;
     session = ankah_session_find(id, now);
+    if (session && strcmp(session->host, host)) return NULL;
     if (!session) {
         for (i = 0; i < MAX_SESSIONS; ++i) {
             expire(&sessions[i], now);
@@ -126,6 +133,7 @@ ankah_session *ankah_session_accept_solved(const char *id, uint64_t now,
         }
         if (!session) return NULL;
         memset(session, 0, sizeof(*session));
+        strcpy(session->host, host);
         strcpy(session->id, id);
         session->issued = issued;
         session->active = 1;
@@ -150,7 +158,7 @@ ankah_session *ankah_session_new_with_proof(const unsigned char secret[ANKAH_SEC
     size_t i, body_size = 0;
     size_t anonymous_unsolved = 0, anonymous_for_ip = 0;
     int is_post;
-    if (!request || !host || !peer_ip) return NULL;
+    if (!request || !host || !*host || strlen(host) >= sizeof(session->host) || !peer_ip) return NULL;
     is_post = strcmp(request->method, "POST") == 0;
     if (is_post) {
         body_size = request->content_length;
@@ -175,6 +183,7 @@ ankah_session *ankah_session_new_with_proof(const unsigned char secret[ANKAH_SEC
             anonymous_for_ip >= MAX_ANONYMOUS_UNSOLVED_PER_IP) return NULL;
     }
     memset(session, 0, sizeof(*session));
+    strcpy(session->host, host);
     random_hex(session->id);
     random_hex(session->token);
     if (session->id[0]) {
@@ -272,7 +281,7 @@ int ankah_session_changed(void) { return mutation != queued_mutation; }
 void ankah_session_snapshot_retry(void) { ++mutation; }
 
 #define SESSION_SNAPSHOT_MAX ANKAH_SESSION_SNAPSHOT_MAX
-#define SESSION_SNAPSHOT_VERSION 1U
+#define SESSION_SNAPSHOT_VERSION 2U
 
 typedef struct {
     char magic[8];
@@ -290,6 +299,15 @@ typedef struct {
     uint64_t issued, solved_until, body_until;
     uint32_t is_post, issued_with_proof, has_payload;
     uint32_t body_size, received;
+} session_snapshot_record_v1;
+
+typedef struct {
+    char id[33], token[33], challenge[ANKAH_CHALLENGE_TEXT_MAX];
+    char target[ANKAH_MAX_TARGET], peer_ip[64];
+    uint64_t issued, solved_until, body_until;
+    uint32_t is_post, issued_with_proof, has_payload;
+    uint32_t body_size, received;
+    char host[256];
 } session_snapshot_record;
 
 typedef struct {
@@ -331,6 +349,7 @@ ankah_session_snapshot *ankah_session_snapshot_begin(uint64_t now) {
         memcpy(record->challenge, session->challenge, sizeof(record->challenge));
         memcpy(record->target, session->target, sizeof(record->target));
         memcpy(record->peer_ip, session->peer_ip, sizeof(record->peer_ip));
+        memcpy(record->host, session->host, sizeof(record->host));
         record->issued = session->issued;
         record->solved_until = session->solved_until;
         record->body_until = session->body_until;
@@ -448,9 +467,10 @@ static int valid_image(const unsigned char *data, size_t size, uint64_t *generat
     if (size < sizeof(header) + 32) return 0;
     memcpy(&header, data, sizeof(header));
     if (memcmp(header.magic, "ANKHSESS", 8) != 0 ||
-        header.version != SESSION_SNAPSHOT_VERSION ||
+        (header.version != 1 && header.version != SESSION_SNAPSHOT_VERSION) ||
         header.request_size != sizeof(ankah_request) ||
-        header.record_size != sizeof(session_snapshot_record) ||
+        header.record_size != (header.version == 1 ? sizeof(session_snapshot_record_v1) :
+                                                    sizeof(session_snapshot_record)) ||
         header.count > MAX_SESSIONS || header.size != size || !header.generation ||
         mbedtls_sha256(data, size - 32, digest, 0) != 0 ||
         memcmp(digest, data + size - 32, 32) != 0) return 0;
@@ -458,10 +478,12 @@ static int valid_image(const unsigned char *data, size_t size, uint64_t *generat
     for (i = 0; i < header.count; ++i) {
         session_snapshot_record record;
         size_t extra;
-        if (at + sizeof(record) > size - 32) return 0;
-        memcpy(&record, data + at, sizeof(record));
-        at += sizeof(record);
-        if (record.id[32] || record.token[32] ||
+        if (at + header.record_size > size - 32) return 0;
+        memset(&record, 0, sizeof(record));
+        memcpy(&record, data + at, header.record_size);
+        at += header.record_size;
+        if ((header.version == 2 && (!record.host[0] || !memchr(record.host, 0, sizeof(record.host)))) ||
+            record.id[32] || record.token[32] ||
             !memchr(record.challenge, 0, sizeof(record.challenge)) ||
             !memchr(record.target, 0, sizeof(record.target)) ||
             !memchr(record.peer_ip, 0, sizeof(record.peer_ip)) ||
@@ -494,8 +516,9 @@ int ankah_session_snapshot_saved_ids(const unsigned char *data, size_t size,
     at = sizeof(header);
     for (i = 0; i < header.count; ++i) {
         session_snapshot_record record;
-        memcpy(&record, data + at, sizeof(record));
-        at += sizeof(record);
+        memset(&record, 0, sizeof(record));
+        memcpy(&record, data + at, header.record_size);
+        at += header.record_size;
         if (record.has_payload) {
             if (used == capacity) return -1;
             memcpy(ids[used++], record.id, 33);
@@ -511,7 +534,7 @@ void ankah_session_discard_saved_posts(void) {
     for (i = 0; i < MAX_SESSIONS; ++i) release_post(&sessions[i]);
 }
 
-static int load_image(const unsigned char *data, size_t size, uint64_t now) {
+static int load_image(const unsigned char *data, size_t size, uint64_t now, const char *primary_host) {
     session_snapshot_header header;
     size_t at, i;
     (void)size;
@@ -520,13 +543,15 @@ static int load_image(const unsigned char *data, size_t size, uint64_t now) {
     for (i = 0; i < header.count; ++i) {
         session_snapshot_record record;
         ankah_session *session = &sessions[i];
-        memcpy(&record, data + at, sizeof(record));
-        at += sizeof(record);
+        memset(&record, 0, sizeof(record));
+        memcpy(&record, data + at, header.record_size);
+        at += header.record_size;
         if ((!record.solved_until && now > record.issued + 300) ||
             (record.solved_until && now > record.solved_until)) {
             if (record.has_payload) at += sizeof(ankah_request) + record.received;
             continue;
         }
+        strcpy(session->host, header.version == 1 ? primary_host : record.host);
         memcpy(session->id, record.id, sizeof(session->id));
         memcpy(session->token, record.token, sizeof(session->token));
         memcpy(session->challenge, record.challenge, sizeof(session->challenge));
@@ -563,11 +588,12 @@ static int load_image(const unsigned char *data, size_t size, uint64_t now) {
     return 0;
 }
 
-int ankah_session_restore(const char *path, uint64_t now) {
+int ankah_session_restore(const char *path, uint64_t now, const char *primary_host) {
     unsigned char *data[2] = {NULL, NULL};
     size_t size[2] = {0, 0};
     uint64_t generation[2] = {0, 0};
     int slot, chosen = -1, result = 0;
+    if (!primary_host || !*primary_host || strlen(primary_host) >= 256) return -1;
     for (slot = 0; slot < 2; ++slot) {
         char candidate[520];
         int n = snprintf(candidate, sizeof(candidate), "%s.%d", path, slot);
@@ -585,7 +611,7 @@ int ankah_session_restore(const char *path, uint64_t now) {
     if (data[0]) chosen = 0;
     if (data[1] && (chosen < 0 || generation[1] > generation[0])) chosen = 1;
     if (chosen >= 0) {
-        if (load_image(data[chosen], size[chosen], now) != 0) result = -1;
+        if (load_image(data[chosen], size[chosen], now, primary_host) != 0) result = -1;
         snapshot_generation = generation[chosen];
     }
     free(data[0]); free(data[1]);

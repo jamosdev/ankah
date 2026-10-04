@@ -417,6 +417,10 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/static_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR}/build_static_bundle.py
     ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME host_browser COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/host_browser_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR}/build_static_bundle.py
+    ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME continuation COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/continuation_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
@@ -458,7 +462,7 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/configuration_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
   if(CMAKE_CROSSCOMPILING)
-    set_tests_properties(admission cache static continuation links platform tls_http2 dashboard health
+    set_tests_properties(admission cache static host_browser continuation links platform tls_http2 dashboard health
       language_integration upload tus shutdown abuse_integration dots_integration configuration PROPERTIES
       ENVIRONMENT "ANKAH_TEST_RUNNER=${ANKAH_TEST_RUNNER};ANKAH_TEST_WINDOWS_PATHS=1")
   endif()
@@ -549,8 +553,14 @@ if(WIN32)
   endforeach()
 endif()
 
-add_executable(ankah-host-policy tests/host_policy_test.c src/host.c)
+add_executable(ankah-host-policy tests/host_policy_test.c src/host.c src/static.c src/files.c)
 target_include_directories(ankah-host-policy PRIVATE include)
+target_link_libraries(ankah-host-policy PRIVATE ankah_pow)
+if(WIN32)
+  target_link_libraries(ankah-host-policy PRIVATE advapi32)
+else()
+  target_compile_definitions(ankah-host-policy PRIVATE _POSIX_C_SOURCE=200809L)
+endif()
 add_test(NAME host_policy COMMAND ankah-host-policy)
 
 if(NOT WIN32)

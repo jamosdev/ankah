@@ -49,7 +49,7 @@ def literal(name_index, value):
 
 def request_headers(method, path, authority, length=None, headers=None):
     methods = {"GET": 2, "POST": 3}
-    block = bytearray(indexed(methods[method]))
+    block = bytearray(indexed(methods[method]) if method in methods else literal(2, method))
     block.extend(indexed(7))
     block.extend(literal(4, path))
     block.extend(literal(1, authority))

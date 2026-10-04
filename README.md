@@ -168,7 +168,7 @@ an Unlock link, curl and Wget get the terminal solver instructions, and other
 clients get the link as text. The link returns to the page named by a
 same-origin `Referer`, or to `/`.
 
-`GET /ankah/unlock` always issues a fresh challenge, even to a client that has
+`GET /ankah/unlock` is available on every configured virtual host and always issues a fresh challenge, even to a client that has
 already passed one, and never reaches the application. After Finished it
 redirects to `/`, or to the path given as `?return=<path>`. The return path is
 used exactly as written, without percent decoding, and must be a local path
