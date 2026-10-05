@@ -68,6 +68,28 @@ def test_core_methods(client, method):
         assert recorded["headers"]["x-matrix-value"] == "kept"
 
 
+def test_split_cookie_fields_forwarded(client, endpoint):
+    if endpoint["protocol"] == "h1":
+        pytest.skip("split cookie fields are a compressed-protocol representation")
+    fields = [("cookie", "first=synthetic"), ("x-cookie-control", "kept"),
+              ("cookie", "second=fixture"), ("cookie", "third=value")]
+    response = client.request("GET", unique_path("split-cookies"), headers=fields)
+    assert response.status == 200
+    recorded = json.loads(response.body)
+    assert recorded["headers"]["cookie"] == "first=synthetic; second=fixture; third=value"
+    assert recorded["headers"]["x-cookie-control"] == "kept"
+
+
+def test_native_split_cookie_overflow(client, endpoint):
+    if endpoint["profile"] != "native" or endpoint["protocol"] == "h1":
+        pytest.skip("native compressed-protocol cookie bound")
+    path = unique_path("cookie-overflow")
+    response = client.request("GET", path, headers=[
+        ("cookie", "a=" + "x" * 2046), ("cookie", "b=" + "y" * 2046)])
+    assert response.status == 400
+    assert record_count(client, path=path) == 0
+
+
 BODY_CASES = [
     ("empty", b"", {}),
     ("json", b'{"answer":42,"text":"hello"}', {"Content-Type": "application/json"}),

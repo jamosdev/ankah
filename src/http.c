@@ -109,6 +109,46 @@ const char *ankah_header_value(const ankah_request *request, const char *name) {
     return NULL;
 }
 
+int ankah_request_coalesce_cookies(ankah_request *request) {
+    char joined[ANKAH_MAX_VALUE];
+    size_t total = 0, used = 0;
+    unsigned int i, first = ANKAH_MAX_HEADERS, cookies = 0, kept = 0;
+    if (!request || request->count > ANKAH_MAX_HEADERS) return -1;
+    /* Validate the whole join before changing any header or count. */
+    for (i = 0; i < request->count; ++i) {
+        const char *end;
+        size_t length, separator;
+        if (!ankah_header_is(&request->headers[i], ANKAH_HEADER_COOKIE)) continue;
+        end = memchr(request->headers[i].value, 0, ANKAH_MAX_VALUE);
+        if (!end) return -1;
+        length = (size_t)(end - request->headers[i].value);
+        separator = cookies ? 2 : 0;
+        if (total > sizeof(joined) - 1 - separator ||
+            length > sizeof(joined) - 1 - separator - total) return -1;
+        total += separator + length;
+        if (!cookies) first = i;
+        ++cookies;
+    }
+    if (cookies < 2) return 0;
+    for (i = 0; i < request->count; ++i) {
+        size_t length;
+        if (!ankah_header_is(&request->headers[i], ANKAH_HEADER_COOKIE)) continue;
+        if (i != first) { memcpy(joined + used, "; ", 2); used += 2; }
+        length = strlen(request->headers[i].value);
+        memcpy(joined + used, request->headers[i].value, length);
+        used += length;
+    }
+    joined[used] = 0;
+    memcpy(request->headers[first].value, joined, used + 1);
+    for (i = 0; i < request->count; ++i) {
+        if (i != first && ankah_header_is(&request->headers[i], ANKAH_HEADER_COOKIE)) continue;
+        if (kept != i) request->headers[kept] = request->headers[i];
+        ++kept;
+    }
+    request->count = kept;
+    return 0;
+}
+
 int ankah_parse_request(const char *bytes, size_t length, ankah_request *out) {
     llhttp_t parser;
     llhttp_settings_t settings;

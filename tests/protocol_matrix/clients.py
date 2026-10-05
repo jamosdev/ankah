@@ -150,8 +150,9 @@ class H3Protocol(QuicConnectionProtocol):
         else:
             fields = [(b":method", method.encode()), (b":scheme", scheme.encode()),
                       (b":authority", authority.encode()), (b":path", path.encode())]
+        items = headers.items() if hasattr(headers, "items") else (headers or [])
         fields.extend((name.lower().encode(), str(value).encode())
-                      for name, value in (headers or {}).items())
+                      for name, value in items)
         chunks = ([content] if content else []) if isinstance(
             content, (bytes, bytearray)) else list(content or [])
         self.http.send_headers(stream_id=stream_id, headers=fields,

@@ -3773,7 +3773,28 @@ static void render_gate(connection *c, ankah_session *session) {
     respond(c, 428, "Precondition Required", "text/html; charset=utf-8", body, extra);
 }
 
+/* A browser can fetch a favicon while its document's proof is still solving.
+ * Resource requests stay blocked, but must not replace the document's cookie.
+ * Fetch metadata only selects this denial response; it never grants access. */
+static int deny_unproved_subresource(connection *c) {
+    static const char *const destinations[] = {
+        "image", "script", "style", "font", "audio", "video", "track", "manifest",
+        "worker", "sharedworker", "serviceworker"
+    };
+    const char *destination = ankah_header_value(&c->request, "Sec-Fetch-Dest");
+    size_t i;
+    if (!destination || (strcmp(c->request.method, "GET") && strcmp(c->request.method, "HEAD")))
+        return 0;
+    for (i = 0; i < sizeof(destinations) / sizeof(destinations[0]); ++i) {
+        if (strcmp(destination, destinations[i])) continue;
+        respond_unlock_required(c, 428, "Precondition Required", "Ankah challenge required.\n", NULL);
+        return 1;
+    }
+    return 0;
+}
+
 static void handle_challenge(connection *c) {
+    if (deny_unproved_subresource(c)) return;
     if (command_line_client(&c->request)) {
         respond_curl_challenge(c, 302, "Found", "", 1);
     } else {
@@ -3815,6 +3836,7 @@ static void handle_challenge(connection *c) {
 static void handle_route_challenge(connection *c) {
     ankah_request *request;
     ankah_session *session;
+    if (deny_unproved_subresource(c)) return;
     if ((strcmp(c->request.method, "GET") && strcmp(c->request.method, "HEAD")) ||
         !valid_return_path(c->request.target)) {
         respond_unlock_required(c, 428, "Precondition Required", "Unlock, then retry this method.", NULL);

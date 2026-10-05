@@ -1832,6 +1832,8 @@ static int h2_on_frame_recv(nghttp2_session *session,
     }
     if (frame->hd.type == NGHTTP2_HEADERS &&
         frame->headers.cat == NGHTTP2_HCAT_REQUEST) {
+        if (!stream->invalid && ankah_request_coalesce_cookies(&stream->request) != 0)
+            stream->invalid = 1;
         if (!stream->invalid && stream->saw_method && stream->saw_path &&
             stream->saw_authority && !stream->admitted) {
             int rate_class = 0, proved = 0, crawler = 0, bing_claim = 0;

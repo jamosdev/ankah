@@ -90,6 +90,18 @@ even if a client manually copies it. Session snapshots retain host identity;
 reordering virtual-host declarations does not change session ownership. Gateway
 links synchronize only primary-host sessions; additional-host challenges are local.
 
+HTTP/2 and HTTP/3 decode split Cookie fields into one ordered value separated
+by `; ` before proof admission or forwarding. This lets browser sessions and
+passes work alongside existing cookies. The combined value must fit the existing
+4095-byte field limit; overflow returns 400 before connecting to an upstream.
+
+Unproved GET/HEAD requests identifying a browser image, script, stylesheet, font
+or other passive resource with Sec-Fetch-Dest receive 428 unlock instructions
+without a new session cookie. An automatic favicon fetch therefore cannot
+replace the challenge for the page being solved. The resource still requires
+valid proof, and fetch metadata never exempts it. Document navigation and the
+explicit unlock page keep their normal challenge behavior.
+
 The dashboard keeps one token, authenticator, statistics store and set of controls
 across hosts. A setting change or runtime disable affects the complete process.
 Browser credentials remain in each origin's session storage. Existing public

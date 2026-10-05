@@ -53,5 +53,9 @@ int ankah_chunked_body_consume(ankah_chunked_body *body,
  * names return -1 without changing header. */
 int ankah_header_set_name(ankah_header *header, const char *name, size_t length);
 const char *ankah_header_value(const ankah_request *request, const char *name);
+/* Join decoded HTTP/2 or HTTP/3 Cookie fields with "; " before admission or
+ * HTTP/1.1 forwarding. Preserve wire order and other fields. Returns -1 without
+ * changing request if the combined value exceeds ANKAH_MAX_VALUE - 1 bytes. */
+int ankah_request_coalesce_cookies(ankah_request *request);
 
 #endif

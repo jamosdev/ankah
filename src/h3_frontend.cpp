@@ -382,7 +382,8 @@ int end_headers(nghttp3_conn *, int64_t, int, void *, void *data) {
     }
     if (stream->failed || !stream->saw_method || !stream->saw_path ||
         !stream->saw_authority || stream->scheme != "https" ||
-        stream->request.target[0] != '/') {
+        stream->request.target[0] != '/' ||
+        ankah_request_coalesce_cookies(&stream->request) != 0) {
         stream->fail(400, "Invalid HTTP/3 request\n");
         return 0;
     }

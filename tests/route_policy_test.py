@@ -22,6 +22,7 @@ class RoutePolicies(browser.BrowserHosts):
         super().setUp()
         self.stop()
         self.admin_records = []
+        self.admin_cookie_fields = []
         self.admin_seen = []
         self.admin_condition = threading.Condition()
         owner = self
@@ -60,6 +61,7 @@ class RoutePolicies(browser.BrowserHosts):
                     if len(body) != amount:
                         return
                 owner.admin_records.append((self.command, self.path, dict(self.headers), body))
+                owner.admin_cookie_fields.append(self.headers.get_all('Cookie', []))
                 if self.path == '/admin/drop':
                     self.close_connection = True
                     return
@@ -145,6 +147,53 @@ class RoutePolicies(browser.BrowserHosts):
     def proof(self, protocol='h1', host='submit.test'):
         sid, challenge, cookie = self.challenge('/ankah/unlock', protocol=protocol, host=host)
         return self.complete(sid, challenge, cookie, protocol=protocol, host=host)[0]
+
+    def split_routed_cookies(self, target):
+        sid, challenge, cookie = self.challenge(target, protocol='h2')
+        result = self.request('/ankah/answer/' + sid + '?answer=' + str(browser.solve(challenge)),
+                              'POST', protocol='h2')
+        self.assertEqual(result[0], 200, (result[0], result[1], result[2][:256]))
+        result = self.request('/ankah/finish/' + sid + '?', protocol='h2',
+                              headers=[('cookie', 'existing=synthetic'), ('cookie', cookie)])
+        self.assertEqual(result[0], 303, (result[0], result[1], result[2][:256]))
+        self.assertEqual(result[1]['location'], target)
+        passed = result[1]['set-cookie'].split(';')[0]
+        fields = [('cookie', 'existing=synthetic'), ('x-cookie-control', 'kept'),
+                  ('cookie', passed), ('cookie', 'application=fixture')]
+        result = self.request(target, headers=fields, protocol='h2')
+        self.assertEqual(result[0], 200, (result[0], result[1], result[2][:256]))
+        self.assertEqual(self.admin_records[-1][1], target)
+        self.assertEqual(self.admin_cookie_fields[-1],
+                         ['existing=synthetic; ' + passed + '; application=fixture'])
+        self.assertEqual(self.admin_records[-1][2]['x-cookie-control'], 'kept')
+        self.assertEqual(self.records, [])
+
+    def case_split_cookies_admin(self):
+        self.split_routed_cookies('/admin/?view=mail&empty=')
+
+    def case_split_cookies_login(self):
+        self.split_routed_cookies('/oidc/login?next=%2Fadmin%2F')
+
+    def case_split_cookies_overflow(self):
+        result = self.request('/oidc/callback', 'POST', protocol='h2', body=b'signed=synthetic',
+                              headers=[('cookie', 'a=' + 'x' * 2046),
+                                       ('cookie', 'b=' + 'y' * 2046)])
+        self.assertEqual(result[0], 400, (result[0], result[1], result[2][:256]))
+        self.assertEqual(self.admin_records, [])
+        self.assertEqual(self.admin_seen, [])
+
+    def case_subresource_preserves_document_cookie(self):
+        sid, challenge, cookie = self.challenge('/admin/?view=mail', protocol='h2')
+        result = self.request('/admin/icon.png', protocol='h2',
+                              headers={'Cookie': cookie, 'Sec-Fetch-Dest': 'image'})
+        self.assertEqual(result[0], 428, (result[0], result[1], result[2][:256]))
+        self.assertNotIn('set-cookie', result[1])
+        self.assertEqual(self.admin_seen, [])
+        passed, target = self.complete(sid, challenge, cookie, protocol='h2')
+        self.assertEqual(target, '/admin/?view=mail')
+        result = self.request('/admin/icon.png', protocol='h2',
+                              headers={'Cookie': passed, 'Sec-Fetch-Dest': 'image'})
+        self.assertEqual(result[0], 200, (result[0], result[1], result[2][:256]))
 
     def barrier(self, client, token=b'barrier!'):
         client.send_frame(6, 0, 0, token)

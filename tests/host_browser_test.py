@@ -20,7 +20,7 @@ import urllib.parse
 
 import brotli
 from hpack import Decoder
-from http2_client import Client, DATA, HEADERS
+from http2_client import Client, DATA, HEADERS, header_items
 from process_support import start_gateway, windows_path
 from static_test import solve
 from dashboard_test import dashboard_code
@@ -100,6 +100,7 @@ class BrowserHosts(unittest.TestCase):
         source.mkdir()
         self.landing = b'<html><a href="https://status.test">Service status</a></html>' + b' ' * 4096
         (source / 'index.html').write_bytes(self.landing)
+        (source / 'favicon.ico').write_bytes(b'protected-fixture-icon')
         subprocess.run([sys.executable, BUILDER, '--project-root', str(self.root),
                         '--source', 'public', '--url-prefix', '/', '--output', str(self.root / 'bundle')],
                        check=True, capture_output=True)
@@ -174,7 +175,7 @@ class BrowserHosts(unittest.TestCase):
         with context.wrap_socket(socket.create_connection((address, self.port), timeout=8),
                                  server_hostname=host) as connection:
             head = f'{method} {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {len(body)}\r\n'
-            head += ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+            head += ''.join(f'{k}: {v}\r\n' for k, v in header_items(headers))
             connection.sendall(head.encode() + b'\r\n' + body)
             reply = http.client.HTTPResponse(connection, method=method)
             reply.begin()
@@ -212,6 +213,71 @@ class BrowserHosts(unittest.TestCase):
             self.assertEqual((result[0], result[2]), (200, self.landing))
             self.assertEqual(result[1]['cache-control'], 'private, no-cache')
             self.assertEqual(self.request(host='status.test', **options)[0], 200)
+
+    def split_cookie_completion(self, host, protocol='h2'):
+        options = dict(host=host, protocol=protocol)
+        target = '/ankah/unlock?return=/' if host == 'status.test' else '/'
+        sid, challenge, cookie = self.challenge(target, **options)
+        finish = '/ankah/finish/' + sid + '?'
+        for headers in ({}, {'Cookie': cookie}):
+            result = self.request(finish, headers=headers, **options)
+            self.assertEqual(result[0], 403, (result[0], result[1], result[2][:256]))
+        result = self.request('/ankah/answer/' + sid + '?answer=' + str(solve(challenge)),
+                              'POST', **options)
+        self.assertEqual(result[0], 200, (result[0], result[1], result[2][:256]))
+        # Repeated finish and pass checks deliberately share the solved session.
+        for reverse in (False, True):
+            fields = [('cookie', 'existing=synthetic'), ('cookie', cookie)]
+            if reverse:
+                fields.reverse()
+            headers = fields if protocol == 'h2' else {'Cookie': '; '.join(v for _, v in fields)}
+            result = self.request(finish, headers=headers, **options)
+            self.assertEqual(result[0], 303, (result[0], result[1], result[2][:256]))
+            self.assertEqual(result[1]['location'], '/')
+            passed = result[1]['set-cookie'].split(';')[0]
+            fields = [('cookie', 'existing=synthetic'), ('cookie', passed)]
+            if reverse:
+                fields.reverse()
+            headers = fields if protocol == 'h2' else {'Cookie': '; '.join(v for _, v in fields)}
+            result = self.request('/', headers=headers, **options)
+            self.assertEqual(result[0], 200, (result[0], result[1], result[2][:256]))
+        other = dict(host='other.test', protocol=protocol)
+        result = self.request(finish, headers=[('cookie', 'existing=synthetic'), ('cookie', cookie)], **other)
+        self.assertEqual(result[0], 403, (result[0], result[1], result[2][:256]))
+        result = self.request('/', headers=[('cookie', 'existing=synthetic'), ('cookie', passed)], **other)
+        self.assertEqual(result[0], 428, (result[0], result[1], result[2][:256]))
+        self.assertEqual(self.records, [])
+
+    def test_h2_split_cookies_primary(self):
+        self.config = [value for value in self.config if not value.startswith('allow-prefix=')]
+        self.restart()
+        self.split_cookie_completion('status.test')
+
+    def test_h2_split_cookies_secondary(self):
+        self.split_cookie_completion('submit.test')
+
+    def test_h1_combined_cookies_control(self):
+        self.split_cookie_completion('submit.test', 'h1')
+
+    def subresource_cookie_binding(self, protocol):
+        sid, challenge, cookie = self.challenge(protocol=protocol)
+        for binding in ('', cookie):
+            result = self.request('/favicon.ico', protocol=protocol,
+                headers={'Cookie': binding, 'Sec-Fetch-Dest': 'image'})
+            self.assertEqual(result[0], 428, (result[0], result[1], result[2][:256]))
+            self.assertNotIn('set-cookie', result[1], 'favicon must not replace the document session')
+            self.assertNotIn(b'protected-fixture-icon', result[2])
+        passed, target = self.complete(sid, challenge, cookie, protocol=protocol)
+        self.assertEqual(target, '/')
+        result = self.request('/favicon.ico', protocol=protocol,
+            headers={'Cookie': passed, 'Sec-Fetch-Dest': 'image'})
+        self.assertEqual((result[0], result[2]), (200, b'protected-fixture-icon'))
+
+    def test_h1_subresource_preserves_challenge_cookie(self):
+        self.subresource_cookie_binding('h1')
+
+    def test_h2_subresource_preserves_challenge_cookie(self):
+        self.subresource_cookie_binding('h2')
 
     def test_particle_assets_on_every_challenge_host(self):
         # Fresh process with the dashboard disabled proves decorative assets are

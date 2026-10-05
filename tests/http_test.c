@@ -7,6 +7,65 @@ static int expect(int truth, const char *name) {
     return truth ? 0 : 1;
 }
 
+static void header(ankah_request *request, const char *name, const char *value) {
+    ankah_header *item = &request->headers[request->count++];
+    (void)ankah_header_set_name(item, name, strlen(name));
+    strcpy(item->value, value);
+}
+
+static int cookie_checks(void) {
+    static ankah_request request, original;
+    int failures = 0;
+    header(&request, "Host", "example.test");
+    original = request;
+    failures += expect(ankah_request_coalesce_cookies(&request) == 0 &&
+                       memcmp(&request, &original, sizeof(request)) == 0, "absent cookie unchanged");
+    header(&request, "Cookie", "a=b; c=d");
+    original = request;
+    failures += expect(ankah_request_coalesce_cookies(&request) == 0 &&
+                       memcmp(&request, &original, sizeof(request)) == 0, "single cookie unchanged");
+    header(&request, "X-Control", "kept");
+    header(&request, "cOoKiE", "e=f");
+    header(&request, "Authorization", "first");
+    header(&request, "Cookie", "");
+    header(&request, "Authorization", "second");
+    header(&request, "Cookie", "g=h");
+    failures += expect(ankah_request_coalesce_cookies(&request) == 0 && request.count == 5,
+                       "coalesce split fields and empty field");
+    failures += expect(strcmp(request.headers[1].value, "a=b; c=d; e=f; ; g=h") == 0 &&
+                       strcmp(request.headers[2].name, "X-Control") == 0 &&
+                       strcmp(request.headers[2].value, "kept") == 0 &&
+                       strcmp(request.headers[3].value, "first") == 0 &&
+                       strcmp(request.headers[4].value, "second") == 0,
+                       "preserve cookie order and repeated non-cookie fields");
+    original = request;
+    failures += expect(ankah_request_coalesce_cookies(&request) == 0 &&
+                       memcmp(&request, &original, sizeof(request)) == 0, "coalescing is idempotent");
+    memset(&request, 0, sizeof(request));
+    header(&request, "Cookie", "");
+    header(&request, "Cookie", "b=c");
+    memset(request.headers[0].value, 'a', ANKAH_MAX_VALUE - 6);
+    request.headers[0].value[ANKAH_MAX_VALUE - 6] = 0;
+    failures += expect(ankah_request_coalesce_cookies(&request) == 0 &&
+                       strlen(request.headers[0].value) == ANKAH_MAX_VALUE - 1,
+                       "maximum combined cookie value");
+    memset(&request, 0, sizeof(request));
+    header(&request, "Cookie", "");
+    header(&request, "Cookie", "b=c");
+    memset(request.headers[0].value, 'a', ANKAH_MAX_VALUE - 5);
+    request.headers[0].value[ANKAH_MAX_VALUE - 5] = 0;
+    original = request;
+    failures += expect(ankah_request_coalesce_cookies(&request) == -1 &&
+                       memcmp(&request, &original, sizeof(request)) == 0,
+                       "overflow rejects without partial mutation");
+    memset(request.headers[0].value, 'a', ANKAH_MAX_VALUE);
+    original = request;
+    failures += expect(ankah_request_coalesce_cookies(&request) == -1 &&
+                       memcmp(&request, &original, sizeof(request)) == 0,
+                       "unterminated cookie rejects without mutation");
+    return failures;
+}
+
 int main(void) {
     const char *good = "GET /hello HTTP/1.1\r\nHost: example.test\r\n\r\n";
     const char *smuggle = "POST / HTTP/1.1\r\nhOsT: example.test\r\ncontent-LENGTH: 5\r\n"
@@ -30,7 +89,7 @@ int main(void) {
     ankah_request request;
     ankah_chunked_body chunks;
     size_t decoded;
-    int failures = 0;
+    int failures = cookie_checks();
     failures += expect(ankah_parse_request(good, strlen(good), &request) == 0, "valid request");
     failures += expect(strcmp(request.target, "/hello") == 0, "target");
     failures += expect(ankah_parse_request(smuggle, strlen(smuggle), &request) != 0,

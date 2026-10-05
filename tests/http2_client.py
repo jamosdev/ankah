@@ -47,6 +47,11 @@ def literal(name_index, value):
     return integer(name_index, 4) + text(value)
 
 
+def header_items(headers):
+    """Keep repeated fields in wire order; existing mappings remain supported."""
+    return headers.items() if hasattr(headers, 'items') else (headers or [])
+
+
 def request_headers(method, path, authority, length=None, headers=None):
     methods = {"GET": 2, "POST": 3}
     block = bytearray(indexed(methods[method]) if method in methods else literal(2, method))
@@ -55,7 +60,7 @@ def request_headers(method, path, authority, length=None, headers=None):
     block.extend(literal(1, authority))
     if length is not None:
         block.extend(literal(28, str(length)))
-    for name, value in (headers or {}).items():
+    for name, value in header_items(headers):
         block.extend(integer(0, 4))
         block.extend(text(name.lower()))
         block.extend(text(value))

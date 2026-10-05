@@ -55,6 +55,8 @@ async function main() {
   const scenarios = routed ? [
     {name: "admin-return", host: "submit.test", target: "/admin/?view=mail&empty=", returned: true},
     {name: "login-return", host: "submit.test", target: "/oidc/login?next=%2Fadmin%2F", returned: true},
+    {name: "admin-existing-cookie", host: "submit.test", target: "/admin/?view=mail&empty=", returned: true, seeded: true},
+    {name: "login-existing-cookie", host: "submit.test", target: "/oidc/login?next=%2Fadmin%2F", returned: true, seeded: true},
   ] : [
     {name: "landing", host: "submit.test", target: "/", hold: true},
     {name: "primary-test", host: "status.test", hold: true},
@@ -76,6 +78,10 @@ async function main() {
         isMobile: !!scenario.mobile, hasTouch: !!scenario.mobile,
         reducedMotion: scenario.reduced ? "reduce" : "no-preference"});
       const page = await context.newPage();
+      if (scenario.seeded) await context.addCookies([
+        {name: "existing_cookie", value: "synthetic", url: origin(scenario.host) + "/"},
+        {name: "ankah_pass", value: "expired-synthetic", url: origin(scenario.host) + "/"},
+      ]);
       const errors = [], csp = [], requests = [], rejected = [];
       let release = () => {};
       page.on("pageerror", (error) => errors.push(String(error)));
