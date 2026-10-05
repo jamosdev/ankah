@@ -13,13 +13,18 @@ parser.add_argument('assets', type=Path)
 parser.add_argument('metadata', help='JSON output path, or - for stdout with stdin-controlled lifetime')
 parser.add_argument('--bundle', type=Path)
 parser.add_argument('--no-dashboard', action='store_true')
+parser.add_argument('--routes', action='store_true', help='include isolated browser upstream policies')
 args = parser.parse_args()
 executable, assets = args.executable.resolve(), args.assets.resolve()
 sys.argv = [__file__, str(executable), str(Path(__file__).resolve().parents[1] / 'build_static_bundle.py'),
             str(assets)]
 from host_browser_test import BrowserHosts
 
-fixture = BrowserHosts()
+if args.routes:
+    from route_policy_test import RoutePolicies
+    fixture = RoutePolicies()
+else:
+    fixture = BrowserHosts()
 stopped = threading.Event()
 for signum in (signal.SIGINT, signal.SIGTERM):
     signal.signal(signum, lambda *_: stopped.set())

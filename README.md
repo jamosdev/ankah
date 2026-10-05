@@ -200,6 +200,9 @@ tests. The Python tests use `Brotli==1.2.0` and `hpack==4.2.0`. Set
 CMake downloads llhttp 9.4.3, qrcodegen, stb_image_write, ngtcp2 1.25.0,
 nghttp3 1.18.0, and AWS-LC 5.4.0 during the build. qrcodegen is MIT
 licensed; stb_image_write is available under the public domain or MIT license.
+Mascot upload optimization uses vendored ExoQuant (MIT) and LodePNG (zlib).
+Their source revisions, local patches, and licence notices are recorded under
+`third_party/`; release packages include both notices.
 
 The generated HTTP header classifier and language registry are checked in, so
 normal builds do not need gperf (or write into the source tree). After changing

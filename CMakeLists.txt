@@ -76,6 +76,19 @@ FetchContent_MakeAvailable(stb)
 add_library(ankah_qr STATIC ${qrcodegen_SOURCE_DIR}/c/qrcodegen.c src/qr.c)
 target_include_directories(ankah_qr PRIVATE ${qrcodegen_SOURCE_DIR}/c ${stb_SOURCE_DIR})
 target_include_directories(ankah_qr PUBLIC include)
+add_library(ankah_png_vendor STATIC
+  third_party/exoquant/exoquant.c third_party/lodepng/lodepng.c)
+target_include_directories(ankah_png_vendor PRIVATE src)
+target_include_directories(ankah_png_vendor SYSTEM PUBLIC
+  third_party/exoquant third_party/lodepng)
+target_compile_definitions(ankah_png_vendor PUBLIC
+  LODEPNG_NO_COMPILE_ALLOCATORS LODEPNG_NO_COMPILE_DISK)
+add_library(ankah_png STATIC src/png_optimizer.c src/png_memory.c)
+target_include_directories(ankah_png PUBLIC src)
+target_link_libraries(ankah_png PRIVATE ankah_png_vendor)
+if(UNIX)
+  target_link_libraries(ankah_png_vendor PUBLIC m)
+endif()
 add_library(ankah_pow STATIC src/pow.c)
 target_include_directories(ankah_pow PUBLIC include)
 if(ANKAH_BUNDLED_RUNTIME_DEPS)
@@ -290,7 +303,7 @@ endif()
 if(UNIX)
   target_compile_definitions(ankah PRIVATE _POSIX_C_SOURCE=200809L)
 endif()
-target_link_libraries(ankah PRIVATE ankah_http ankah_pow ankah_qr ${ANKAH_LIBUV}
+target_link_libraries(ankah PRIVATE ankah_http ankah_pow ankah_qr ankah_png ${ANKAH_LIBUV}
   ${ANKAH_MBEDTLS_TLS} ${ANKAH_NGHTTP2} ankah_language
   ${ANKAH_NGTCP2_CRYPTO} ${ANKAH_NGTCP2} ${ANKAH_NGHTTP3}
   ${ANKAH_AWS_SSL} ${ANKAH_AWS_CRYPTO})
@@ -339,6 +352,8 @@ if(UNIX)
   target_compile_definitions(ankah-session PRIVATE _POSIX_C_SOURCE=200809L)
 endif()
 add_executable(ankah-rate tests/rate_test.c src/rate.c)
+add_executable(ankah-png tests/png_optimizer_test.c)
+target_link_libraries(ankah-png PRIVATE ankah_png ankah_png_vendor)
 target_include_directories(ankah-rate PRIVATE src)
 add_executable(ankah-stats tests/stats_test.c src/stats.c src/files.c)
 target_include_directories(ankah-stats PRIVATE include)
@@ -362,7 +377,7 @@ target_link_libraries(ankah-proxy PRIVATE ${ANKAH_LIBUV} ankah_header_names)
 set(ANKAH_PROJECT_TARGETS ankah ankah-pow ankah-http ankah-session ankah-rate ankah-proxy
   ankah-upload-policy ankah-dots-policy
   ankah-stats ankah-header-names ankah-language ankah_qr ankah_pow ankah_http
-  ankah_header_names ankah_language)
+  ankah_header_names ankah_language ankah_png ankah-png)
 if(UNIX)
   list(APPEND ANKAH_PROJECT_TARGETS ankah-storage)
 endif()
@@ -373,11 +388,12 @@ if(ANKAH_STRICT_WARNINGS AND CMAKE_C_COMPILER_ID MATCHES "GNU|Clang")
 endif()
 if(MINGW)
   target_compile_definitions(ankah PRIVATE _WIN32_WINNT=0x0A00)
-  foreach(target ankah ankah-pow ankah-http ankah-session ankah-proxy ankah-stats)
+  foreach(target ankah ankah-pow ankah-http ankah-session ankah-proxy ankah-stats ankah-png)
     target_link_options(${target} PRIVATE -static -static-libgcc)
   endforeach()
 endif()
 enable_testing()
+add_test(NAME png_optimizer COMMAND ankah-png)
 add_test(NAME pow COMMAND ankah-pow)
 add_test(NAME http COMMAND ankah-http)
 add_test(NAME header_names COMMAND ankah-header-names)
@@ -407,6 +423,17 @@ if(Python3_Interpreter_FOUND)
   else()
     set(ANKAH_CRAWLER_DNS_FIXTURE "")
   endif()
+  set(ANKAH_MASCOT_WORKER_FIXTURE "")
+  if(CMAKE_SYSTEM_NAME STREQUAL "Linux" AND NOT ANKAH_STATIC_LINUX AND
+      NOT ANKAH_BUNDLED_RUNTIME_DEPS)
+    add_library(ankah-mascot-worker-fixture SHARED tests/mascot_worker_fixture.c)
+    target_include_directories(ankah-mascot-worker-fixture PRIVATE ${LIBUV_INCLUDE_DIR})
+    target_link_libraries(ankah-mascot-worker-fixture PRIVATE ${CMAKE_DL_LIBS})
+    set(ANKAH_MASCOT_WORKER_FIXTURE $<TARGET_FILE:ankah-mascot-worker-fixture>)
+  endif()
+  add_test(NAME mascot COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/mascot_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR} ${ANKAH_MASCOT_WORKER_FIXTURE})
   add_test(NAME admission COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/admission_test.py
     $<TARGET_FILE:ankah> ${ANKAH_CRAWLER_DNS_FIXTURE})
@@ -419,6 +446,10 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME host_browser COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/host_browser_test.py
+    $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR}/build_static_bundle.py
+    ${CMAKE_CURRENT_SOURCE_DIR})
+  add_test(NAME route_policy COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
+    ${CMAKE_CURRENT_SOURCE_DIR}/tests/route_policy_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR}/build_static_bundle.py
     ${CMAKE_CURRENT_SOURCE_DIR})
   add_test(NAME continuation COMMAND ${ANKAH_PYTHON_TEST_COMMAND}
@@ -462,7 +493,7 @@ if(Python3_Interpreter_FOUND)
     ${CMAKE_CURRENT_SOURCE_DIR}/tests/configuration_test.py
     $<TARGET_FILE:ankah> ${CMAKE_CURRENT_SOURCE_DIR})
   if(CMAKE_CROSSCOMPILING)
-    set_tests_properties(admission cache static host_browser continuation links platform tls_http2 dashboard health
+    set_tests_properties(admission cache static host_browser route_policy continuation links platform tls_http2 dashboard mascot health
       language_integration upload tus shutdown abuse_integration dots_integration configuration PROPERTIES
       ENVIRONMENT "ANKAH_TEST_RUNNER=${ANKAH_TEST_RUNNER};ANKAH_TEST_WINDOWS_PATHS=1")
   endif()
@@ -502,6 +533,10 @@ install(FILES docs/monitoring.md DESTINATION . RENAME MONITORING.md
   COMPONENT ankah_runtime)
 install(FILES PARTICLES_LICENSE.md DESTINATION notices COMPONENT ankah_runtime)
 install(FILES D3_LICENSE.md DESTINATION notices COMPONENT ankah_runtime)
+install(FILES third_party/exoquant/LICENSE
+  DESTINATION notices/exoquant COMPONENT ankah_runtime)
+install(FILES third_party/lodepng/LICENSE
+  DESTINATION notices/lodepng COMPONENT ankah_runtime)
 install(FILES
   ${llhttp_SOURCE_DIR}/LICENSE-MIT
   DESTINATION notices RENAME llhttp-LICENSE.txt COMPONENT ankah_runtime)

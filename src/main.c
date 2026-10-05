@@ -30,6 +30,7 @@
 #include "crawler.h"
 #include "disk_writer.h"
 #include "link.h"
+#include "png_optimizer.h"
 #include <llhttp.h>
 #include <uv.h>
 #include <mbedtls/md.h>
@@ -124,6 +125,13 @@ typedef struct throttle_client throttle_client;
 typedef struct remote_pending remote_pending;
 typedef struct consume_job consume_job;
 
+typedef struct {
+    uv_work_t work;
+    connection *client;
+    unsigned char *input, *output;
+    size_t input_size, output_size;
+} mascot_job;
+
 typedef enum {
     LIFECYCLE_RUNNING,
     LIFECYCLE_DRAINING,
@@ -157,7 +165,8 @@ typedef struct {
 struct connection {
     uv_tcp_t client;
     union { uv_tcp_t tcp; uv_pipe_t pipe; } upstream;
-    ankah_host *host; /* Exact streaming route only. */
+    ankah_host *host; /* Routed upstream requests, including their challenge gate. */
+    ankah_upstream_policy *policy;
     ankah_host *selected_host;
     unsigned int route_id;
     unsigned int bridge_port;
@@ -421,7 +430,9 @@ typedef struct {
 } configuration;
 
 static configuration config;
+static mascot_job *active_mascot_job;
 static ankah_host *loading_host;
+static ankah_upstream_policy *loading_policy;
 
 static void close_connection(connection *c);
 static void send_asset_chunk(connection *c);
@@ -1258,9 +1269,80 @@ static int health_name(const char *name) {
 
 static int load_config_file(const char *path, option_state *state);
 
+static int policy_option(ankah_upstream_policy *policy, const char *name, const char *value) {
+    uint64_t n;
+    if (!strcmp(name, "upstream")) {
+        if (policy->upstream[0]) return -1;
+        return copy_text(policy->upstream, sizeof(policy->upstream), value);
+    }
+    if (decimal_u64(value, &n) || !n || n > 1073741824) return -1;
+#define LIMIT(KEY, FIELD, MAXIMUM) if (!strcmp(name, KEY)) { \
+    if (policy->FIELD || n > MAXIMUM) { return -1; } policy->FIELD = n; return 0; }
+    LIMIT("body-limit", body_limit, 1073741824)
+    LIMIT("concurrency", concurrency, 256)
+    LIMIT("connect-timeout-ms", connect_ms, 300000)
+    LIMIT("upload-timeout-ms", upload_ms, 3600000)
+    LIMIT("response-timeout-ms", response_ms, 3600000)
+#undef LIMIT
+    return -1;
+}
+
+static int route_option(ankah_host *host, const char *value) {
+    ankah_exact_route route;
+    const char *at;
+    unsigned int seen = 0, i;
+    int used = 0;
+    memset(&route, 0, sizeof(route));
+    if (host->route_count == ANKAH_MAX_ROUTES ||
+        sscanf(value, "%63s %15s %2047s%n", route.id, route.method, route.path, &used) != 3 ||
+        strspn(route.id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != strlen(route.id) ||
+        strspn(route.method, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != strlen(route.method) ||
+        route.path[0] != '/' || strpbrk(route.path, "?#%") ||
+        strstr(route.path, "/./") || strstr(route.path, "/../")) return -1;
+    at = value + used;
+    while (*at) {
+        char token[96];
+        size_t size = 0;
+        unsigned int bit;
+        while (ascii_space(*at)) ++at;
+        if (!*at) break;
+        while (*at && !ascii_space(*at)) {
+            if (size + 1 == sizeof(token)) return -1;
+            token[size++] = *at++;
+        }
+        token[size] = 0;
+        if (prefix(token, "policy=")) {
+            bit = 1;
+            if (!token[7] || strspn(token + 7, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != strlen(token + 7) ||
+                copy_text(route.policy_name, sizeof(route.policy_name), token + 7)) return -1;
+        } else if (prefix(token, "match=")) {
+            bit = 2;
+            if (!strcmp(token + 6, "prefix")) route.prefix = 1;
+            else if (strcmp(token + 6, "exact")) return -1;
+        } else if (prefix(token, "query=")) {
+            bit = 4;
+            if (!strcmp(token + 6, "allow")) route.query = 1;
+            else if (strcmp(token + 6, "reject")) return -1;
+        } else if (prefix(token, "challenge=")) {
+            bit = 8;
+            if (!strcmp(token + 10, "on")) route.challenge = 1;
+            else if (strcmp(token + 10, "off")) return -1;
+        } else return -1;
+        if (seen & bit) return -1;
+        seen |= bit;
+    }
+    if (route.prefix && (route.path[strlen(route.path) - 1] != '/' ||
+        strchr(route.path, '\\') || strstr(route.path, "//"))) return -1;
+    for (i = 0; i < host->route_count; ++i)
+        if (!strcmp(route.id, host->routes[i].id) ||
+            (route.prefix == host->routes[i].prefix && !strcmp(route.path, host->routes[i].path) &&
+             !strcmp(route.method, host->routes[i].method))) return -1;
+    host->routes[host->route_count++] = route;
+    return 0;
+}
+
 static int host_option(const char *name, const char *value, const option_context *context) {
     ankah_host *h = loading_host;
-    uint64_t n;
     unsigned int i;
     if (!strcmp(name, "public-origin")) {
         if (h->origin[0]) return -1;
@@ -1271,27 +1353,26 @@ static int host_option(const char *name, const char *value, const option_context
         if (*out) return -1;
         return copy_path(out, 512, value, context);
     }
-    if (!strcmp(name, "upstream")) {
-        if (h->upstream[0]) return -1;
-        return copy_text(h->upstream, sizeof(h->upstream), value);
+    if (!strcmp(name, "upstream-policy")) {
+        char id[64], path[CONFIG_PATH_MAX];
+        int used = 0, result;
+        option_state state = {0};
+        if (h->policy_count == ANKAH_MAX_POLICIES ||
+            sscanf(value, "%63s%n", id, &used) != 1 ||
+            strspn(id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != strlen(id) ||
+            !strcmp(id, "default") || !ascii_space(value[used])) return -1;
+        while (ascii_space(value[used])) ++used;
+        if (!value[used] || copy_path(path, sizeof(path), value + used, context)) return -1;
+        for (i = 0; i < h->policy_count; ++i)
+            if (!strcmp(id, h->policies[i].id)) return -1;
+        loading_policy = &h->policies[h->policy_count];
+        strcpy(loading_policy->id, id);
+        result = load_config_file(path, &state);
+        loading_policy = NULL;
+        if (!result) ++h->policy_count;
+        return result;
     }
-    if (!strcmp(name, "route")) {
-        ankah_exact_route r;
-        char extra;
-        memset(&r, 0, sizeof(r));
-        if (h->route_count == ANKAH_MAX_ROUTES ||
-            sscanf(value, "%63s %15s %2047s %c", r.id, r.method, r.path, &extra) != 3 ||
-            strspn(r.id, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_") != strlen(r.id) ||
-            strspn(r.method, "ABCDEFGHIJKLMNOPQRSTUVWXYZ") != strlen(r.method) ||
-            r.path[0] != '/' || strpbrk(r.path, "?#%") || strstr(r.path, "/./") ||
-            strstr(r.path, "/../")) return -1;
-        for (i = 0; i < h->route_count; ++i)
-            if (!strcmp(r.id, h->routes[i].id) ||
-                (!strcmp(r.path, h->routes[i].path) &&
-                 !strcmp(r.method, h->routes[i].method))) return -1;
-        h->routes[h->route_count++] = r;
-        return 0;
-    }
+    if (!strcmp(name, "route")) return route_option(h, value);
     if (!strcmp(name, "static-bundle")) {
         if (h->static_directory[0] || !value[0]) return -1;
         return copy_path(h->static_directory, sizeof(h->static_directory), value, context);
@@ -1300,21 +1381,13 @@ static int host_option(const char *name, const char *value, const option_context
         if (h->static_challenge_seen++) return -1;
         return boolean_value(value, &h->static_challenge);
     }
-    if (decimal_u64(value, &n) || !n || n > 1073741824) return -1;
-#define LIMIT(KEY, FIELD, MAXIMUM) if (!strcmp(name, KEY)) { \
-    if (h->FIELD || n > MAXIMUM) { return -1; } h->FIELD = n; return 0; }
-    LIMIT("body-limit", body_limit, 1073741824)
-    LIMIT("concurrency", concurrency, 256)
-    LIMIT("connect-timeout-ms", connect_ms, 300000)
-    LIMIT("upload-timeout-ms", upload_ms, 3600000)
-    LIMIT("response-timeout-ms", response_ms, 3600000)
-#undef LIMIT
-    return -1;
+    return policy_option(&h->defaults, name, value);
 }
 
 static int apply_option(const char *name, const char *value,
                         const option_context *context, option_state *state) {
     int health = health_name(name);
+    if (loading_policy) return policy_option(loading_policy, name, value);
     if (loading_host) return host_option(name, value, context);
     if (!strcmp(name, "virtual-host")) {
         char path[CONFIG_PATH_MAX];
@@ -1714,16 +1787,34 @@ static int finish_configuration(void) {
             if (!h->origin[0] || !h->certificate[0] || !h->key[0] ||
                 (!h->route_count && !h->static_directory[0]) ||
                 (h->static_challenge && !h->static_directory[0])) return -1;
-            if (h->route_count && (!h->body_limit || !h->concurrency || !h->connect_ms ||
-                !h->upload_ms || h->response_ms < h->upload_ms)) return -1;
-            if (h->route_count && prefix(h->upstream, "unix:")) {
+            for (j = 0; j < h->route_count; ++j) {
+                ankah_exact_route *route = &h->routes[j];
+                unsigned int k;
+                if (!route->policy_name[0] || !strcmp(route->policy_name, "default")) continue;
+                for (k = 0; k < h->policy_count; ++k)
+                    if (!strcmp(route->policy_name, h->policies[k].id)) break;
+                if (k == h->policy_count) return -1;
+                route->policy_index = k + 1;
+            }
+            for (j = 0; j <= h->policy_count; ++j) {
+                ankah_upstream_policy *policy = j ? &h->policies[j - 1] : &h->defaults;
+                unsigned int k;
+                int needed = j != 0 || policy->upstream[0] || policy->body_limit ||
+                    policy->concurrency || policy->connect_ms || policy->upload_ms || policy->response_ms;
+                for (k = 0; k < h->route_count; ++k)
+                    if (h->routes[k].policy_index == j) needed = 1;
+                if (!needed) continue;
+                if (!policy->body_limit || !policy->concurrency || !policy->connect_ms ||
+                    !policy->upload_ms || policy->response_ms < policy->upload_ms) return -1;
+                if (prefix(policy->upstream, "unix:")) {
 #ifdef _WIN32
-                return -1;
-#else
-                if (h->upstream[5] != '/' || !h->upstream[6] || strlen(h->upstream + 5) >= 108)
                     return -1;
+#else
+                    if (policy->upstream[5] != '/' || !policy->upstream[6] || strlen(policy->upstream + 5) >= 108)
+                        return -1;
 #endif
-            } else if (h->route_count && parse_address(h->upstream, ip, sizeof(ip), &port)) return -1;
+                } else if (parse_address(policy->upstream, ip, sizeof(ip), &port)) return -1;
+            }
             for (j = 0; j < i; ++j)
                 if (!strcmp(h->name, config.hosts[j].name)) return -1;
         }
@@ -1842,7 +1933,7 @@ static int finish_configuration(void) {
                 (prefix(h->dashboard_route, h->bundle.prefix) ||
                  prefix(h->bundle.prefix, h->dashboard_route))) return -1;
             for (j = 0; j < h->route_count; ++j)
-                if (ankah_host_local_path(h, h->routes[j].path)) return -1;
+                if (ankah_host_route_conflict(h, j)) return -1;
         }
     }
     if (config.throttle_prefix_count) {
@@ -1942,6 +2033,8 @@ static void on_handle_closed(uv_handle_t *handle) {
 static void close_connection(connection *c) {
     if (c->closed) return;
     c->closed = 1;
+    if (active_mascot_job && active_mascot_job->client == c)
+        (void)uv_cancel((uv_req_t *)&active_mascot_job->work);
     if (c->host) fprintf(stderr,
         "Ankah route=%s elapsed_ms=%" PRIu64 " request_queue=%zu response_queue=%zu request_peak=%zu response_peak=%zu\n",
         c->host->routes[c->route_id].id, uv_now(config.loop) - c->accepted_ms,
@@ -3185,7 +3278,8 @@ static void respond(connection *c, int status, const char *reason,
                           "%sConnection: close\r\n%s%s\r\n%s",
                           status, reason, type, charset, body_size, language_headers,
                           extra ? extra : "",
-                          c->abuse_action ? "Ankah-Proxy-Action: block\r\n" : "", body);
+                          c->abuse_action ? "Ankah-Proxy-Action: block\r\n" : "",
+                          !strcmp(c->request.method, "HEAD") ? "" : body);
     if (length < 0 || (size_t)length >= sizeof(response) ||
         queue_bytes(c, (uv_stream_t *)&c->client, NULL, response, (size_t)length, 1) != 0)
         close_connection(c);
@@ -3287,7 +3381,7 @@ static int frontend_admit(const ankah_request *request, const char *host,
                           int *crawler, int *bing_claim) {
     char resolved[64];
     unsigned int i;
-    int status = 0, rate_result = 0;
+    int status = 0, rate_result = 0, route_challenge = 0;
     for (i = 0; i < request->count; ++i) {
         if (same_ascii(request->headers[i].name, "X-Ankah-Internal-Rate-Checked") ||
             same_ascii(request->headers[i].name, "X-Ankah-Internal-Proved") ||
@@ -3307,10 +3401,11 @@ static int frontend_admit(const ankah_request *request, const char *host,
             int validation = ankah_host_request(&config.hosts[index], request, host,
                                                  ankah_header_value(request, "Host") == NULL, &route);
             if (validation) return validation;
-            if (route != ANKAH_LOCAL_ROUTE) {
+            if (route != ANKAH_LOCAL_ROUTE && !config.hosts[index].routes[route].challenge) {
                 *kind = 1; *proved = 0; *crawler = 0; *bing_claim = 0;
                 return status;
             }
+            route_challenge = route != ANKAH_LOCAL_ROUTE;
         }
         host = config.hosts[index].authority;
     } else if (!status && (!host || !same_ascii(host, config.public_host))) status = 421;
@@ -3318,8 +3413,8 @@ static int frontend_admit(const ankah_request *request, const char *host,
     if (!status && gateway_blocked(resolved)) status = 403;
     if (!status) {
         *proved = request_proved(request, host);
-        *crawler = ankah_google_crawler_is_known(resolved);
-        *bing_claim = !*crawler && claims_bingbot(request);
+        *crawler = !route_challenge && ankah_google_crawler_is_known(resolved);
+        *bing_claim = !route_challenge && !*crawler && claims_bingbot(request);
         if (*crawler) *proved = 1;
         *kind = request_rate_class(request, *proved, *crawler || *bing_claim);
         if (!*bing_claim) rate_result = allow_rate((rate_class)*kind, resolved);
@@ -3713,6 +3808,35 @@ static void handle_challenge(connection *c) {
         }
         render_gate(c, session);
     }
+}
+
+/* Routed writes are never saved for continuation. Browser gate sessions carry
+ * only a GET return target, not the original headers or body. */
+static void handle_route_challenge(connection *c) {
+    ankah_request *request;
+    ankah_session *session;
+    if ((strcmp(c->request.method, "GET") && strcmp(c->request.method, "HEAD")) ||
+        !valid_return_path(c->request.target)) {
+        respond_unlock_required(c, 428, "Precondition Required", "Unlock, then retry this method.", NULL);
+        return;
+    }
+    if (command_line_client(&c->request)) {
+        respond_curl_challenge(c, 428, "Precondition Required", "Ankah challenge required.\n", 0);
+        return;
+    }
+    request = calloc(1, sizeof(*request));
+    if (!request) { close_connection(c); return; }
+    strcpy(request->method, "GET");
+    strcpy(request->target, c->request.target);
+    session = ankah_session_new_with_proof(config.secret, connection_host(c),
+                (uint64_t)time(NULL), request, c->peer_ip, 0);
+    free(request);
+    if (!session) {
+        respond(c, 503, "Unavailable", "text/plain", "Challenge capacity reached\n", NULL);
+        return;
+    }
+    tally(c, ANKAH_STAT_challenges_issued, 1);
+    render_gate(c, session);
 }
 
 /* Always issues a fresh challenge, even to a client that already passed one,
@@ -4203,7 +4327,7 @@ static void on_connected(uv_connect_t *request, int status) {
     }
     c->connect_deadline_ns = 0;
     if (c->host) {
-        c->reply_deadline_ns = uv_hrtime() + c->host->response_ms * UINT64_C(1000000);
+        c->reply_deadline_ns = uv_hrtime() + c->policy->response_ms * UINT64_C(1000000);
         ankah_frontend_response_deadline(c->bridge_port, c->reply_deadline_ns);
     }
     head_size = build_upstream_request(c, head, sizeof(head));
@@ -4238,12 +4362,12 @@ static int connect_upstream(connection *c) {
     int result;
     strcpy(ip, config.upstream_ip);
     if (c->host) {
-        if (prefix(c->host->upstream, "unix:")) unix_path = c->host->upstream + 5;
+        if (prefix(c->policy->upstream, "unix:")) unix_path = c->policy->upstream + 5;
         else {
             unix_path = "";
-            if (parse_address(c->host->upstream, ip, sizeof(ip), &port)) return -1;
+            if (parse_address(c->policy->upstream, ip, sizeof(ip), &port)) return -1;
         }
-        c->connect_deadline_ns = uv_hrtime() + c->host->connect_ms * UINT64_C(1000000);
+        c->connect_deadline_ns = uv_hrtime() + c->policy->connect_ms * UINT64_C(1000000);
         refresh_timeout(c);
     }
     if (*unix_path) {
@@ -5178,7 +5302,7 @@ static void serve_dashboard_asset(connection *c, const static_asset *asset) {
                     !c->segmented) != 0) close_connection(c);
 }
 
-static void finish_mascot_upload(connection *c) {
+static void save_mascot_upload(connection *c) {
     shared_body *replacement;
     char temporary[sizeof(config.mascot_path)];
     if (!valid_mascot_png(c->mascot_upload, c->mascot_received)) {
@@ -5207,6 +5331,74 @@ static void finish_mascot_upload(connection *c) {
     body_release(config.mascot_current);
     config.mascot_current = replacement;
     respond(c, 204, "No Content", "text/plain", "", NULL);
+}
+
+static void optimize_mascot(uv_work_t *work) {
+    mascot_job *job = work->data;
+    (void)ankah_png_optimize(job->input, job->input_size,
+        ANKAH_PNG_MEMORY_LIMIT, &job->output, &job->output_size);
+}
+
+static void on_mascot_wait_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *buffer) {
+    connection *c = stream->data;
+    free(buffer->base);
+    if (count < 0) close_connection(c);
+}
+
+static void on_mascot_optimized(uv_work_t *work, int status) {
+    mascot_job *job = work->data;
+    connection *c = job->client;
+    active_mascot_job = NULL;
+    if (!c->closed) {
+        uv_read_stop((uv_stream_t *)&c->client);
+        if (!config.dashboard || config.lifecycle != LIFECYCLE_RUNNING || status < 0) {
+            respond(c, 503, "Unavailable", "text/plain", "Could not save mascot\n", NULL);
+        } else {
+            c->mascot_upload = job->output ? job->output : job->input;
+            c->mascot_received = job->output ? job->output_size : job->input_size;
+            if (job->output) job->output = NULL;
+            else job->input = NULL;
+            save_mascot_upload(c);
+        }
+    }
+    free(job->input);
+    free(job->output);
+    free(job);
+    release_connection(c);
+}
+
+static void finish_mascot_upload(connection *c) {
+    mascot_job *job;
+    if (!valid_mascot_png(c->mascot_upload, c->mascot_received)) {
+        respond(c, 400, "Bad Request", "text/plain", "Invalid PNG image\n", NULL);
+        return;
+    }
+    if (active_mascot_job) {
+        respond(c, 503, "Unavailable", "text/plain", "Mascot update in progress\n", NULL);
+        return;
+    }
+    job = calloc(1, sizeof(*job));
+    if (!job) { save_mascot_upload(c); return; }
+    job->client = c;
+    job->input = c->mascot_upload;
+    job->input_size = c->mascot_received;
+    job->work.data = job;
+    c->mascot_upload = NULL;
+    ++c->handles; /* Retain the connection even if its socket closes. */
+    active_mascot_job = job;
+    if (uv_queue_work(config.loop, &job->work, optimize_mascot, on_mascot_optimized) != 0) {
+        active_mascot_job = NULL;
+        c->mascot_upload = job->input;
+        free(job);
+        save_mascot_upload(c);
+        release_connection(c);
+        return;
+    }
+    c->request_deadline_ns = 0;
+    c->reply_deadline_ns = uv_hrtime() + ANKAH_UPLOAD_REPLY_NS;
+    refresh_timeout(c);
+    if (!c->closed && uv_read_start((uv_stream_t *)&c->client,
+            allocate_read, on_mascot_wait_read) != 0) close_connection(c);
 }
 
 static void handle_dashboard(connection *c, size_t end, const char *target) {
@@ -5262,6 +5454,11 @@ static void handle_dashboard(connection *c, size_t end, const char *target) {
     }
     if (route == MASCOT) {
         const char *type = ankah_header_value(&c->request, "Content-Type");
+        if (active_mascot_job &&
+            (!strcmp(c->request.method, "PUT") || !strcmp(c->request.method, "DELETE"))) {
+            respond(c, 503, "Unavailable", "text/plain", "Mascot update in progress\n", NULL);
+            return;
+        }
         if (strcmp(c->request.method, "GET") == 0) {
             serve_mascot(c, 1);
         } else if (strcmp(c->request.method, "DELETE") == 0) {
@@ -5625,13 +5822,19 @@ static void handle_initial(connection *c) {
         if (host_index > 0 && route_id != ANKAH_LOCAL_ROUTE) {
             c->host = &config.hosts[host_index];
             c->route_id = route_id;
+            c->policy = ankah_host_policy(c->host, route_id);
             registry_unlink(c);
             if (!admit_request(c)) return;
+            if (c->host->routes[route_id].challenge &&
+                !request_proved(&c->request, connection_host(c))) {
+                handle_route_challenge(c);
+                return;
+            }
             if (c->admission_state == 0) { --config.pending_connections; c->admission_state = 2; }
             if (c->request.chunked) {
                 ankah_chunked_body_init(&c->chunked_body);
                 if (ankah_chunked_body_consume(&c->chunked_body, c->initial + end,
-                        c->initial_size - end, c->host->body_limit, &decoded) < 0 || c->chunked_body.trailer_size) {
+                        c->initial_size - end, c->policy->body_limit, &decoded) < 0 || c->chunked_body.trailer_size) {
                     respond(c, c->chunked_body.limit_exceeded ? 413 : 400,
                             "Request Rejected", "text/plain", "Invalid body\n", NULL);
                     return;
@@ -5646,7 +5849,7 @@ static void handle_initial(connection *c) {
             }
             c->body_started_ns = uv_hrtime();
             c->request_deadline_ns = request_body_complete(c) ? 0 :
-                c->body_started_ns + c->host->upload_ms * UINT64_C(1000000);
+                c->body_started_ns + c->policy->upload_ms * UINT64_C(1000000);
             uv_read_stop((uv_stream_t *)&c->client);
             if (start_upstream(c))
                 respond(c, 502, "Bad Gateway", "text/plain", "Upstream unavailable\n", NULL);
@@ -5921,7 +6124,7 @@ static void on_client_read(uv_stream_t *stream, ssize_t count, const uv_buf_t *b
                 if (c->request.chunked) {
                     size_t decoded = 0;
                     if (ankah_chunked_body_consume(&c->chunked_body, buffer->base,
-                            (size_t)count, c->host ? c->host->body_limit : forward_body_limit(), &decoded) < 0 ||
+                            (size_t)count, c->host ? c->policy->body_limit : forward_body_limit(), &decoded) < 0 ||
                         (c->host && c->chunked_body.trailer_size)) {
                         if (c->chunked_body.limit_exceeded && !c->upstream_final_started) {
                             c->forwarding = 0;

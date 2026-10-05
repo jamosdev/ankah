@@ -51,7 +51,11 @@ async function main() {
     args: ["--no-proxy-server", "--host-resolver-rules=MAP *.test " +
            (process.env.ANKAH_FIXTURE_ADDRESS || "127.0.0.1")]});
   const version = await browser.version();
-  const scenarios = [
+  const routed = fixtureOptions.includes("--routes");
+  const scenarios = routed ? [
+    {name: "admin-return", host: "submit.test", target: "/admin/?view=mail&empty=", returned: true},
+    {name: "login-return", host: "submit.test", target: "/oidc/login?next=%2Fadmin%2F", returned: true},
+  ] : [
     {name: "landing", host: "submit.test", target: "/", hold: true},
     {name: "primary-test", host: "status.test", hold: true},
     {name: "secondary-test", host: "submit.test", hold: true},
@@ -62,7 +66,7 @@ async function main() {
     ...["script-failed", "script-stalled", "config-failed", "config-stalled", "config-invalid"]
       .map((fault) => ({name: fault, host: "submit.test", fault})),
   ];
-  if (!fixtureOptions.includes("--no-dashboard")) scenarios.push({name: "dashboard-control", host: "status.test", dashboard: true});
+  if (!routed && !fixtureOptions.includes("--no-dashboard")) scenarios.push({name: "dashboard-control", host: "status.test", dashboard: true});
   try {
     for (const scenario of scenarios) {
       const fixture = await freshFixture(scenario.name);
@@ -113,9 +117,19 @@ async function main() {
           await context.clearCookies();
           target = "/ankah/solve/" + sid;
         }
-        await page.goto(origin(scenario.host) + target, {waitUntil: "domcontentloaded"});
+        const returned = scenario.returned ? page.waitForResponse(response =>
+          response.url() === origin(scenario.host) + target && response.status() === 200,
+          {timeout: 10000}) : null;
+        if (returned) returned.catch(() => {});
+        const firstResponse = await page.goto(origin(scenario.host) + target, {waitUntil: "domcontentloaded"});
         let state;
-        if (scenario.fault || scenario.name === "normal-return") {
+        if (scenario.returned) {
+          assert.equal(firstResponse.status(), 428);
+          await returned;
+          await page.waitForFunction(() => !document.querySelector("body[data-challenge]"));
+          assert.equal(page.url(), origin(scenario.host) + target);
+          state = {returned: true, queryPreserved: true};
+        } else if (scenario.fault || scenario.name === "normal-return") {
           await page.waitForURL(origin(scenario.host) + "/", {waitUntil: "domcontentloaded", timeout: 10000});
           assert.equal(await page.locator("body").getAttribute("data-challenge"), null);
           state = {returned: true};

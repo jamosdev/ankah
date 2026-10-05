@@ -102,7 +102,8 @@ struct h2_stream {
     int has_content_length;
     int chunked_bridge;
     int host_index;
-    int exact_route;
+    int exact_route; /* Any configured upstream route. */
+    unsigned int route_id;
     int host_reserved;
     int stream_counted;
     uint64_t header_deadline_ns, response_deadline_ns;
@@ -160,7 +161,8 @@ struct front_connection {
     int timer_initialized;
     int handshake_complete;
     int selected_host;
-    int exact_route;
+    int exact_route; /* Any configured upstream route. */
+    unsigned int route_id;
     int host_reserved;
     int saw_sni;
     uint64_t response_deadline_ns;
@@ -420,10 +422,11 @@ static tls_credentials *credentials_load(void) {
 }
 
 static int validate_host(front_connection *front, const ankah_request *request,
-                          const char *authority, int h2, int *exact) {
+                          const char *authority, int h2, int *exact, unsigned int *route_id) {
     unsigned int route = ANKAH_LOCAL_ROUTE, i;
     int index, status;
     *exact = 0;
+    *route_id = ANKAH_LOCAL_ROUTE;
     if (!frontend.options.host_count) return 0;
     index = ankah_host_find(frontend.options.hosts, frontend.options.host_count, authority);
     if (index < 0) return -index;
@@ -432,7 +435,7 @@ static int validate_host(front_connection *front, const ankah_request *request,
         if (strlen(request->headers[i].name) >= 17 &&
             same_ascii_part(request->headers[i].name, 17, "x-ankah-internal-", 17)) return 400;
     status = ankah_host_request(&frontend.options.hosts[index], request, authority, h2, &route);
-    if (!status) *exact = route != ANKAH_LOCAL_ROUTE;
+    if (!status) { *exact = route != ANKAH_LOCAL_ROUTE; *route_id = route; }
     return status;
 }
 
@@ -624,12 +627,12 @@ static void close_front(front_connection *front) {
     if (front->closing) return;
     front->closing = 1;
     if (front->host_reserved) {
-        --frontend.options.hosts[front->selected_host].active;
+        --ankah_host_policy(&frontend.options.hosts[front->selected_host], front->route_id)->active;
         front->host_reserved = 0;
     }
     for (stream = front->streams; stream; stream = stream->next)
         if (stream->host_reserved) {
-            --frontend.options.hosts[stream->host_index].active;
+            --ankah_host_policy(&frontend.options.hosts[stream->host_index], stream->route_id)->active;
             stream->host_reserved = 0;
         }
     uv_read_stop((uv_stream_t *)&front->client);
@@ -893,7 +896,7 @@ static int send_h1_header(front_connection *front) {
         ankah_stats_add(ANKAH_STAT_responses_4xx, 1);
         return h1_local_response(front, 400, NULL);
     }
-    status = validate_host(front, &parsed, ankah_header_value(&parsed, "Host"), 0, &front->exact_route);
+    status = validate_host(front, &parsed, ankah_header_value(&parsed, "Host"), 0, &front->exact_route, &front->route_id);
     if (status) return h1_local_response(front, status, &parsed);
     status = frontend.options.admit(&parsed, ankah_header_value(&parsed, "Host"),
                                     front->peer_ip, &rate_class, &proved, &crawler,
@@ -901,9 +904,12 @@ static int send_h1_header(front_connection *front) {
     if (status) return h1_local_response(front, status, &parsed);
     if (front->exact_route) {
         ankah_host *host = &frontend.options.hosts[front->selected_host];
-        if (host->active >= host->concurrency) return h1_local_response(front, 503, &parsed);
-        ++host->active;
-        front->host_reserved = 1;
+        ankah_upstream_policy *policy = ankah_host_policy(host, front->route_id);
+        if ((!host->routes[front->route_id].challenge || proved) && policy->active >= policy->concurrency) return h1_local_response(front, 503, &parsed);
+        if (!host->routes[front->route_id].challenge || proved) {
+            ++policy->active;
+            front->host_reserved = 1;
+        }
     }
     if ((crawler || bing_claim) && ankah_crawler_acquire() != 0)
         return h1_local_response(front, 429, &parsed);
@@ -960,10 +966,10 @@ static int send_h1_header(front_connection *front) {
     free(request);
     front->h1_header_sent = 1;
     front->h1_header_size = 0;
-    if (front->exact_route) {
+    if (front->host_reserved) {
         front->response_deadline_ns = uv_hrtime() +
-            (frontend.options.hosts[front->selected_host].response_ms +
-             frontend.options.hosts[front->selected_host].connect_ms) * UINT64_C(1000000);
+            (ankah_host_policy(&frontend.options.hosts[front->selected_host], front->route_id)->response_ms +
+             ankah_host_policy(&frontend.options.hosts[front->selected_host], front->route_id)->connect_ms) * UINT64_C(1000000);
         refresh_timeout(front);
     }
     return 1;
@@ -1630,10 +1636,10 @@ static void on_h2_core_connected(uv_connect_t *request, int status) {
         return;
     }
     stream->core_connected = 1;
-    if (stream->exact_route) {
+    if (stream->host_reserved) {
         stream->response_deadline_ns = uv_hrtime() +
-            (frontend.options.hosts[stream->host_index].response_ms +
-             frontend.options.hosts[stream->host_index].connect_ms) * UINT64_C(1000000);
+            (ankah_host_policy(&frontend.options.hosts[stream->host_index], stream->route_id)->response_ms +
+             ankah_host_policy(&frontend.options.hosts[stream->host_index], stream->route_id)->connect_ms) * UINT64_C(1000000);
         refresh_timeout(front);
     }
     capacity = ANKAH_HEADER_LIMIT + 1024;
@@ -1831,7 +1837,7 @@ static int h2_on_frame_recv(nghttp2_session *session,
             int rate_class = 0, proved = 0, crawler = 0, bing_claim = 0;
             int status;
             stream->request.content_length = stream->declared_length;
-            status = validate_host(front, &stream->request, stream->authority, 1, &stream->exact_route);
+            status = validate_host(front, &stream->request, stream->authority, 1, &stream->exact_route, &stream->route_id);
             if (!status && frontend.options.host_count) {
                 stream->host_index = front->selected_host;
                 stream->chunked_bridge = stream->exact_route && !stream->has_content_length;
@@ -1847,12 +1853,15 @@ static int h2_on_frame_recv(nghttp2_session *session,
             }
             if (stream->exact_route) {
                 ankah_host *host = &frontend.options.hosts[stream->host_index];
-                if (host->active >= host->concurrency) {
+                ankah_upstream_policy *policy = ankah_host_policy(host, stream->route_id);
+                if ((!host->routes[stream->route_id].challenge || proved) && policy->active >= policy->concurrency) {
                     h2_request_failure(stream, 503, "Route capacity reached\n");
                     return 0;
                 }
-                ++host->active;
-                stream->host_reserved = 1;
+                if (!host->routes[stream->route_id].challenge || proved) {
+                    ++policy->active;
+                    stream->host_reserved = 1;
+                }
             }
             if ((crawler || bing_claim) && ankah_crawler_acquire() != 0) {
                 h2_request_failure(stream, 429, "Crawler concurrency exceeded\n");
@@ -1913,8 +1922,8 @@ static int h2_on_data(nghttp2_session *session, uint8_t flags, int32_t stream_id
         return 0;
     }
     if (stream->has_content_length || stream->chunked_bridge) {
-        if (stream->exact_route && (stream->request_received > frontend.options.hosts[stream->host_index].body_limit ||
-            size > frontend.options.hosts[stream->host_index].body_limit - stream->request_received)) {
+        if (stream->exact_route && (stream->request_received > ankah_host_policy(&frontend.options.hosts[stream->host_index], stream->route_id)->body_limit ||
+            size > ankah_host_policy(&frontend.options.hosts[stream->host_index], stream->route_id)->body_limit - stream->request_received)) {
             nghttp2_session_consume_connection(front->h2, size);
             h2_request_failure(stream, 413, "Request body too large\n");
             return 0;
@@ -1990,7 +1999,7 @@ static int h2_on_stream_close(nghttp2_session *session, int32_t stream_id,
         }
     }
     if (stream->host_reserved) {
-        --frontend.options.hosts[stream->host_index].active;
+        --ankah_host_policy(&frontend.options.hosts[stream->host_index], stream->route_id)->active;
         stream->host_reserved = 0;
     }
     stream->closed_by_h2 = 1;
@@ -2005,6 +2014,9 @@ static int h2_on_stream_close(nghttp2_session *session, int32_t stream_id,
     stream->response_queued = 0;
     close_stream_core(stream);
     stream_maybe_free(stream);
+    /* Completion may have removed the earliest absolute deadline after the
+     * long-wait flag was already cleared by response headers. */
+    if (!front->closing) refresh_timeout(front);
     return 0;
 }
 
@@ -2204,9 +2216,10 @@ static void on_timeout(uv_timer_t *timer) {
     if (frontend.options.host_count && front->protocol_h2 && front->admission_state) {
         h2_stream *stream;
         uint64_t now = uv_hrtime();
-        int expired = 0;
+        int expired = 0, scheduled = 0;
         for (stream = front->streams; stream; stream = stream->next) {
             uint64_t d = stream->admitted ? stream->response_deadline_ns : stream->header_deadline_ns;
+            if (!stream->closed_by_h2 && d) scheduled = 1;
             if (!stream->closed_by_h2 && d && now >= d) {
                 nghttp2_submit_rst_stream(front->h2, NGHTTP2_FLAG_NONE, stream->id, NGHTTP2_CANCEL);
                 close_stream_core(stream);
@@ -2215,6 +2228,9 @@ static void on_timeout(uv_timer_t *timer) {
             }
         }
         if (expired) { h2_flush(front); drive_tls(front); refresh_timeout(front); return; }
+        /* libuv's cached millisecond clock can fire before the absolute
+         * nanosecond deadline. Re-arm instead of closing other streams. */
+        if (scheduled) { refresh_timeout(front); return; }
     }
     close_front(front);
 }

@@ -6,22 +6,35 @@
 #include <stdint.h>
 #define ANKAH_MAX_HOSTS 16
 #define ANKAH_MAX_ROUTES 16
+#define ANKAH_MAX_POLICIES 16
 #define ANKAH_LOCAL_ROUTE UINT_MAX
 typedef struct {
     char id[64], method[16], path[ANKAH_MAX_TARGET];
+    char policy_name[64];
+    unsigned int policy_index;
+    int prefix, query, challenge;
 } ankah_exact_route;
+typedef struct {
+    char id[64], upstream[512];
+    unsigned int concurrency, active;
+    size_t body_limit;
+    uint64_t connect_ms, upload_ms, response_ms;
+} ankah_upstream_policy;
 typedef struct {
     char origin[256], authority[256], name[256];
     unsigned int port;
-    char certificate[512], key[512], upstream[512];
+    char certificate[512], key[512];
     char static_directory[512], dashboard_route[ANKAH_MAX_TARGET];
     ankah_static_bundle bundle;
     int primary, static_challenge, static_challenge_seen;
     ankah_exact_route routes[ANKAH_MAX_ROUTES];
-    unsigned int route_count, concurrency, active;
-    size_t body_limit;
-    uint64_t connect_ms, upload_ms, response_ms;
+    unsigned int route_count, policy_count;
+    ankah_upstream_policy defaults, policies[ANKAH_MAX_POLICIES];
 } ankah_host;
+ankah_upstream_policy *ankah_host_policy(ankah_host *host, unsigned int route);
+const ankah_upstream_policy *ankah_host_policy_const(const ankah_host *host, unsigned int route);
+/* Checks whether an upstream route overlaps gateway or packaged paths. */
+int ankah_host_route_conflict(const ankah_host *host, unsigned int route);
 int ankah_host_local_path(const ankah_host *host, const char *target);
 /* Only case and an omitted configured default port are normalized. */
 int ankah_authority(const char *text, unsigned int default_port,

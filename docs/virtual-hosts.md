@@ -21,9 +21,9 @@ upload-timeout-ms=105000
 response-timeout-ms=115000
 ```
 
-Origin and certificate fields are required. A host needs exact upstream routes,
-a static bundle, or both. Upstream and limit fields are required when routes are
-present. A static-only host does not need an upstream. `route` may repeat with distinct identifiers and exact
+Origin and certificate fields are required. A host needs configured upstream routes,
+a static bundle, or both. Each upstream route requires a complete policy:
+host-level fields for legacy routes, or a named policy as described below. A static-only host does not need an upstream. `route` may repeat with distinct identifiers and exact
 method/path pairs. Route identifiers contain letters, digits, underscores or
 hyphens. Limits are positive integer bytes, transactions or milliseconds. Unknown
 keys, duplicate fields/hosts/routes and invalid limits fail startup. No route
@@ -132,3 +132,77 @@ fallback is used. Wine currently cannot preserve this ACL in the test filesystem
 the Wine check verifies no credential file, token rotation and rejection of the
 old token. Native Windows checks require the persisted file and protected ACL.
 Wine results do not establish native Windows permissions or platform acceptance.
+
+## Upstream policies and browser routes
+
+Additional hosts can assign routes to named policies. A policy file contains
+only `upstream`, `body-limit`, `concurrency`, `connect-timeout-ms`,
+`upload-timeout-ms` and `response-timeout-ms`, with the same required fields,
+validation and absolute deadlines as the legacy host-level settings. Unknown,
+duplicate or missing fields fail startup. Policy files cannot include other
+files. Their filenames resolve relative to the host file; Unix upstream socket
+paths remain absolute. Up to 16 named policies are supported per host.
+
+```ini
+# In the virtual-host file; definitions may follow their route references.
+upstream-policy=browser browser-policy.conf
+route=web-get GET /admin/ policy=browser match=prefix query=allow challenge=on
+route=web-head HEAD /admin/ policy=browser match=prefix query=allow challenge=on
+route=web-post POST /admin/ policy=browser match=prefix query=allow challenge=on
+route=login GET /oidc/login policy=browser query=allow challenge=on
+route=callback POST /oidc/callback policy=browser
+route=logout POST /oidc/backchannel-logout policy=browser
+```
+
+Example `browser-policy.conf` for a separate local backend:
+
+```ini
+upstream=127.0.0.1:8082
+body-limit=65536
+concurrency=4
+connect-timeout-ms=5000
+upload-timeout-ms=10000
+response-timeout-ms=15000
+```
+
+Every route using a policy shares its transaction capacity across HTTP/1.1 and
+HTTP/2 connections. Other policies have independent pools, including when they
+use the same address. The gateway-wide resource ceilings still apply. Existing
+host-level upstream/limits form the implicit `default` policy and retain their
+shared capacity. Omitted `policy` or `policy=default` selects that policy; the
+name `default` cannot be declared. All declared policies are validated at
+startup, and an implicit policy is required when referenced. Configuration is
+loaded at startup; SIGHUP still reloads only certificates.
+
+Route options may appear in any order, once each. The defaults are
+`match=exact query=reject challenge=off`, preserving existing three-field routes.
+Identifiers and methods retain their existing restrictions. Prefix routes must
+end in `/`, match that directory and its descendants, and reject escaped path
+bytes, backslashes, repeated slashes and dot segments. No path decoding or
+normalization takes place. Exact path ownership wins over prefixes; otherwise
+the longest matching prefix owns the request. Wrong methods return 405 and a
+rejected query returns 404, without falling through to a broader route.
+`query=allow` matches the path before `?` and forwards the complete original
+target unchanged, including an empty query. Default routes still reject even
+an empty question mark. Prefix routes cannot intersect gateway-reserved paths
+or cover packaged static files. Duplicate route identifiers and duplicate
+method/path/match definitions fail startup.
+
+`challenge=on` requires host-bound browser proof before connecting. Primary-host
+allow prefixes and verified crawlers do not exempt these routes. GET/HEAD can
+issue a normal browser gate; its session stores only the GET return target, not
+the original headers or body. Unproved writes return 428 with unlock-and-retry
+instructions. No routed write is captured or replayed. Challenge responses do
+not consume upstream-policy slots. Gateway admission/rate limits still protect
+challenge routes; challenge-off routes retain the existing direct admission.
+
+Protocol callback and backchannel POSTs should use exact, challenge-off routes.
+Their backend must validate their credentials, state and tokens. A challenge
+cookie never substitutes for application authentication or authorization.
+Ankah forwards cookies, redirect locations, multiple Set-Cookie fields and
+backend cache policy. Routed traffic bypasses request-derived language logging;
+its diagnostics use configured route identifiers and queue counters. Browser
+GET return targets are subject to normal challenge-session persistence, so do
+not place credentials in challenged query URLs. An absolute response deadline may close the affected HTTP/1.1 connection or
+reset its HTTP/2 stream rather than deliver a new status after expiry. Forwarding
+connects once with no retry, fallback upstream, POST continuation or gateway receipt cache.

@@ -180,6 +180,19 @@ For PNG images already within that dimension limit, the browser keeps the
 original file when it is smaller than the re-encoded PNG. This preserves
 existing palette optimization and interlacing.
 
+The server then tries a palette PNG with Adam7 interlacing and saves it only
+when it is smaller than the uploaded file. Images with more than 256 colours
+use lossy colour quantization, including partial transparency. High-quality
+encoding runs in the background and can take tens of seconds. The saved image
+appears in the preview after completion. Other mascot updates or restores
+receive HTTP 503 while an update is running; reads continue to use the current
+image. Optimization failures leave the uploaded encoding intact.
+
+Optimization applies to static images up to 1024 pixels on their longest
+side. Animated, 16-bit, ICC-profiled images and images with unsupported colour
+or orientation metadata retain their original bytes. Existing file-size and
+dimension limits still apply.
+
 The page files load from the `dashboard` directory inside `--assets-dir` when
 the dashboard is enabled, and Ankah refuses to start if they are missing. The
 public listener does not serve them unless a dashboard public route is

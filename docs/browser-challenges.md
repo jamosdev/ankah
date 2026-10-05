@@ -54,3 +54,9 @@ The browser writes screenshots, its version, the fixture executable hash and
 scenario results. Visual checks hold the Finished form navigation only long
 enough to inspect the challenge; separate cases exercise unmodified navigation.
 Phone checks solve a fresh session without sharing the original page's cookie.
+
+Pass `--routes` to the same check to exercise administration-prefix and login
+query navigation through an isolated policy backend. These two fresh-browser
+cases require an initial challenge, real browser proof completion and a return
+to the unchanged query-bearing target. The fixture uses only synthetic backends;
+it does not test an OIDC provider or application authorization.
