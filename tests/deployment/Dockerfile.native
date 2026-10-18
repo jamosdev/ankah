@@ -1,0 +1,21 @@
+FROM ubuntu:24.04
+RUN apt-get update && apt-get install -y --no-install-recommends \
+      build-essential cmake ninja-build git clang lld python3 curl ca-certificates systemd \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DANKAH_STRICT_WARNINGS=ON -DANKAH_BUNDLED_RUNTIME_DEPS=ON \
+ && cmake --build /build --target ankah --parallel 2 \
+ && cmake --install /build --component ankah_runtime --prefix /opt/ankah/test-first \
+ && cp -a /opt/ankah/test-first /opt/ankah/test-next \
+ && ln -s /opt/ankah/test-first /opt/ankah/current \
+ && useradd --system --user-group --uid 10001 --home-dir /var/lib/ankah \
+      --no-create-home --shell /usr/sbin/nologin ankah \
+ && install -d -m 700 -o ankah -g ankah /var/lib/ankah \
+ && install -D -m 644 deploy/native/ankah.service /etc/systemd/system/ankah.service \
+ && systemd-analyze verify /etc/systemd/system/ankah.service
+USER ankah
+WORKDIR /var/lib/ankah
+STOPSIGNAL SIGTERM
+ENTRYPOINT ["/opt/ankah/current/ankah", "--config", "/etc/ankah/ankah.conf"]

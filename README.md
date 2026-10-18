@@ -2,24 +2,43 @@
 
 ![Stylized corporate logo merging the number 41113 with the motif of the letters A N K](41113-corporate.png)
 
-Ankah is an internet shield. It was all started because some python django websites
-were being rate limited down to oblivion to the point that normal users couldn't
-even reliably connect anymore.
+Ankah challenges unverified traffic and limits admitted requests to help
+protect application capacity. It runs between your existing HTTPS proxy and
+application on a VPS or in Docker.
 
-A solution had to be found, but existing projects were too much work for too little
-gain. Ankah challenges unverified traffic and limits admitted requests to help
-protect application capacity. It can be used
-equally well by those who run a VPS, and those who are using docker containers.
+## Protect an existing site
 
-The challenge page displays the mascot prominently. Replace it from the
-[dashboard](docs/dashboard.md) by choosing a PNG, JPEG, or WebP image and saving
-it; new challenge pages show the change without a restart. The dashboard is at
-`/ankah-admin/` by default and needs its generated token or authenticator
-sign-in. The uploaded image is saved to
-`ankah.mascot.png` in the working directory, or to `--mascot-file path` when
-configured. The destination must be writable. You can also replace
-`assets/ankah.png` with a PNG and restart Ankah. A dashboard upload takes
-precedence until you choose **Restore default** in the dashboard.
+Keep your HTTPS proxy and application. Insert Ankah on a private HTTP hop:
+
+```text
+existing HTTPS proxy -> Ankah :8000 -> private application
+```
+
+- **[Docker Compose](docs/quickstart.md#docker-compose):** a separate unprivileged
+  gateway container, your existing application image and command, and persistent
+  credentials and state.
+- **[Native Linux service](docs/quickstart.md#native-linux-with-systemd):** Ubuntu
+  24.04 on x86-64, a versioned source build or verified release package, and systemd.
+
+Both walkthroughs include complete configuration, proxy forwarding examples,
+credential setup, and upgrade/rollback steps. Start with the
+[required substitutions](docs/quickstart.md#before-starting).
+
+### Verify before cutover
+
+Check `/ankah/livez` with the public Host, then stage the HTTPS proxy change for
+your testing source. Use a fresh browser to solve a challenge, continue to the
+original application URL, revisit with the solved session, and sign in to the
+dashboard. Only then route all traffic through Ankah. Follow the copyable
+[verification and rollback steps](docs/quickstart.md#verification-and-cutover).
+
+## Features and documentation
+
+See the [operator dashboard and mascot settings](docs/dashboard.md),
+[proxy trust and TLS](docs/tls-and-proxies.md), [monitoring](docs/monitoring.md),
+[browser challenges](docs/browser-challenges.md), [static serving](docs/static-serving.md),
+[virtual hosts](docs/virtual-hosts.md), [linked gateways](docs/gateway-links.md),
+[release packages](docs/release-packages.md), and [limitations](docs/limitations.md).
 
 This open-source lightweight web firewall is intended to help small websites and
 servers handle aggressive scraper bots and automated traffic overload. It can also help
@@ -59,6 +78,15 @@ with separate Chromium measurements for new and returning visitors. Its reports
 include correct application responses per offered visit, successful-visit p95,
 challenge delays and failures, backend work, and the resources of the complete
 serving deployment, including the DOTS edge and database.
+
+The [18 October local reference result](examples/visitor-availability/reference-2026-10-18/README.md)
+completed all 75 trials with valid offered load. At 40 and 200 unsolved attacker
+requests/second, both protected deployments delivered 100% of legitimate visits.
+When the attacker solved and reused proof at 200 requests/second, Ankah delivered
+0.4% of new visits and 6.2% of returning visits; Ankah with DOTS delivered 0.3%
+and 3.2%. Read these success rates alongside the reported latency, challenge
+time, and complete serving costs. Public raw-artifact hosting and remote CI
+validation remain pending.
 
 The full reference profile uses five five-minute repeats per scenario. Short
 smoke runs check the harness and are not evidence of stable latency or a
@@ -249,6 +277,9 @@ cmake -S . -B build
 cmake --build build
 ctest --test-dir build --output-on-failure
 ```
+
+For changes to deployment templates, run the isolated
+[deployment acceptance checks](tests/deployment/README.md) as well.
 
 Windows x64 builds use MinGW and can be tested from Linux with Wine. The
 Windows build uses pinned static copies of libuv, Mbed TLS, nghttp2, the QUIC
@@ -479,13 +510,9 @@ mesh setup, POST continuation, and session storage.
 
 ![Port 41113 belongs to Ankah who defends your docker instances from spam](41113-artist.jpg)
 
-to use it, specify these command line options:
-```
-```
-the default listen port is 41113 which can be remembered by the mnemonic "ANK" (with
-a bit of imagination). If you run multiple Ankah instances on the one server IP then
-you will need to override the listen port for the other instances, using the command
-line option ``.
+The default listen port is `8000`. Use `--listen 127.0.0.1:8002` (or another
+free address and port) for an additional instance, with its own credentials and
+state paths.
 
 ## Licenses
 Ankah itself is composed of original Ankah core files which are licensed [LGPL](LICENSE),

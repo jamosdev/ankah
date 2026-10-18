@@ -13,4 +13,8 @@ visitor-availability-artifacts
 protocol-matrix-ca.pem
 __pycache__
 *.pyc
+deploy/compose/.env
+deploy/compose/ankah.conf
+deploy/compose/credentials
+deploy/compose/state
 examples/dots-benchmark/edge/third_party/go-dots

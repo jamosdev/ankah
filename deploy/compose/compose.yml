@@ -1,0 +1,62 @@
+services:
+  ankah:
+    image: ${ANKAH_IMAGE:-ankah:local}
+    build:
+      context: ${ANKAH_SOURCE:-../..}
+      dockerfile: deploy/Dockerfile
+      args:
+        ANKAH_PACKAGE_STAGE: ${ANKAH_PACKAGE_STAGE:-source-build}
+        ANKAH_VERSION: ${ANKAH_VERSION:-}
+        ANKAH_SHA256: ${ANKAH_SHA256:-}
+    user: "10001:10001"
+    restart: unless-stopped
+    stop_signal: SIGTERM
+    stop_grace_period: 2m
+    read_only: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - type: bind
+        source: ./ankah.conf
+        target: /etc/ankah/ankah.conf
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./credentials
+        target: /etc/ankah/credentials
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: bind
+        source: ./state
+        target: /var/lib/ankah
+        bind:
+          create_host_path: false
+    networks:
+      frontend:
+        ipv4_address: 172.30.81.10
+      application:
+        ipv4_address: 172.30.82.11
+  application:
+    # Keep the existing image, command, environment, volumes and database networks.
+    image: ${APP_IMAGE:?Set APP_IMAGE to your existing application image}
+    restart: unless-stopped
+    # No published ports. The application must listen on 0.0.0.0:8001 here.
+    networks:
+      application:
+        ipv4_address: 172.30.82.10
+networks:
+  frontend:
+    ipam:
+      config:
+        - subnet: 172.30.81.0/24
+          gateway: 172.30.81.1
+  application:
+    internal: true
+    ipam:
+      config:
+        - subnet: 172.30.82.0/24
+          gateway: 172.30.82.1

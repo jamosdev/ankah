@@ -1,0 +1,30 @@
+[Unit]
+Description=Ankah application gateway
+Wants=network-online.target
+After=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=ankah
+Group=ankah
+WorkingDirectory=/var/lib/ankah
+ExecStart=/opt/ankah/current/ankah --config /etc/ankah/ankah.conf
+Restart=on-failure
+RestartSec=5s
+KillSignal=SIGTERM
+TimeoutStopSec=120s
+UMask=0077
+StateDirectory=ankah
+StateDirectoryMode=0700
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/ankah
+CapabilityBoundingSet=
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+
+[Install]
+WantedBy=multi-user.target

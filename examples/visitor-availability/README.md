@@ -5,6 +5,13 @@ response during a specified workload. A reproducible result in which Ankah
 performs poorly is useful evidence too. There is no assertion that a gateway
 must outperform the direct application.
 
+The [18 October 2026 local reference result](reference-2026-10-18/README.md)
+contains all 75 trial summaries and provenance. Both protected deployments
+preserved visitor availability against the tested unsolved floods, but
+availability fell sharply when attackers solved and reused proof. The result
+also records resource costs and the pending raw-artifact publication and
+remote CI checks.
+
 The same Django image, two synchronous Gunicorn workers, CPU-bound `/pi`
 implementation, work factor, application limits, and offered arrival schedules
 are used for three deployments:

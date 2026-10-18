@@ -1,0 +1,13 @@
+listen=0.0.0.0:8000
+public-origin=https://example.com
+upstream=172.30.82.10:8001
+# Host HTTPS proxy reaching the loopback-published Docker port.
+trusted-proxy=172.30.81.1/32
+assets-dir=/opt/ankah/assets
+secret-file=/etc/ankah/credentials/gateway.secret
+dashboard-public-route=/ankah-admin/
+dashboard-token-file=/etc/ankah/credentials/dashboard.token
+session-state-file=/var/lib/ankah/ankah.sessions
+stats-file=/var/lib/ankah/ankah.stats
+mascot-file=/var/lib/ankah/ankah.mascot.png
+ankah-livez=/ankah/livez
