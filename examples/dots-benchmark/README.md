@@ -23,6 +23,13 @@ The demonstration measures a hypothesis. It does not assume the answer:
 The example has done its job if it shows the mechanism and exposes honest
 measurements, whatever ordering a particular machine produces.
 
+For matched application workloads, new and returning browser visitors, and
+attackers that solve challenges, use the separate
+[visitor-availability benchmark](../visitor-availability/README.md). This demo
+does not establish a visitor-availability or total-deployment resource advantage:
+it uses different applications and allows its legitimate probe through Anubis
+by User-Agent, while that probe solves Ankah challenges.
+
 ## Topology
 
 ```

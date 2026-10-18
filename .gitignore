@@ -10,6 +10,7 @@
 __pycache__/
 *.pyc
 /protocol-matrix-artifacts/
+/visitor-availability-artifacts/
 /protocol-matrix-ca.pem
 /ankah.sessions.*
 /ankah.stats.*

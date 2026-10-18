@@ -7,7 +7,8 @@ were being rate limited down to oblivion to the point that normal users couldn't
 even reliably connect anymore.
 
 A solution had to be found, but existing projects were too much work for too little
-gain. Now Ankah protects your site from becoming overloaded by bots. It can be used
+gain. Ankah challenges unverified traffic and limits admitted requests to help
+protect application capacity. It can be used
 equally well by those who run a VPS, and those who are using docker containers.
 
 The challenge page displays the mascot prominently. Replace it from the
@@ -20,8 +21,8 @@ configured. The destination must be writable. You can also replace
 `assets/ankah.png` with a PNG and restart Ankah. A dashboard upload takes
 precedence until you choose **Restore default** in the dashboard.
 
-This open-source lightweight web firewall will protect small websites and servers
-from aggressive AI scraper bots and automated traffic overload. It can also help
+This open-source lightweight web firewall is intended to help small websites and
+servers handle aggressive scraper bots and automated traffic overload. It can also help
 a python web app have its static files (like CSS, JavaScript, and images) served
 directly in production without needing a separate web server configuration like
 Nginx or an external storage service like Amazon S3.
@@ -35,10 +36,9 @@ Nginx or an external storage service like Amazon S3.
   - Upload limits, body timeouts, graceful docker shutdown, [health routes](https://kubernetes.io/docs/reference/using-api/health-checks/),
     [metrics](https://grafana.com/docs/grafana/latest/fundamentals/intro-to-prometheus/), and static caching are covered.
   - A full test suite (python 3.12 scripts and docker with caddy) with [git CI](https://docs.github.com/en/actions/get-started/continuous-integration)
-  - Correctly gates curl/wget (using cli compatible proof of work responses, so
-    that admins won't need to open a browser). Other solutions either block curl
-    completely,	or allow runaway scripts and cli agents to overload their servers
-    and bring them down. This feature is currently unique to Ankah.
+  - Curl and Wget can obtain a pass through the terminal proof-of-work solver,
+    so administrators do not need to open a browser. Admitted requests still
+    follow rate limits; those limits may exceed an application's capacity.
   - It forwards the startup and shutdown of the wrapped script / process. So
     docker shutdown travels through Ankah connection draining, then to the wrapped
     script. And a script / process crash bubbles up through Ankah to then arrive at
@@ -49,40 +49,66 @@ Nginx or an external storage service like Amazon S3.
     [worked example](examples/dots-benchmark/README.md).
   - The challenge mascot can be changed from the dashboard or customised with a single Dockerfile line when deploying.
 
-Ankah's low RAM usage is beneficial for those hosting on low end boxes, the kind of
-hardware which is most affected by AI scanners, bot floods, and automated spam scripts.
-![Image showing Ankah using only 4mb of RAM while Anubis was using 60mb of RAM in the exact same load scenario](docs/example_ram.png)
-<small>Ankah's system memory usage is small and bounded, staying constant throughout this memory test, whereas Anubis memory usage climbed to over 10x higher under the same test load scenario</small>
+## Visitor availability evidence
 
-You can run the included docker compose DOTS demo to test ankah vs anubis protecting
-an application server under equal round robin load testing on the same HW.
-![Image showing Ankah utilising the DOTS protocol to protect the application server](docs/example_dots.png)
-<small>Ankah successfully offloading bot attacks to the DOTS appliance, allowing its challenge rate to fall to 0, proving that no bot connections are even reaching the app server anymore. Meanwhile, legitimate users (represented by legit probe results) are able to make it through the flood attack and successfully reach the application server at a greater frequency.</small>
+The useful question is whether legitimate visitors can reach your application
+during the traffic you expect. The [visitor-availability benchmark](examples/visitor-availability/README.md)
+compares the same Django application directly, behind Ankah, and behind Ankah
+with DOTS. It covers unsolved floods and clients that earn and reuse proof,
+with separate Chromium measurements for new and returning visitors. Its reports
+include correct application responses per offered visit, successful-visit p95,
+challenge delays and failures, backend work, and the resources of the complete
+serving deployment, including the DOTS edge and database.
+
+The full reference profile uses five five-minute repeats per scenario. Short
+smoke runs check the harness and are not evidence of stable latency or a
+capacity advantage. Use the documented commands to retain observations and
+recalculate the report. The reference workload is one CPU-bound endpoint on
+one Docker host; it does not establish performance for database-heavy sites,
+distributed attacks, other devices, or your deployment. Challenge-solving
+clients can reach the application and consume its capacity.
+
+The separate [DOTS worked example](examples/dots-benchmark/README.md) demonstrates
+upstream filtering of new connections from a source that never solves a
+challenge. Neither backend receives attacker work in that example. Its two
+different applications and client policies do not establish a comparable
+visitor-availability or total-resource advantage. Gateway memory alone is not
+a measurement of visitor availability.
 
 ## Why this is important
 Bots making your site slow and causing timeouts hurts normal users, crawlers, APIs, SEO,
 accessibility, and conversion.
 
-Proof of work client side cryptographic hash challenges are the current recommended
-best practice solution to this issue. By default ankah allows good crawlers from known
-address and challenges everything else. If a bot is especially persistent at trying to
-flood your website while ignoring challenges, Ankah will even block it in the default
-configuration.
+Client-side proof-of-work challenges increase the cost of obtaining access;
+they do not establish that a client is human or prevent an admitted client from
+overloading an application. By default Ankah allows verified supported crawlers
+and challenges other protected requests. Repeated per-client rate rejections
+and other documented abuse patterns can trigger a temporary local ban with
+the default conservative [abuse policy](docs/proxy-abuse.md).
 
 Ankah is product neutral. It works just as well in front of nodejs as it does python.
 
-## SEO is fully supported
-Both google and bing crawlers are allowed through by default. However both are rate
-limited so that your application server will only ever see 1 crawler page load at
-a time, no matter who they are from or how many requests they try to send at once.
+## Crawler behaviour and monitoring
 
-This means that crawlers cannot slow your site down so long as your site is able to
-handle at least 2 people using it at once, and with this you will still get full
-search rankings like always.
+Google common-crawler address ranges bypass challenges. Bingbot claims are
+verified through reverse and matching forward DNS lookups. Crawler traffic
+shares a burst of ten requests, a refill of two requests per second, and one
+concurrency slot across the process. A Bing lookup also occupies that slot.
+Completing a request releases the slot without refunding its rate token.
+Contention or exhausted rate capacity returns `429` with a one-second retry
+hint; that hint does not reserve admission.
 
-The SEO-boosting crawler proof-of-work gate bypass cannot become a source of DDoS
-itself because it is heavily rate limited with at most 1 concurrent RDNS query in
-flight at once, with full asynchronous socket scheduling and normal timeouts.
+These controls do not guarantee unchanged crawling, indexing, or rankings.
+[Google explains](https://developers.google.com/crawling/docs/crawlers-fetchers/reduce-crawl-rate)
+that significant numbers of `429` or server-error responses reduce crawling
+across the hostname, including URLs that still return content. Sustained
+failures can also affect indexing.
+
+Monitor verified crawler response statuses, rejection reasons, response times,
+and application capacity. Check Search Console crawl statistics and indexing
+reports after deployment and policy changes. Persistent crawler rejections
+need investigation rather than an assumption that the bypass preserves search
+visibility. See [monitoring and exact admission limits](docs/monitoring.md).
 
 ## Quick download
 - Linux x64 (musl): [download the latest package](https://github.com/jamosdev/ankah/releases/latest/download/ankah-linux-musl-x64.tar.gz)

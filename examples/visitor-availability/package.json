@@ -1,0 +1,7 @@
+{
+  "name": "ankah-visitor-availability",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {"playwright": "1.62.1"},
+  "scripts": {"test": "node --test client_test.cjs"}
+}

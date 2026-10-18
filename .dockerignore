@@ -9,6 +9,7 @@ dist
 .cache
 .venv
 protocol-matrix-artifacts
+visitor-availability-artifacts
 protocol-matrix-ca.pem
 __pycache__
 *.pyc

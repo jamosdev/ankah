@@ -1,0 +1,17 @@
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc AS build
+RUN apk add --no-cache cmake ninja gcc g++ musl-dev linux-headers git clang lld curl openssl python3
+WORKDIR /src
+COPY . .
+RUN cmake -S . -B /build -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      -DANKAH_STRICT_WARNINGS=ON -DANKAH_BUNDLED_RUNTIME_DEPS=ON -DANKAH_STATIC_LINUX=ON \
+ && cmake --build /build --target ankah -j 4 \
+ && cmake --install /build --component ankah_runtime --prefix /opt/ankah \
+ && sha256sum /opt/ankah/ankah > /opt/ankah/executable.sha256
+
+FROM alpine:3.20@sha256:d9e853e87e55526f6b2917df91a2115c36dd7c696a35be12163d44e6e2a4b6bc
+RUN apk add --no-cache ca-certificates
+COPY --from=build /opt/ankah/ankah /usr/local/bin/ankah
+COPY --from=build /opt/ankah/assets /assets
+COPY --from=build /opt/ankah/notices /usr/share/doc/ankah/notices
+COPY --from=build /opt/ankah/LICENSE /usr/share/doc/ankah/LICENSE
+USER nobody
